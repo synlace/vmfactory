@@ -1,0 +1,25 @@
+spec_version: 1
+name: strix
+base: ubuntu-24.04
+cpu: 2
+memory_gb: 4
+disk_gb: 20
+network:
+  ip: 192.168.124.60
+  gateway: 192.168.124.1
+roles: [common, docker, pipx]
+provision:
+  dockerfile: docker/strix-agent.Dockerfile
+files:
+  - src: files/strix/banner.txt
+    dest: /etc/motd
+    mode: "0644"
+    sha256: c6010c2f9f9791379d6ea18734e849907eca428dda99cf1602cbf9297e0361c6
+  # Secret (API key). Kept out of git via .gitignore; the sha256 pin
+  # lives here, the value does not. Mode 0600, owned by the box user.
+  - src: files/strix/cli-config.json
+    dest: /home/ubuntu/.strix/cli-config.json
+    owner: ubuntu
+    group: ubuntu
+    mode: "0600"
+    sha256: 5f9149fcf9ebf5e77acd8050930a28bd2f061a0d518c3069d0fdabc72abea01a

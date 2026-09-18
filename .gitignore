@@ -1,0 +1,7 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+files/
+.gitignore.swp
+*.swp
