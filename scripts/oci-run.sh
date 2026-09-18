@@ -151,4 +151,13 @@ fi
 start_args+=("${cmd_args[@]}")
 # `--` keeps dash-leading guest args (e.g. nginx's -g) out of krunvm's own
 # option parser; krunvm start passes everything after it to the guest.
+set +e
 krun start "$name" -- ${start_args[@]+"${start_args[@]}"}
+status=$?
+set -e
+if [[ $status -ne 0 ]]; then
+  echo "note: guest exited with status $status. If this is 'listen() ... Permission denied'" >&2
+  echo "on a port below 1024: rootless microVMs cannot bind privileged ports." >&2
+  echo "Use a high guest port or an unprivileged image variant (e.g. nginxinc/nginx-unprivileged)." >&2
+fi
+exit $status
