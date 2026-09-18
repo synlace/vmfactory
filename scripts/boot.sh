@@ -44,7 +44,7 @@ echo "booting $name: $DISK tap=$tap mac=$mac ip=$IP"
 # Rebuilds and snapshot reverts produce new host keys on the same IP.
 # These boxes are disposable, so reset the per-box known_hosts each boot;
 # enter.sh re-adds the key via StrictHostKeyChecking=accept-new.
-rm -f "build/$name/known_hosts"
+rm -f "build/$name/known_hosts" "build/$name/mon.sock"
 
 exec qemu-system-x86_64 -m "$MEM_MB" -smp "$CPU" -accel kvm -name "$name" \
   -drive file="$disk",if=virtio,format=qcow2 \

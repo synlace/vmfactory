@@ -10,7 +10,8 @@ list:
     for spec in specs/*.yaml; do
       name=$(basename "$spec" .yaml)
       if pgrep -f "qemu-system.*-name $name" >/dev/null 2>&1; then
-        state=running
+        state=$( (printf 'info status\n'; sleep 1) | nc -N -U "build/$name/mon.sock" 2>/dev/null | grep -oE 'paused|running' | head -1)
+        state=${state:-running}
       else
         state=stopped
       fi
@@ -55,11 +56,25 @@ exec lab=lab *cmd:
 ip lab=lab:
     {{ uvrun }} python -c "import yaml; spec = yaml.safe_load(open('specs/{{ lab }}.yaml')); print(spec['network']['ip'])"
 
+# Pause a running box (CPU halted, RAM kept in host memory; ssh freezes)
+pause lab=lab:
+    echo stop | nc -N -U "build/{{ lab }}/mon.sock" >/dev/null
+
+# Resume a paused box (TCP connections survive the pause)
+resume lab=lab:
+    echo cont | nc -N -U "build/{{ lab }}/mon.sock" >/dev/null
+
+# Show the box's QEMU status and current snapshot list
+status lab=lab:
+    #!/bin/sh
+    (printf 'info status\n'; sleep 1) | nc -N -U "build/{{ lab }}/mon.sock" 2>/dev/null | tail -2
+    qemu-img snapshot -l "build/{{ lab }}/image/vmf-{{ lab }}" 2>/dev/null | head -6
+
 # Shut down a running box. ACPI first, then force after 10 seconds.
 stop lab=lab:
     #!/bin/sh
     sock="build/{{ lab }}/mon.sock"
-    [ -S "$sock" ] && { echo system_powerdown | nc -U "$sock" >/dev/null 2>&1 || true; }
+    [ -S "$sock" ] && { echo system_powerdown | nc -N -U "$sock" >/dev/null 2>&1 || true; }
     i=0
     while [ "$i" -lt 10 ]; do
       pgrep -f "qemu-system.*-name {{ lab }}" >/dev/null 2>&1 || { echo "box {{ lab }} stopped"; exit 0; }
