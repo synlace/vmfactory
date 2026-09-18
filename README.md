@@ -93,10 +93,11 @@ just run --keep image                              # keep the VM for reuse
   command; krunvm starts guests with a clean environment and does not read
   the image's default command, so the script resolves ENTRYPOINT/CMD from
   the OCI config blob (skopeo) when no command is given.
-- Privileged ports fail rootless: guests cannot bind ports below 1024
-  (`listen() ... Permission denied`, the host side lacks
-  `CAP_NET_BIND_SERVICE`). Use a high guest port or an unprivileged image
-  variant (`nginxinc/nginx-unprivileged` listens on 8080).
+- Privileged ports fail rootless when unmapped: a guest bind with no `-p`
+  mapping translates to a direct host bind under your uid, so binding
+  below 1024 fails (`listen() ... Permission denied`). With `-p 8080:80`
+  the host side binds 8080 (unprivileged OK) and the guest bind is
+  virtualized by TSI — mapped ports work even for guest port 80.
 - Known krunvm 0.2.4 quirk: guest commands containing shell quotes get
   mangled in transit; keep commands quote-free (use `env` style).
 

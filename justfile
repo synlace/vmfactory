@@ -18,6 +18,14 @@ list:
       ip=$(awk '/network:/{f=1} f && /ip:/{print $2; exit}' "$spec")
       printf '%-24s %-10s %s\n' "$name" "$state" "${ip:--}"
     done
+    # Ephemeral microVMs (krunvm), if any; names are plain single tokens
+    if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
+      buildah unshare -- krunvm list 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+$'
+    else
+      nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm list 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+$'
+    fi | while IFS= read -r vm; do
+      printf '%-24s %-10s %s\n' "$vm" microvm "-"
+    done
 
 # Validate a spec: schema, base pin, roles, Dockerfile subset
 validate lab=lab:
