@@ -72,6 +72,30 @@ The export merges role package lists (`roles/*/defaults/main.yml`
 Roles without `vmf_packages` get a note, not a guess. `COPY` in the
 referenced Dockerfile blocks the export (context paths do not carry over).
 
+## Ephemeral OCI runs (krunvm backend)
+
+```sh
+just run --rm -p 3002:3000 bkimminich/juice-shop   # run an OCI image in a microVM
+just run --rm -e FOO=bar image cmd                 # command + env (quote-free)
+just run --keep image                              # keep the VM for reuse
+```
+
+- Runtime: krunvm (libkrun) inside a `buildah unshare` user namespace.
+  Falls back to `nix shell nixpkgs#krunvm nixpkgs#buildah` when not on PATH.
+- `--rm` is the default: the microVM is deleted when the process exits.
+  Ctrl-C in a terminal tears down the whole tree.
+- Digest pinning: first run records the digest (TOFU) in `~/.vmf/oci-pins`;
+  later runs fail loudly on drift. `VMF_OCI_PINS` overrides the pin file.
+- Unprefixed image names get docker.io normalization (`alpine` ->
+  `docker.io/library/alpine`).
+- `-p` uses krunvm port mapping (host:guest), rootless. `-e` is applied by
+  prefixing the guest command with `/usr/bin/env` — needs an explicit
+  command; krunvm starts guests with a clean environment and does not read
+  the image's default command, so the script resolves ENTRYPOINT/CMD from
+  the OCI config blob (skopeo) when no command is given.
+- Known krunvm 0.2.4 quirk: guest commands containing shell quotes get
+  mangled in transit; keep commands quote-free (use `env` style).
+
 ## Conventions
 
 - Roles build the platform (common, docker, pipx); Dockerfiles add tools.

@@ -40,6 +40,10 @@ build lab=lab: (generate lab)
 boot lab=lab:
     sh scripts/boot.sh {{ lab }}
 
+# Run an OCI image as an ephemeral microVM (docker-style flags)
+run *args:
+    sh scripts/oci-run.sh {{ args }}
+
 # SSH into a running box; pass a command to run it remotely instead
 ssh lab=lab *cmd:
     sh scripts/enter.sh {{ lab }} {{ cmd }}
