@@ -19,13 +19,22 @@ ctr=$(buildah from "$VMF_REF")
 rootfs=$(buildah mount "$ctr")
 trap 'buildah rm "$ctr" >/dev/null 2>&1 || true' EXIT
 
-mkdir -p "$rootfs/vmf" "$rootfs/root"
+mkdir -p "$rootfs/vmf" "$rootfs/vmf/bin" "$rootfs/root"
 cp "$VMF_BUNDLE/dropbear" "$rootfs/vmf/dropbear"
 cp "$VMF_BUNDLE/dropbearkey" "$rootfs/vmf/dropbearkey"
 cp "$VMF_BUNDLE/busybox" "$rootfs/vmf/busybox"
 cp "$VMF_INIT" "$rootfs/vmf/init.sh"
 ln -sf busybox "$rootfs/vmf/sh"
 chmod 755 "$rootfs/vmf/dropbear" "$rootfs/vmf/busybox" "$rootfs/vmf/init.sh"
+
+# Fallback tool symlinks: busybox dispatches on argv[0], so one symlink
+# per applet gives every image (including distroless) a full coreutils
+# set under /vmf/bin. The directory is APPENDED to PATH by oci-run.sh,
+# so real image binaries always win where they exist.
+while read -r applet; do
+  [ -n "$applet" ] || continue
+  ln -sf /vmf/busybox "$rootfs/vmf/bin/$applet"
+done < <("$VMF_BUNDLE/busybox" --list)
 
 # /etc/passwd: distroless bases carry none; dropbear requires a root entry
 # with a shell it accepts. Root's shell is forced to /vmf/sh (busybox) so

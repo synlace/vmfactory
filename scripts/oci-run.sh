@@ -132,6 +132,12 @@ for kv in (os.environ.get("VMF_ENVS") or "").split("\x00"):
     if kv and "=" in kv:
         k, _, v = kv.partition("=")
         env[k] = v
+# Fallback tools: /vmf/bin holds a busybox symlink per applet. Append it
+# to PATH so images without coreutils (distroless) still run `ls` etc.
+# while real image binaries keep priority. The guest init inherits this
+# PATH, so dropbear ssh sessions get the same fallback.
+p = env.get("PATH", "")
+env["PATH"] = (p + ":/vmf/bin") if p else "/vmf/bin:/usr/bin:/bin"
 
 user = (config.get("User") or "").strip()
 uid = ""
