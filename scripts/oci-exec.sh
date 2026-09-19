@@ -16,7 +16,7 @@ else
   krun() { nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm "$@"; }
 fi
 
-krun list | grep -qx "$name" || {
+krun list | grep -qx -- "$name" || {
   echo "error: no microVM '$name' running; start one with: just run --keep <image>" >&2
   exit 1
 }
