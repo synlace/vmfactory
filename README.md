@@ -134,9 +134,10 @@ dropbear image). For microVMs:
   shows it.
 - One-shot commands are the contract for microVMs: `just ssh <name> cmd`
   gives docker-exec semantics (live process space, exit code, scp -O
-  works — it is exec-based). On distroless bases there is no shell
-  tooling: prefix commands with `/vmf/busybox` (`just ssh juice-shop
-  '/vmf/busybox ls /'`). Interactive PTY shells are impossible
+  works — it is exec-based). The derived layer also symlinks every
+  busybox applet into `/vmf/bin` and appends that directory to PATH, so
+  even distroless images run plain `ls`, `grep`, `ps` etc. (real image
+  binaries keep priority). Interactive PTY shells are impossible
   inside libkrun microVMs: opening a pts slave device returns EIO while
   the master is held (verified with an in-guest probe: `open(/dev/ptmx)`
   and `TIOCGPTN` succeed, `open(/dev/pts/N)` fails). `just ssh` strips
