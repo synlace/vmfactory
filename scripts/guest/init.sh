@@ -38,7 +38,13 @@ done
 /vmf/dropbear -EsF -p 22 &
 
 cd "$($BB cat /vmf-run/cwd)"
-eval "set -- $(cat /vmf-run/argv.sh)"
+# Everything the init itself runs comes from /vmf or shell builtins:
+# distroless bases carry no coreutils and PATH may not reach /bin.
+eval "set -- $(/vmf/busybox cat /vmf-run/argv.sh)"
+[ $# -ge 1 ] || {
+  echo "vmf-init: empty argv" >&2
+  exit 2
+}
 uid="$($BB cat /vmf-run/uid 2>/dev/null || true)"
 
 # Image USER (numeric uid[:gid]) or root.
