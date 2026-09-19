@@ -77,7 +77,10 @@ referenced Dockerfile blocks the export (context paths do not carry over).
 ```sh
 just run --rm -p 3002:3000 bkimminich/juice-shop   # run an OCI image in a microVM
 just run --rm -e FOO=bar image cmd                 # command + env (quote-free)
-just run --keep image                              # keep the VM for reuse
+just run --keep image                              # keep the VM, then ssh in
+just ssh image                                     # interactive shell (PTY)
+just ssh image 'ls /proc'                          # one-shot, docker-exec semantics
+just ssh -it image true                            # docker-style flags accepted/ignored
 ```
 
 - Runtime: krunvm (libkrun) inside a `buildah unshare` user namespace.
@@ -89,25 +92,57 @@ just run --keep image                              # keep the VM for reuse
 - Unprefixed image names get docker.io normalization (`alpine` ->
   `docker.io/library/alpine`).
 - `-p` uses krunvm port mapping (host:guest), rootless. `-e` is applied by
-  prefixing the guest command with `/usr/bin/env` — needs an explicit
-  command; krunvm starts guests with a clean environment and does not read
-  the image's default command, so the script resolves ENTRYPOINT/CMD from
-  the OCI config blob (skopeo) when no command is given.
+  the guest init before the app starts — krunvm starts guests with a clean
+  environment and ignores the image's default command, so ENTRYPOINT/CMD/
+  ENV/USER/WORKDIR are resolved from the OCI config blob (skopeo) and
+  handed to the init via a per-run mount. Quoting survives: argv travels
+  in a file, not through the krunvm command line.
 - Privileged ports fail rootless when unmapped: a guest bind with no `-p`
   mapping translates to a direct host bind under your uid, so binding
   below 1024 fails (`listen() ... Permission denied`). With `-p 8080:80`
   the host side binds 8080 (unprivileged OK) and the guest bind is
   virtualized by TSI — mapped ports work even for guest port 80.
-- Exec into running VMs (`just exec <name> <cmd>`): every agent-mode run
-  boots the static guest agent (`agent/main.go`, built to
-  `~/.local/share/vmf/agent/vmf-agent`) as the guest init, which execs the
-  image entrypoint and serves exec requests on the agent port (47770).
-  This is true docker-exec semantics — the shell sees the running VM's
-  live process table. Not supported: interactive stdin (TSI forwarded
-  connections lack half-close). Route: `just exec` picks the qemu-box
-  path when `build/<name>/vm.conf` exists, else the agent path.
-- Known krunvm 0.2.4 quirk: guest commands containing shell quotes get
-  mangled in transit; keep commands quote-free (use `env` style).
+
+## SSH into microVMs (dropbear layer)
+
+`just ssh <name>` reaches both box types: qemu boxes (via `enter.sh`,
+real sshd from the cloud image) and krunvm microVMs (via a derived
+dropbear image). For microVMs:
+
+- On first use of an image, `scripts/derive.sh` commits one extra layer
+  on top of the pinned bytes: a static musl `dropbear` + `dropbearkey` +
+  `busybox` bundle (`~/.local/share/vmf/ssh-bundle`) and
+  `scripts/guest/init.sh`, plus `/etc/passwd` + `/etc/shells` fixups so
+  every base behaves identically (distroless gets a root entry; root's
+  shell is forced to `/vmf/sh` — dropbear rejects shells missing from
+  `/etc/shells`, like alpine's `/bin/ash`).
+- The derived image is cached under a content-addressed tag
+  (`vmf-ssh:<base-hash>-<payload-hash>`: base pinned ref + bundle +
+  init + derive script) in the buildah store, recorded in
+  `~/.vmf/derive/`; any payload change or base digest change rebuilds
+  it. The pinned bytes themselves are never modified.
+- The guest init (`/vmf/init.sh`) starts dropbear on guest port 22
+  (pubkey-only, host keys generated in-guest at boot) and supervises the
+  image entrypoint with signal forwarding; the VM exits when the
+  entrypoint exits (libkrun's init.krun is PID 1 and reaps).
+- Auth: one client keypair per host user (`~/.vmf/ssh/id_ed25519`,
+  TOFU-generated on first run); its public half is mounted into the VM
+  and installed as root's `authorized_keys`. Host key checking is
+  `accept-new` into `~/.vmf/ssh/known_hosts`.
+- The ssh host port is stable per VM name (hash, 20000-29999) and stored
+  in `~/.vmf/runs/<name>.conf`, which `just ssh` reads; `just list`
+  shows it.
+- One-shot commands are the contract for microVMs: `just ssh <name> cmd`
+  gives docker-exec semantics (live process space, exit code, scp -O
+  works — it is exec-based). Interactive PTY shells are impossible
+  inside libkrun microVMs: opening a pts slave device returns EIO while
+  the master is held (verified with an in-guest probe: `open(/dev/ptmx)`
+  and `TIOCGPTN` succeed, `open(/dev/pts/N)` fails). `just ssh` strips
+  `-t` style flags with a notice. For interactive shells, boot a qemu
+  box (`just boot <lab>`), which runs real sshd with a full PTY.
+- `--no-ssh` boots the pinned image as-is: no derive, no ssh, entrypoint
+  straight through krunvm (krunvm then mangles quoted args — the ssh
+  path passes argv through files, so quoting is safe there).
 
 ## Conventions
 

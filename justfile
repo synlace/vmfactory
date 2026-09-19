@@ -24,7 +24,11 @@ list:
     else
       nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm list 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+$'
     fi | while IFS= read -r vm; do
-      printf '%-24s %-10s %s\n' "$vm" microvm "-"
+      port=-
+      if [ -f "$HOME/.vmf/runs/$vm.conf" ]; then
+        port=$(. "$HOME/.vmf/runs/$vm.conf"; echo "$PORT")
+      fi
+      printf '%-24s %-10s %s\n' "$vm" "microvm" "ssh port $port"
     done
 
 # Validate a spec: schema, base pin, roles, Dockerfile subset
@@ -48,22 +52,24 @@ build lab=lab: (generate lab)
 boot lab=lab:
     sh scripts/boot.sh {{ lab }}
 
-# Run an OCI image as an ephemeral microVM (docker-style flags)
+# Run an OCI image as an ephemeral microVM (docker-style flags); ssh in
+# with `just ssh <name>` afterwards
 run *args:
     sh scripts/oci-run.sh {{ args }}
 
-# SSH into a running box; pass a command to run it remotely instead
-ssh lab=lab *cmd:
-    sh scripts/enter.sh {{ lab }} {{ cmd }}
+# SSH into a running box (qemu) or microVM (dropbear); pass a command to
+# run it remotely instead. Docker-style leading flags are accepted/ignored.
+ssh *args:
+    sh scripts/ssh.sh {{ args }}
 
-# SSH into a running box (alias for ssh)
-enter lab=lab *cmd:
-    sh scripts/enter.sh {{ lab }} {{ cmd }}
+# SSH into a running box or microVM (alias for ssh)
+enter *args:
+    sh scripts/ssh.sh {{ args }}
 
-# Run a command inside a running box (ssh) or microVM (agent exec);
+# Run a command inside a running box or microVM (same router as ssh);
 # docker-style leading flags accepted and ignored
 exec *args:
-    sh scripts/exec-router.sh {{ args }}
+    sh scripts/ssh.sh {{ args }}
 
 # Print the dedicated IP of a box, declared in the spec
 ip lab=lab:

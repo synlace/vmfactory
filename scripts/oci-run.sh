@@ -6,26 +6,29 @@
 # ~/.vmf/oci-pins; drift is a hard error. `--rm` is the default: the VM
 # is deleted when the process exits.
 #
-# Agent mode (default, when the static agent binary exists): the guest
-# init is the vmf-agent, which execs the app and exposes a live exec
-# channel on the agent port, so `just exec <name> <cmd>` reaches the
-# running VM (real process space, like docker exec).
+# SSH mode (default): on first use of an image, the script derives a
+# local image that adds one layer on top of the pinned bytes — a static
+# dropbear + dropbearkey + busybox bundle plus a guest init script. The
+# derived image is cached under a content-addressed tag and rebuilt when
+# the base digest or any payload file changes. The guest init starts
+# dropbear on :22 (pubkey auth only) and supervises the image
+# entrypoint, so `just ssh <name> <cmd>` reaches the running microVM.
+# `--no-ssh` skips the derive step and boots the pinned bytes as-is.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: oci-run.sh [--rm] [--keep] [--name NAME] [--cpus N]
-                  [-p HOST:GUEST] [-e K=V] IMAGE [COMMAND...]
+Usage: oci-run.sh [--rm] [--keep] [--name NAME] [--cpus N] [--no-ssh]
+                  [-p HOST:GUEST] [-v HOST:GUEST] [-e K=V] IMAGE [COMMAND...]
 
   --rm            accepted, default behavior (VM deleted on exit)
   --keep          keep the microVM after exit (re-run reuses it)
+  --no-ssh        boot the pinned image as-is (no dropbear layer, no ssh)
   -p HOST:GUEST   publish host port to guest port (repeatable)
   -v HOST:GUEST   mount a host path into the guest (repeatable)
   -e K=V          environment for the guest process (repeatable)
   --name NAME     microVM name (default: derived from the image)
   --cpus N        vCPUs
-  --no-agent      do not boot the exec agent (plain init)
-  --agent-port N  host port for the exec channel (default 47770)
   IMAGE           OCI reference (registry/repo[:tag]); digest-pinned
   COMMAND...      optional command to run inside (default: image entrypoint)
 EOF
@@ -37,8 +40,7 @@ volumes=()
 envs=()
 name=""
 cpus=""
-agent=1
-agent_port="47770"
+ssh=1
 keep=0
 image=""
 cmd_args=()
@@ -47,8 +49,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --rm) shift ;;
     --keep) keep=1; shift ;;
-    --no-agent) agent=0; shift ;;
-    --agent-port) [[ $# -ge 2 ]] || usage; agent_port="$2"; shift 2 ;;
+    --no-ssh) ssh=0; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
@@ -80,6 +81,11 @@ if [[ -z "$name" ]]; then
   name="$(basename "${image%%:*}")"
 fi
 
+RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
+SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
+BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
+DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
+
 # Digest pin: TOFU on first run; drift is a hard error afterwards.
 pins="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 mkdir -p "$(dirname "$pins")"
@@ -106,31 +112,111 @@ fi
 
 # Resolve the app argv + env from the OCI config blob: krunvm ignores the
 # image's ENTRYPOINT/CMD, so argv = Entrypoint+Cmd (docker semantics), env
-# = image Env overridden by -e flags, cwd = WorkingDir. One python pass
-# emits the agent config (and the argv used by plain mode).
-cfg_blob=$("${SKOPEO[@]}" inspect --config "docker://$image" 2>/dev/null || true)
+# = image Env overridden by -e flags, cwd = WorkingDir, uid = User.
+# One python pass writes the guest init inputs into the run dir.
+mkdir -p "$RUNS_DIR/$name/auth"
+cfg_blob=$("${SKOPEO[@]}" inspect --config "docker://$ref" 2>/dev/null || true)
 envs_nul="$(printf '%s\0' "${envs[@]:-}" || true)"
-resolved_json=$(
-  VMF_ENVS="$envs_nul" python3 - "$cfg_blob" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF'
-import json, os, sys
-blob = json.loads(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else {}
-config = blob.get("config") or {}
-argv = sys.argv[2:]
+VMF_ENVS="$envs_nul" python3 - "$cfg_blob" "$RUNS_DIR/$name" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
+import json, os, shlex, sys
+
+blob, rundir = sys.argv[1], sys.argv[2]
+argv = sys.argv[3:]
+config = (json.loads(blob).get("config") or {}) if blob else {}
 if not argv:
     argv = list(config.get("Entrypoint") or []) + list(config.get("Cmd") or [])
 if not argv:
-    sys.stderr.write("error: image has no default command; pass one explicitly\n")
-    sys.exit(1)
+    sys.stderr.write("error: image has no default command; pass one explicitly\n"); sys.exit(1)
 env = dict(kv.split("=", 1) for kv in (config.get("Env") or []) if "=" in kv)
 for kv in (os.environ.get("VMF_ENVS") or "").split("\x00"):
     if kv and "=" in kv:
         k, _, v = kv.partition("=")
         env[k] = v
-json.dump({"argv": argv, "env": env,
-           "cwd": config.get("WorkingDir") or "/",
-           "listen": "0.0.0.0:7777"}, sys.stdout)
+
+user = (config.get("User") or "").strip()
+uid = ""
+if user:
+    u, _, g = user.partition(":")
+    if u.isdigit() and (not g or g.isdigit()):
+        uid = f"{u}:{g or u}"
+    else:
+        sys.stderr.write(f"warning: image USER {user!r} is not numeric; running as root\n")
+
+with open(os.path.join(rundir, "env"), "w") as f:
+    for k, v in env.items():
+        f.write(f"{k}={shlex.quote(v)}\n")
+with open(os.path.join(rundir, "argv.sh"), "w") as f:
+    f.write(" ".join(shlex.quote(a) for a in argv) + "\n")
+with open(os.path.join(rundir, "cwd"), "w") as f:
+    f.write(config.get("WorkingDir") or "/")
+with open(os.path.join(rundir, "uid"), "w") as f:
+    f.write(uid)
 PYEOF
+
+# Client keypair (TOFU, per host user).
+if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
+  mkdir -p "$SSH_DIR"
+  ssh-keygen -q -t ed25519 -N '' -f "$SSH_DIR/id_ed25519"
+  echo "note: ssh client key generated: $SSH_DIR/id_ed25519"
+fi
+
+# Host port for guest 22: stable from the name, probing upward if busy.
+user_ssh_port=""
+for p in "${ports[@]:-}"; do
+  [[ "$p" == *:22 ]] && user_ssh_port="${p%%:*}" && break
+done
+if [[ -z "$user_ssh_port" ]]; then
+  ssh_port=$(python3 - "$name" <<'PY'
+import socket, sys, zlib
+p = 20000 + zlib.crc32(sys.argv[1].encode()) % 10000
+for _ in range(100):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); s.close(); print(p); break
+    except OSError:
+        s.close(); p += 1
+PY
 )
+  ports+=("$ssh_port:22")
+else
+  ssh_port="$user_ssh_port"
+fi
+
+# Static ssh bundle: build once from nixpkgs (musl-static, libc-free).
+if [[ "$ssh" -eq 1 ]] && [[ ! -x "$BUNDLE_DIR/dropbear" || ! -x "$BUNDLE_DIR/busybox" ]]; then
+  echo "building static ssh bundle (dropbear + busybox, one-time)..."
+  mapfile -t outs < <(nix build nixpkgs#pkgsStatic.dropbear nixpkgs#pkgsStatic.busybox --print-out-paths)
+  mkdir -p "$BUNDLE_DIR"
+  cp "${outs[0]}/bin/dropbear" "$BUNDLE_DIR/dropbear"
+  cp "${outs[0]}/bin/dropbearkey" "$BUNDLE_DIR/dropbearkey"
+  cp "${outs[1]}/bin/busybox" "$BUNDLE_DIR/busybox"
+fi
+
+# Derive the ssh-enabled image from the pinned bytes: add one layer with
+# the dropbear/busybox bundle and the guest init. Cached per pinned ref.
+DERIVED_TAG=""
+if [[ "$ssh" -eq 1 ]]; then
+  # Content-addressed tag: base digest + bundle/init content. Any change
+  # to the guest payload busts the derive cache.
+  content=$(cat "$BUNDLE_DIR/dropbear" "$BUNDLE_DIR/dropbearkey" "$BUNDLE_DIR/busybox" \
+    "$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
+    "$(cd "$(dirname "$0")" && pwd)/derive.sh" | sha256sum | cut -c1-8)
+  DERIVED_TAG="v$(printf '%s' "$ref" | cksum | cut -d' ' -f1 | cut -c1-10)-$content"
+  DERIVED="vmf-ssh:$DERIVED_TAG"
+  if command -v buildah >/dev/null 2>&1; then
+    BUILD_BIN=(buildah)
+  else
+    BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
+  fi
+  VMF_REF="$ref" VMF_DERIVED="$DERIVED" VMF_TAG="$DERIVED_TAG" \
+  VMF_BUNDLE="$BUNDLE_DIR" VMF_INIT="$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
+  VMF_DERIVE_DIR="$DERIVE_DIR" \
+  "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/derive.sh"
+  cp "$SSH_DIR/id_ed25519.pub" "$RUNS_DIR/$name/auth/authorized_keys"
+  create_ref="$DERIVED"
+else
+  create_ref="$ref"
+fi
 
 create_args=(--name "$name")
 for p in "${ports[@]:-}"; do
@@ -139,41 +225,42 @@ done
 for v in "${volumes[@]:-}"; do
   [[ -n "$v" ]] && create_args+=(-v "$v")
 done
+[[ "$ssh" -eq 1 ]] && create_args+=(-v "$RUNS_DIR/$name:/vmf-run")
 [[ -n "$cpus" ]] && create_args+=(--cpus "$cpus")
 
-AGENT_DIR="${VMF_AGENT_DIR:-$HOME/.local/share/vmf/agent}"
-use_agent=0
-if [[ "$agent" -eq 1 && -x "$AGENT_DIR/vmf-agent" ]]; then
-  use_agent=1
-  create_args+=(-v "$AGENT_DIR:/vmf-agent" --port "${agent_port}:7777")
-  printf '%s' "$resolved_json" > "$AGENT_DIR/config.json"
-fi
+# State for `just ssh <name>`.
+cat > "$RUNS_DIR/$name.conf" <<EOF
+PORT=$ssh_port
+IMAGE=$image
+PIN=${digest:-}
+DERIVED=${DERIVED_TAG:-}
+EOF
 
 # Runs are disposable: a stale VM of the same name is replaced.
 krun delete "$name" >/dev/null 2>&1 || true
-echo "creating microVM '$name' from $ref (pulls the image on first use)..."
-krun create "$ref" "${create_args[@]}"
+echo "creating microVM '$name' from $create_ref (pulls on first use)..."
+krun create "$create_ref" "${create_args[@]}"
 
 cleanup() {
   if [[ "$keep" -eq 0 ]]; then
     krun delete "$name" >/dev/null 2>&1 || true
+    rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name.conf"
   else
     echo "note: kept microVM '$name' (krunvm delete $name to remove)"
   fi
 }
 trap cleanup EXIT
 
-if [[ "$use_agent" -eq 1 ]]; then
+if [[ "$ssh" -eq 1 ]]; then
+  echo "microVM '$name': ssh with 'just ssh $name' (pubkey, port $ssh_port)"
   set +e
-  krun start "$name" -- /vmf-agent/vmf-agent /vmf-agent/config.json
+  krun start "$name" -- /vmf/init.sh
   status=$?
   set -e
 else
-  mapfile -t argv < <(printf '%s' "$resolved_json" | python3 -c '
-import json, sys
-for a in json.load(sys.stdin):
-    print(a)
-')
+  # Plain mode: argv straight through krunvm (no derive, no ssh).
+  argv_file="$RUNS_DIR/$name/argv.sh"
+  mapfile -t argv < <(eval "printf '%s\n' $(cat "$argv_file")")
   set +e
   krun start "$name" -- ${argv[@]+"${argv[@]}"}
   status=$?
