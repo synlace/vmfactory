@@ -60,9 +60,13 @@ ssh lab=lab *cmd:
 enter lab=lab *cmd:
     sh scripts/enter.sh {{ lab }} {{ cmd }}
 
-# Run a command inside a running box
-exec lab=lab *cmd:
-    sh scripts/enter.sh {{ lab }} {{ cmd }}
+# Run a command inside a running box (ssh) or microVM (agent exec)
+exec name *cmd:
+    #!/bin/sh
+    if [ -f "build/{{ name }}/vm.conf" ]; then
+      exec sh scripts/enter.sh "{{ name }}" {{ cmd }}
+    fi
+    exec sh scripts/oci-exec.sh "{{ name }}" {{ cmd }}
 
 # Print the dedicated IP of a box, declared in the spec
 ip lab=lab:

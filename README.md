@@ -98,6 +98,14 @@ just run --keep image                              # keep the VM for reuse
   below 1024 fails (`listen() ... Permission denied`). With `-p 8080:80`
   the host side binds 8080 (unprivileged OK) and the guest bind is
   virtualized by TSI — mapped ports work even for guest port 80.
+- Exec into running VMs (`just exec <name> <cmd>`): every agent-mode run
+  boots the static guest agent (`agent/main.go`, built to
+  `~/.local/share/vmf/agent/vmf-agent`) as the guest init, which execs the
+  image entrypoint and serves exec requests on the agent port (47770).
+  This is true docker-exec semantics — the shell sees the running VM's
+  live process table. Not supported: interactive stdin (TSI forwarded
+  connections lack half-close). Route: `just exec` picks the qemu-box
+  path when `build/<name>/vm.conf` exists, else the agent path.
 - Known krunvm 0.2.4 quirk: guest commands containing shell quotes get
   mangled in transit; keep commands quote-free (use `env` style).
 
