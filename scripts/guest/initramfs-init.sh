@@ -42,6 +42,10 @@ $BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-ru
 
 hn=$($BB cat /root/vmf-run/hostname 2>/dev/null)
 [ -n "$hn" ] && $BB hostname "$hn"
+# Docker parity: docker makes the container hostname resolvable via
+# /etc/hosts. Without this, apps that resolve their own hostname (apache
+# ServerName, slapd, postfix...) log warnings or fail at startup.
+[ -n "$hn" ] && [ -d /root/etc ] && echo "10.0.2.15 $hn" >> /root/etc/hosts
 [ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
 
 if [ -x /root/vmf/init.sh ]; then

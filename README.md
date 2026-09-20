@@ -124,7 +124,9 @@ an in-guest ssh server). For microVMs:
 - On first use of an image, `scripts/derive.sh` commits one extra layer
   on top of the pinned bytes: a static musl bundle
   (`~/.local/share/vmf/ssh-bundle`: busybox + dropbear for krunvm,
-  OpenSSH sshd + ssh-keygen for qemu) plus `scripts/guest/init.sh`,
+  OpenSSH sshd + ssh-keygen for qemu; stage or update it with
+  `scripts/stage-bundle.sh`, which builds everything from nixpkgs with
+  sshd's utmp/wtmp logging disabled) plus `scripts/guest/init.sh`,
   plus `/etc/passwd` + `/etc/shells` fixups so every base behaves
   identically (distroless gets a root entry; root's shell is forced to
   `/vmf/sh`).

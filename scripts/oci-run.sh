@@ -259,6 +259,8 @@ if [[ "$ssh" -eq 1 ]]; then
   # Content-addressed tag: base digest + bundle/init content. Any change
   # to the guest payload busts the derive cache.
   content=$(cat "$BUNDLE_DIR/dropbear" "$BUNDLE_DIR/dropbearkey" "$BUNDLE_DIR/busybox" \
+    "$BUNDLE_DIR/sshd" "$BUNDLE_DIR/ssh-keygen" "$BUNDLE_DIR/sshd-session" \
+    "$BUNDLE_DIR/sshd-auth" "$BUNDLE_DIR/moduli" \
     "$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
     "$(cd "$(dirname "$0")" && pwd)/derive.sh" | sha256sum | cut -c1-8)
   DERIVED_TAG="v$(printf '%s' "$ref" | cksum | cut -d' ' -f1 | cut -c1-10)-$content"
@@ -272,6 +274,7 @@ if [[ "$ssh" -eq 1 ]]; then
   VMF_BUNDLE="$BUNDLE_DIR" VMF_INIT="$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
   VMF_DERIVE_DIR="$DERIVE_DIR" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/derive.sh"
+  mkdir -p "$RUNS_DIR/$name/auth"
   cp "$SSH_DIR/id_ed25519.pub" "$RUNS_DIR/$name/auth/authorized_keys"
   create_ref="$DERIVED"
 else
@@ -309,6 +312,7 @@ EOF
 # Per-run guest inputs shared into the VM (hostname for the kernel UTS,
 # engine marker for the guest init's power-off behavior, port forwards
 # for slirp hostfwd).
+mkdir -p "$RUNS_DIR/$name"
 printf '%s\n' "$name" > "$RUNS_DIR/$name/hostname"
 printf '%s\n' "$ENGINE" > "$RUNS_DIR/$name/engine"
 : > "$RUNS_DIR/$name/hostfwd"
