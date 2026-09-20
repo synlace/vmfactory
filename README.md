@@ -232,17 +232,35 @@ an in-guest ssh server). For microVMs:
 
 `vmf run github.com/org/repo` works without a scheme (gitlab.com and
 bitbucket.org too); `https://`, `git@`, and `file://` URLs also work,
-and a plain local directory path runs the same pipeline. The compose
-file is found at the repo root or in a unique subdirectory (two levels
-deep; several matches fail with the list).
+and a plain local directory path runs the same pipeline. A URL with
+extra path segments selects the project inside the repo
+(`github.com/org/repo/apps/upper`; the clone URL stays the repo root).
 
-The translation is deterministic (no LLM on the happy path): services,
-image|build (context, dockerfile, args), ports (TCP/UDP), expose, env
-(mapping and list forms), env_file, command, entrypoint, depends_on,
-network aliases. Known gaps (a compose file relying on them still
-boots, but those parts are inert): volumes (named volumes and bind
-mounts are dropped), custom network isolation (everything lands on one
-static-IP project network), healthchecks, replicas.
+Multi-project repos (one compose per lab) never guess: every candidate
+compose file under the root or the first two directory levels gets a
+menu (name, services, ports) and `vmf` refuses to boot until you pick
+one by path hint, `--project <name-or-path>`, or `--intent "<phrase>"`.
+
+`--intent` sends the menu plus your phrase to a small LLM that returns
+a pointer ({project, ref, variant}); the pointer must be one of the
+menu entries or the run refuses. `ref` re-clones that branch or tag;
+`variant` overrides any `variant` build arg. Config lives in
+`~/.vmf/env` (chmod 600): `VMF_LLM_API_KEY`, `VMF_LLM_MODEL`,
+`VMF_LLM_BASE_URL` (any OpenAI-compatible endpoint; defaults to
+OpenRouter), `VMF_INTENT_MODEL`, `VMF_GAPFILL_MODEL`. Without a key
+the LLM paths degrade to the deterministic menu — the model is an
+accelerator, never a dependency. The compose translation itself is
+always deterministic.
+
+The compose file is found at the repo root or in a unique subdirectory
+(two levels deep). The translation is deterministic (no LLM on the
+happy path): services, image|build (context, dockerfile, args), ports
+(TCP/UDP), expose, env (mapping and list forms), env_file, command,
+entrypoint, depends_on, network aliases. Known gaps (a compose file
+relying on them still boots, but those parts are inert): volumes
+(named volumes and bind mounts are dropped), custom network isolation
+(everything lands on one static-IP project network), healthchecks,
+replicas.
 
 Because the guest has no docker embedded DNS (its resolver DNAT needs
 iptables, which the module-less microVM kernel does not ship), each

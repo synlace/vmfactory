@@ -25,6 +25,8 @@ DOCKER_BUNDLE="${VMF_DOCKER_BUNDLE:-$HOME/.local/share/vmf/docker-bundle}"
 COMPOSE_CACHE="${VMF_COMPOSE_CACHE:-$HOME/.vmf/compose}"
 PINS="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 VMF_COMPOSE_RUNID="${VMF_COMPOSE_RUNID:-0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export VMF_SCRIPTS_DIR="$SCRIPT_DIR"
 
 tag_for() { printf 'localhost/vmf-compose/%s-%s:%s' "$VMF_COMPOSE_SLUG" "$1" "$VMF_COMPOSE_RUNID"; }
 
@@ -51,50 +53,165 @@ if [[ "${VMF_COMPOSE_KEEPPLAN:-0}" == "1" ]]; then
 fi
 
 "${PY[@]}" - "$VMF_COMPOSE_SRC" "$plan_tmp/plan.json" <<'PYEOF'
-import json, os, sys, yaml
+import json, os, shutil, subprocess, sys, yaml
 src = sys.argv[1]
 out = sys.argv[2]
 NAMES = ("compose.yaml", "docker-compose.yaml", "compose.yml", "docker-compose.yml")
 SKIP_DIRS = {".git", "node_modules", ".github", "__pycache__", ".idea", ".vscode"}
 
-def pick_compose(root):
-    # Root first, then a unique compose file anywhere in the first two
-    # directory levels (monorepos keep projects in subdirs).
-    for cand in NAMES:
-        p = os.path.join(src, cand)
-        if os.path.isfile(p):
-            return cand, os.path.join(src, cand)
+def meta(path):
+    # Cheap per-candidate metadata for the menu and the hint matcher.
+    try:
+        doc = yaml.safe_load(open(path)) or {}
+    except Exception as exc:
+        return None, ["unparseable: %s" % exc], []
+    name = doc.get("name") or ""
+    svcs = doc.get("services") or {}
+    ports = [str(pv) for s in svcs.values() for pv in (s.get("ports") or [])]
+    return str(name), list(svcs), ports
+
+def scan(root):
+    # Every compose file in the first two directory levels (one project
+    # per directory is the monorepo layout).
     hits = []
-    for dirpath, dirnames, filenames in os.walk(src):
-        rel = os.path.relpath(dirpath, src)
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
         if rel != "." and rel.count(os.sep) >= 2:
             dirnames[:] = []
             continue
-        if dirpath == src:
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-            continue
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if dirpath == root:
+            continue
         for cand in NAMES:
             if cand in filenames:
-                hits.append((dirpath, cand))
+                name, svcs, ports = meta(os.path.join(dirpath, cand))
+                hits.append({"dir": dirpath, "rel": rel, "file": cand,
+                             "name": name, "services": svcs, "ports": ports})
                 break
-    if not hits:
-        sys.stderr.write("error: no compose file in %s (root or first two dir levels)\n" % src)
-        sys.exit(1)
-    if len(hits) > 1:
-        sys.stderr.write("error: several compose files under %s:\n" % src)
-        for d, cand in sorted(hits):
-            sys.stderr.write("  error:   %s/%s\n" % (os.path.relpath(d, src), cand))
-        sys.stderr.write("error: pass the project directory explicitly to pick one\n")
-        sys.exit(1)
-    d, cand = hits[0]
-    return d, os.path.join(d, cand)
+    return hits
 
-compose_dir, compose_path = pick_compose(src)
+def menu(hits, root):
+    sys.stderr.write("vmf: several projects under %s:\n" % root)
+    for h in sorted(hits, key=lambda h: h["rel"]):
+        ps = " ".join(h["ports"][:4]) if h["ports"] else "-"
+        sys.stderr.write("  vmf:   %-28s %-14s %d services  ports %s\n"
+                         % (h["rel"], h["name"] or "-", len(h["services"]), ps))
+    sys.stderr.write("  vmf: run one explicitly:\n")
+    sys.stderr.write("  vmf:   vmf run <repo>/<relpath>\n")
+    sys.stderr.write("  vmf:   vmf run <repo> --project <name-or-path>\n")
+    sys.stderr.write("  vmf:   vmf run <repo> --intent \"which one to run\"\n")
+
+hint = os.environ.get("VMF_COMPOSE_PROJECT", "").strip()
+intent = os.environ.get("VMF_RUN_INTENT", "").strip()
+
+def resolve(root, hits, hint):
+    # A hint matches by relative path prefix, directory name, or compose
+    # name. Unambiguous only when exactly one candidate survives.
+    if hint:
+        matched = [h for h in hits
+                   if h["rel"] == hint
+                   or h["rel"].startswith(hint.rstrip("/") + "/")
+                   or os.path.basename(h["rel"]) == hint
+                   or (h["name"] and h["name"] == hint)]
+        if len(matched) != 1:
+            if not matched:
+                sys.stderr.write("error: no compose project matches '%s'\n" % hint)
+            else:
+                sys.stderr.write("error: hint '%s' matches several projects\n" % hint)
+            menu(hits, root)
+            sys.exit(1)
+        return matched[0]
+    if len(hits) == 1:
+        return hits[0]
+    menu(hits, root)
+    sys.exit(2)
+
+def resolve_intent(root, hits, phrase):
+    # The LLM picks a pointer from the enumerated menu. Anything outside
+    # the menu is a hard error, never a boot.
+    llm = os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh")
+    menu_json = [{"path": h["rel"], "name": h["name"],
+                  "services": len(h["services"]), "ports": h["ports"][:8]}
+                 for h in sorted(hits, key=lambda h: h["rel"])]
+    prompt = ("Project menu (choose one path from this list only):\n%s\n\n"
+              "User request: %s\n\n"
+              "Reply with JSON: {\"project\": \"<path from the menu>\", "
+              "\"ref\": \"<git branch or tag, or null>\", "
+              "\"variant\": \"<build variant value, or null>\", "
+              "\"why\": \"<max 8 words>\"}" % (json.dumps(menu_json), phrase))
+    proc = subprocess.run(["bash", llm, "--role", "intent", prompt],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        # Deterministic fallback: the menu. The model is an accelerator,
+        # never a dependency.
+        sys.stderr.write(proc.stderr)
+        menu(hits, root)
+        sys.exit(2)
+    try:
+        sel = json.loads(proc.stdout.strip().strip("`"))
+        if isinstance(sel, str):
+            sel = json.loads(sel)
+    except Exception:
+        sys.stderr.write("error: --intent returned unparseable output; run without --intent\n")
+        sys.exit(1)
+    want = sel.get("project")
+    for h in hits:
+        if h["rel"] == want or (h["name"] and h["name"] == want):
+            return h, sel
+    sys.stderr.write("error: llm picked '%s' which is not a menu project; refusing\n"
+                     % want)
+    menu(hits, root)
+    sys.exit(1)
+
+# Root compose wins; otherwise every subdirectory compose is a candidate.
+candidates = []
+for cand in NAMES:
+    p = os.path.join(src, cand)
+    if os.path.isfile(p):
+        name_, svcs_, ports_ = meta(p)
+        candidates.append({"dir": src, "rel": ".", "file": cand,
+                           "name": name_, "services": svcs_, "ports": ports_})
+        break
+if not candidates:
+    candidates = scan(src)
+
+sel = None
+if candidates:
+    if intent and not hint:
+        resolved, sel = resolve_intent(src, candidates, intent)
+    else:
+        resolved = resolve(src, candidates, hint)
+else:
+    resolved = None
+if not candidates:
+    sys.stderr.write("error: no compose file in %s (root or first two dir levels)\n" % src)
+    sys.exit(1)
+
+compose_dir = resolved["dir"]
+compose_path = os.path.join(compose_dir, resolved["file"])
 if compose_dir != src:
-    # Monorepo: everything below resolves against the project dir.
     src = compose_dir
-    sys.stderr.write("compose: using %s/%s\n" % (os.path.relpath(compose_dir, sys.argv[1]), os.path.basename(compose_path)))
+    sys.stderr.write("compose: using %s/%s\n"
+                     % (os.path.relpath(compose_dir, sys.argv[1]), resolved["file"]))
+if sel:
+    ref = (sel.get("ref") or "").strip()
+    variant = (sel.get("variant") or "").strip()
+    sys.stderr.write("intent: lab=%s (%s, %d services) ref=%s variant=%s [llm: %s]\n"
+                     % (resolved["rel"], resolved["name"] or "-",
+                        len(resolved["services"]), ref or "default", variant or "-",
+                        (sel.get("why") or "")[:40]))
+    url = os.environ.get("VMF_COMPOSE_URL")
+    if ref and url:
+        sys.stderr.write("intent: re-cloning %s @ %s\n" % (url, ref))
+        shutil.rmtree(src, ignore_errors=True)
+        rc = subprocess.run(["git", "clone", "--depth", "1", "--branch", ref,
+                             url, sys.argv[1]]).returncode
+        if rc != 0 or not os.path.isfile(compose_path):
+            sys.stderr.write("error: ref %s has no compose at %s\n" % (ref, resolved["rel"]))
+            sys.exit(1)
+    if variant:
+        os.environ["VMF_VARIANT_OVERRIDE"] = variant
+
 doc = yaml.safe_load(open(compose_path))
 svcs = doc.get("services") or {}
 
@@ -226,6 +343,27 @@ if not prim:
 plan["primary"] = prim[0]["name"]
 json.dump(plan, open(out, "w"))
 PYEOF
+
+# Intent variant override: a build arg whose key matches "variant"
+# (case-insensitive) gets the requested value in every built service.
+if [[ -n "${VMF_VARIANT_OVERRIDE:-}" ]]; then
+  VMF_VARIANT_OVERRIDE="$VMF_VARIANT_OVERRIDE" "${PY[@]}" - "$plan_tmp/plan.json" <<'PYV'
+import json, os, sys
+p = json.load(open(sys.argv[1]))
+v = os.environ["VMF_VARIANT_OVERRIDE"]
+n = 0
+for e in p["services"]:
+    a = (e.get("build") or {}).get("args")
+    if a:
+        for k in list(a):
+            if k.lower() == "variant":
+                a[k] = v
+                n += 1
+json.dump(p, open(sys.argv[1], "w"))
+if n:
+    print("intent: VARIANT=%s applied to %d service(s)" % (v, n))
+PYV
+fi
 
 if command -v jq >/dev/null 2>&1; then
   JQ=(jq -r)

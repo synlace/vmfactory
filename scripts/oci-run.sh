@@ -37,6 +37,12 @@ Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
                   beyond fail with EFBIG (disk-full semantics)
   -p HOST:GUEST   publish host port to guest port (repeatable; suffix
                   /udp for UDP, e.g. 53:53/udp)
+  --project P     compose project inside a multi-project repo: path
+                  relative to the repo root, directory name, or the
+                  compose file's name field
+  --intent TEXT   natural-language project/version pick; resolves to a
+                  pointer from the candidate menu through an LLM (needs
+                  VMF_LLM_API_KEY in ~/.vmf/env; degrades to the menu)
   --expose MODE   port exposure: all (default: auto-publish every port
                   the guest discovers, TCP+UDP) | declared (only -p /
                   compose-declared ports) | none. An explicit -p makes
@@ -56,6 +62,8 @@ ports=()
 volumes=()
 envs=()
 expose=""
+project_hint=""
+intent=""
 name=""
 cpus=""
 mem=""
@@ -67,6 +75,8 @@ keep=0
 detach=0
 image=""
 cmd_args=()
+# Needed by the compose handoff, which runs before the later defaults.
+RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,6 +91,8 @@ while [[ $# -gt 0 ]]; do
     --disk-cap) [[ $# -ge 2 ]] || usage; diskcap="$2"; shift 2 ;;
     -i|-t|-it|-ti|-itd|-dit) echo "note: '$1' ignored: microVMs have no PTY" >&2; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
+    --project) [[ $# -ge 2 ]] || usage; project_hint="$2"; shift 2 ;;
+    --intent) [[ $# -ge 2 ]] || usage; intent="$2"; shift 2 ;;
     --expose) [[ $# -ge 2 ]] || usage; expose="$2"; shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
@@ -113,22 +125,54 @@ fi
 # Compose mode: a git URL or a directory containing a compose file.
 # The pipeline lives in compose-run.sh; it hands back to this script
 # with a local image tag and VMF_MODE=compose + VMF_DATA_DRIVE set.
+clone_url="$image"; proj_hint="${project_hint:-}"
+# Path hints: a URL with segments beyond host/org/repo selects the
+# project inside the repo (github.com/org/repo/apps/upper), matching
+# the compose-spec url#path convention.
+case "$image" in
+  https?://*)
+    p="${image#*://}"; p="${p%%#*}"; p="${p%.git}"
+    if [[ "$p" == */*/*/* ]]; then
+      rest="${p#*/*/*/}"
+      clone_url="https://${p%/$rest}"
+      proj_hint="${proj_hint:-$rest}"
+    fi ;;
+  git@*)
+    p="${image#git@}"; h="${p%%:*}"; r="${p#*:}"; r="${r%.git}"
+    if [[ "$r" == */*/* ]]; then
+      rest="${r#*/*/}"
+      clone_url="git@$h:${r%/$rest}.git"
+      proj_hint="${proj_hint:-$rest}"
+    fi ;;
+  file://*)
+    # file:///path/to/repo.git/rest: the hint starts after ".git/".
+    p="${image#file://}"; p="${p%%#*}"
+    case "$p" in
+      *.git/*)
+        clone_url="file://${p%%.git/*}.git"
+        proj_hint="${proj_hint:-${p#*.git/}}" ;;
+    esac ;;
+esac
 if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   repo_src="$RUNS_DIR/.compose-src.$$"
   rm -rf "$repo_src"
   mkdir -p "$repo_src"
   if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 "$image" "$repo_src" 2>&1 | tail -1
+    git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
   else
-    nix shell nixpkgs#git -c git clone --depth 1 "$image" "$repo_src" 2>&1 | tail -1
+    nix shell nixpkgs#git -c git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
   fi
-  export VMF_COMPOSE_SRC="$repo_src"
-  name="${name:-$(basename "${image%%.git}")}"
+  export VMF_COMPOSE_SRC="$repo_src" VMF_COMPOSE_URL="$clone_url"
+  name="${name:-$(basename "${clone_url%%.git}")}"
+  [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
+  [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
 elif [[ -d "$image" ]]; then
   # Any local directory: compose-run.sh locates the compose file (root,
   # then a unique subdirectory) and errors clearly when there is none.
   export VMF_COMPOSE_SRC="$(cd "$image" && pwd)"
   name="${name:-$(basename "$image")}"
+  [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
+  [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
 fi
 if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
