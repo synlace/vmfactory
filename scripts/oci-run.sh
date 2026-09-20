@@ -77,6 +77,7 @@ image=""
 cmd_args=()
 # Needed by the compose handoff, which runs before the later defaults.
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
+ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
