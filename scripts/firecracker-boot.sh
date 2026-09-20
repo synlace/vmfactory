@@ -41,8 +41,6 @@ cat > "$boot_json" <<EOF
       "path_on_host": "$VMF_ASSETS_SQUASHFS" },
     { "drive_id": "inputs", "is_root_device": false, "is_read_only": true,
       "path_on_host": "$VMF_RUNDIR/inputs.ext4" }
-    ${VMF_DATA_DRIVE:+, { "drive_id": "data", "is_root_device": false, "is_read_only": false,
-      "path_on_host": "$VMF_DATA_DRIVE" }}
   ],
   "network-interfaces": [
     { "iface_id": "0", "guest_mac": "$guest_mac", "host_dev_name": "tap0" }
@@ -51,14 +49,18 @@ cat > "$boot_json" <<EOF
 }
 EOF
 
-if [[ "$VMF_NET_MODE" == "off" ]]; then
-  python3 - "$boot_json" <<'PY'
-import json, sys
+python3 - "$boot_json" <<'PY'
+import json, os, sys
 cfg = json.load(open(sys.argv[1]))
-cfg.pop("network-interfaces", None)
+if os.environ.get("VMF_NET_MODE") == "off":
+    cfg.pop("network-interfaces", None)
+data = os.environ.get("VMF_DATA_DRIVE")
+if data:
+    cfg["drives"].append({"drive_id": "data", "is_root_device": False,
+                          "is_read_only": False,
+                          "path_on_host": os.environ["VMF_DATA_DRIVE"]})
 json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 PY
-fi
 
 fc_run() {
   local tcmd=()

@@ -41,10 +41,13 @@ fi
 
 plan_tmp=$(mktemp -d)
 data_tmp="$plan_tmp/data"
-trap 'rm -rf "$plan_tmp"' EXIT
+# EXIT alone does not fire on SIGTERM (timeout kills), so trap INT and
+# TERM too — a killed run must not leak a ~800 MB staging dir per
+# attempt.
+trap 'rm -rf "$plan_tmp"' EXIT INT TERM
 if [[ "${VMF_COMPOSE_KEEPPLAN:-0}" == "1" ]]; then
   # Keep the working dir for diagnosis instead of cleaning it up.
-  trap 'echo "compose: kept working dir: $plan_tmp"' EXIT
+  trap 'echo "compose: kept working dir: $plan_tmp"' EXIT INT TERM
 fi
 
 "${PY[@]}" - "$VMF_COMPOSE_SRC" "$plan_tmp/plan.json" <<'PYEOF'
@@ -195,9 +198,9 @@ PYEOF
 
 # --- data drive ----------------------------------------------------------
 stage="$plan_tmp/data"
-mkdir -p "$stage/images" "$stage/docker"
+mkdir -p "$stage/images" "$stage/docker/bin"
 cp "$plan_tmp/compose.yaml" "$stage/compose.yaml"
-cp "$DOCKER_BUNDLE"/bin/* "$stage/docker/"
+cp "$DOCKER_BUNDLE"/bin/* "$stage/docker/bin/"
 while IFS=$'\t' read -r name kind rest; do
   # Built services push their local tag; pulled services push by digest
   # ref (the store only has the upstream name). Either way the tar
@@ -214,7 +217,7 @@ done < <("${JQ[@]}" -r '.services[] | [.name, (if .image then "image" else "buil
 
 size_kb=$(du -sk "$stage" | cut -f1)
 fs_size=$(( size_kb + size_kb / 4 + 65536 ))
-h=$(cat "$plan_tmp/manifest.json" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
+h=$(printf 'layout-v2\n' | cat - "$plan_tmp/manifest.json" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
 mkdir -p "$COMPOSE_CACHE"
 drive="$COMPOSE_CACHE/${VMF_NAME}-$h.ext4"
 if [[ ! -f "$drive" ]]; then
@@ -242,5 +245,12 @@ if [[ "${VMF_COMPOSE_NOEXEC:-0}" == "1" ]]; then
   echo "compose: noexec; primary=$primary_tag data=$drive ports=${ports_args[*]:-none}"
   exit 0
 fi
-exec env VMF_MODE=compose VMF_DATA_DRIVE="$drive" \
-  "$SCRIPT_DIR/oci-run.sh" --name "$VMF_NAME" ${ports_args[@]+"${ports_args[@]}"} "$primary_tag"
+# Reconstruct the original run flags for the second oci-run pass: the
+# first pass parsed them; without this the VM boots on defaults.
+run_args=(--name "$VMF_NAME" --engine "${VMF_RUN_ENGINE:-qemu}")
+[[ "${VMF_RUN_DETACH:-0}" == "1" ]] && run_args+=(-d)
+[[ "${VMF_RUN_KEEP:-0}" == "1" ]] && run_args+=(--keep)
+run_args+=(--memory "${VMF_RUN_MEM:-1024}" --cpus "${VMF_RUN_CPUS:-2}" --net "${VMF_RUN_NETMODE:-open}")
+[[ "${VMF_RUN_TIMEOUT_SECS:-0}" -gt 0 ]] && run_args+=(--timeout "${VMF_RUN_TIMEOUT_SECS}s")
+exec env -u VMF_COMPOSE_SRC VMF_MODE=compose VMF_DATA_DRIVE="$drive" \
+  "$SCRIPT_DIR/oci-run.sh" ${run_args[@]+"${run_args[@]}"} ${ports_args[@]+"${ports_args[@]}"} "$primary_tag"

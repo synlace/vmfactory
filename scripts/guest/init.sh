@@ -16,6 +16,7 @@ BB=/vmf/busybox
 engine=$($BB cat /vmf-run/engine 2>/dev/null || true)
 case "$engine" in
   krunvm) ;;
+  firecracker) trap '$BB reboot -f' EXIT ;;
   *) trap '$BB poweroff -f' EXIT ;;
 esac
 
@@ -71,16 +72,25 @@ eval "set -- $(/vmf/busybox cat /vmf-run/argv.sh)"
 # compose bridge, published ports go through the userland proxy, and
 # the host reaches them via the usual slirp hostfwd.
 mode=$($BB cat /vmf-run/mode 2>/dev/null || echo direct)
+$BB echo "vmf-init: mode=$mode"
 if [ "$mode" = "compose" ]; then
+  $BB echo "vmf-init: compose branch"
   $BB mkdir -p /data
   dd=/dev/vdb
   $BB test -b /dev/vdc && dd=/dev/vdc
+  $BB echo "vmf-init: mounting data drive $dd"
   $BB mount -t ext4 "$dd" /data || {
     echo "vmf-init: cannot mount data drive" >&2
     exit 3
   }
   export PATH="/data/docker/bin:$PATH"
+  # dockerd needs a mounted cgroup hierarchy (v2 preferred; the devices
+  # controller arrives via CGROUP_DEVICE/CGROUP_BPF in the kernel).
+  $BB mkdir -p /sys/fs/cgroup
+  $BB mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
   $BB mkdir -p /data/docker-data
+  $BB mkdir -p /root/.docker/cli-plugins
+  $BB ln -sf /data/docker/bin/docker-compose /root/.docker/cli-plugins/docker-compose
   dockerd --iptables=false --ip6tables=false \
     --data-root /data/docker-data --storage-driver=overlay2 \
     >/data/dockerd.log 2>&1 &
@@ -99,7 +109,7 @@ if [ "$mode" = "compose" ]; then
   for f in /data/images/*.tar; do
     [ -e "$f" ] || continue
     $BB echo "vmf-init: docker load $f"
-    docker load -i "$f" >/dev/null || $BB echo "vmf-init: docker load failed: $f" >&2
+    docker load -i "$f" || $BB echo "vmf-init: docker load failed: $f" >&2
   done
   $BB echo "vmf-init: docker compose up"
   docker compose -f /data/compose.yaml up -d || {

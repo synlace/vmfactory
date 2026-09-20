@@ -104,11 +104,12 @@ elif [[ -d "$image" ]] && { [[ -f "$image/compose.yaml" || -f "$image/compose.ym
   export VMF_COMPOSE_SRC="$(cd "$image" && pwd)"
   name="${name:-$(basename "$image")}"
 fi
-if [[ -n "${VMF_COMPOSE_SRC:-}" ]]; then
+if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
   export VMF_RUN_DETACH="${detach:-0}" VMF_RUN_KEEP="${keep:-0}"
   export VMF_RUN_MEM="${mem:-1024}" VMF_RUN_NETMODE="${netmode:-open}"
   export VMF_RUN_TIMEOUT_SECS="${timeout_secs:-0}" VMF_RUN_CPUS="${cpus:-2}"
+  export VMF_RUN_ENGINE="$ENGINE"
   exec bash "$(cd "$(dirname "$0")" && pwd)/compose-run.sh"
 fi
 
@@ -667,7 +668,7 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   stage="$rundir/inputs"
   mkdir -p "$stage/auth"
   cp "$SSH_DIR/id_ed25519.pub" "$stage/auth/authorized_keys" 2>/dev/null || true
-  for f in hostname engine hostfwd env argv.sh cwd uid; do
+  for f in hostname engine mode hostfwd env argv.sh cwd uid; do
     [[ -f "$rundir/$f" ]] && cp "$rundir/$f" "$stage/$f"
   done
   if command -v mke2fs >/dev/null 2>&1; then
