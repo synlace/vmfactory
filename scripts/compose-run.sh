@@ -69,6 +69,10 @@ if not svcs:
 plan = {"compose_file": os.path.basename(p), "services": []}
 for name, s in svcs.items():
     e = {"name": name}
+    if s.get("command"):
+        e["command"] = s["command"]
+    if s.get("entrypoint"):
+        e["entrypoint"] = s["entrypoint"]
     if s.get("build"):
         b = s["build"]
         if isinstance(b, str):
@@ -86,12 +90,35 @@ for name, s in svcs.items():
     ports = []
     for pv in s.get("ports") or []:
         pv = str(pv)
+        # Proto suffix ("53:53/udp"); tcp is the default.
+        proto = "tcp"
+        if "/" in pv:
+            pv, suffix = pv.rsplit("/", 1)
+            if suffix == "udp":
+                proto = "udp"
+            elif suffix != "tcp":
+                sys.stderr.write("warning: port '%s' for %s: unknown proto; skipped\n" % (pv, name))
+                continue
         parts = pv.split(":")
-        if len(parts) >= 2:
-            ports.append({"host": int(parts[0]), "guest": int(parts[-1])})
+        if len(parts) >= 2 and parts[0].isdigit() and parts[-1].isdigit():
+            # compose "HOST:CONTAINER": the VM side listens on HOST and a
+            # socat forward bridges HOST -> the container port; the
+            # slirp hostfwd maps host:HOST -> vm:HOST.
+            ports.append({"host": int(parts[0]),
+                          "cport": int(parts[-1]), "proto": proto})
         else:
-            sys.stderr.write("warning: port '%s' for %s is guest-only; not published\n" % (pv, name))
+            sys.stderr.write("warning: port '%s' for %s is guest-only or an unsupported form; not published\n" % (pv, name))
     e["ports"] = ports
+    # Guest-only listeners (no host mapping): kept so the guest expose
+    # daemon can auto-forward them from Config.ExposedPorts.
+    exp = []
+    for pv in s.get("expose") or []:
+        pv = str(pv)
+        if "/" not in pv:
+            pv = pv + "/tcp"
+        exp.append(pv)
+    if exp:
+        e["expose"] = exp
     env = {}
     for kv in s.get("environment") or []:
         if isinstance(kv, str):
@@ -178,28 +205,38 @@ tags_json=$(printf '{%s}' "$(for k in "${!SVC_TAGS[@]}"; do printf '"%s":"%s",' 
   '$plan[0] + {digests: $digests, tags: $tags}' > "$plan_tmp/manifest.json"
 
 # --- flattened compose file (no builds, local tags only) ----------------
-"${PY[@]}" - "$plan_tmp/manifest.json" "$plan_tmp/compose.yaml" <<'PYEOF'
+"${PY[@]}" - "$plan_tmp/manifest.json" "$plan_tmp/compose.yaml" "$plan_tmp/ports.txt" <<'PYEOF'
 import json, sys, yaml
 m = json.load(open(sys.argv[1]))
 svcs = {}
+fwd = []
 for e in m["services"]:
     n = e["name"]
     tag = m["tags"].get(n) or e.get("image")
     entry = {"image": tag}
-    if e["ports"]:
-        entry["ports"] = ["%d:%d" % (p["host"], p["guest"]) for p in e["ports"]]
+    if e.get("command"):
+        entry["command"] = e["command"]
+    if e.get("entrypoint"):
+        entry["entrypoint"] = e["entrypoint"]
+    if e.get("expose"):
+        entry["expose"] = e["expose"]
+    # ports are NOT published by docker: the guest expose daemon runs
+    # socat forwards from ports.txt, exposing them on the VM address.
+    for p in e["ports"]:
+        fwd.append("%s %d %d %s" % (p["proto"], p["host"], p["cport"], n))
     if e["env"]:
         entry["environment"] = e["env"]
     if e["depends_on"]:
         entry["depends_on"] = e["depends_on"]
     svcs[n] = entry
 yaml.safe_dump({"services": svcs}, open(sys.argv[2], "w"), sort_keys=False)
+open(sys.argv[3], "w").write("\n".join(fwd) + ("\n" if fwd else ""))
 PYEOF
-
 # --- data drive ----------------------------------------------------------
 stage="$plan_tmp/data"
 mkdir -p "$stage/images" "$stage/docker/bin"
 cp "$plan_tmp/compose.yaml" "$stage/compose.yaml"
+cp "$plan_tmp/ports.txt" "$stage/ports.txt"
 cp "$DOCKER_BUNDLE"/bin/* "$stage/docker/bin/"
 while IFS=$'\t' read -r name kind rest; do
   # Built services push their local tag; pulled services push by digest
@@ -216,16 +253,24 @@ while IFS=$'\t' read -r name kind rest; do
 done < <("${JQ[@]}" -r '.services[] | [.name, (if .image then "image" else "build" end), (.image // .build.context)] | @tsv' "$plan_tmp/plan.json")
 
 size_kb=$(du -sk "$stage" | cut -f1)
-fs_size=$(( size_kb + size_kb / 4 + 65536 ))
-h=$(printf 'layout-v2\n' | cat - "$plan_tmp/manifest.json" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
+# Docker storage needs headroom: the images tars decompress into
+# docker-data on the same drive. Sparse file: host disk usage grows
+# with real use.
+fs_size=$(( size_kb * 4 + 4194304 ))
+h=$(printf 'layout-v3\n' | cat - "$plan_tmp/manifest.json" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
 mkdir -p "$COMPOSE_CACHE"
 drive="$COMPOSE_CACHE/${VMF_NAME}-$h.ext4"
 if [[ ! -f "$drive" ]]; then
-  echo "compose: building data drive ($(( fs_size / 1024 )) MiB)..."
-  if command -v mke2fs >/dev/null 2>&1; then
-    mke2fs -q -F -t ext4 -d "$stage" "$drive.tmp" $(( fs_size * 1024 / 1024 ))
+  echo "compose: building data drive ($(( fs_size / 1024 )) MiB sparse)..."
+  if command -v truncate >/dev/null 2>&1; then
+    truncate -s $(( fs_size / 1024 ))M "$drive.tmp"
   else
-    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -d "$stage" "$drive.tmp" $(( fs_size * 1024 / 1024 ))
+    nix shell nixpkgs#util-linux -c truncate -s $(( fs_size / 1024 ))M "$drive.tmp"
+  fi
+  if command -v mke2fs >/dev/null 2>&1; then
+    mke2fs -q -F -t ext4 -d "$stage" "$drive.tmp"
+  else
+    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -d "$stage" "$drive.tmp"
   fi
   mv "$drive.tmp" "$drive"
 else
@@ -236,9 +281,13 @@ fi
 primary_tag="${SVC_TAGS[$primary]}"
 [[ -n "$primary_tag" ]] || primary_tag="${SVC_IMAGES[$primary]}"
 ports_args=()
-while IFS=$'\t' read -r h g; do
-  ports_args+=(-p "$h:$g")
-done < <("${JQ[@]}" -r '.services[] | .ports[]? | [(.host|tostring), (.guest|tostring)] | @tsv' "$plan_tmp/plan.json")
+while IFS=$'\t' read -r h proto; do
+  if [[ "$proto" == "udp" ]]; then
+    ports_args+=(-p "$h:$h/udp")
+  else
+    ports_args+=(-p "$h:$h")
+  fi
+done < <("${JQ[@]}" -r '.services[] | .ports[]? | [(.host|tostring), .proto] | @tsv' "$plan_tmp/plan.json")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${VMF_COMPOSE_NOEXEC:-0}" == "1" ]]; then
@@ -252,5 +301,6 @@ run_args=(--name "$VMF_NAME" --engine "${VMF_RUN_ENGINE:-qemu}")
 [[ "${VMF_RUN_KEEP:-0}" == "1" ]] && run_args+=(--keep)
 run_args+=(--memory "${VMF_RUN_MEM:-1024}" --cpus "${VMF_RUN_CPUS:-2}" --net "${VMF_RUN_NETMODE:-open}")
 [[ "${VMF_RUN_TIMEOUT_SECS:-0}" -gt 0 ]] && run_args+=(--timeout "${VMF_RUN_TIMEOUT_SECS}s")
+[[ -n "${VMF_RUN_EXPOSE:-}" ]] && run_args+=(--expose "$VMF_RUN_EXPOSE")
 exec env -u VMF_COMPOSE_SRC VMF_MODE=compose VMF_DATA_DRIVE="$drive" \
   "$SCRIPT_DIR/oci-run.sh" ${run_args[@]+"${run_args[@]}"} ${ports_args[@]+"${ports_args[@]}"} "$primary_tag"

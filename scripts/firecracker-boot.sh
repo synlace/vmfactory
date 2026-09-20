@@ -154,12 +154,18 @@ net_boot() {
     i=$((i + 1)); sleep 0.1
   done
   [[ -s "$VMF_RUNDIR/slirp-ready" ]] || { echo "vmf-fc: slirp4netns not ready" >&2; kill "$slirp_pid" 2>/dev/null || true; return 1; }
-  while IFS= read -r pair; do
-    [[ -n "$pair" ]] || continue
-    hport="${pair%% *}"; gport="${pair##* }"
-    resp=$(printf '{"execute":"add_hostfwd","arguments":{"proto":"tcp","host_addr":"127.0.0.1","host_port":%s,"guest_addr":"10.0.2.15","guest_port":%s}}' \
-      "$hport" "$gport" | timeout 5 nc -U "$VMF_RUNDIR/slirp-api.sock" || true)
-    [[ "$resp" == *'"return"'* ]] || { echo "vmf-fc: hostfwd $hport failed: $resp" >&2; }
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # 2 fields (legacy): "hport gport" tcp; 3 fields: "proto hport gport".
+    read -r f1 f2 f3 _ <<<"$line"
+    if [[ -z "${f3:-}" ]]; then
+      proto="tcp"; hport="$f1"; gport="$f2"
+    else
+      proto="$f1"; hport="$f2"; gport="$f3"
+    fi
+    resp=$(printf '{"execute":"add_hostfwd","arguments":{"proto":"%s","host_addr":"127.0.0.1","host_port":%s,"guest_addr":"10.0.2.15","guest_port":%s}}' \
+      "$proto" "$hport" "$gport" | timeout 5 nc -U "$VMF_RUNDIR/slirp-api.sock" || true)
+    [[ "$resp" == *'"return"'* ]] || { echo "vmf-fc: hostfwd $proto $hport failed: $resp" >&2; }
   done < "$VMF_RUNDIR/hostfwd"
   wait "$nspid" || true
   kill "$slirp_pid" 2>/dev/null || true

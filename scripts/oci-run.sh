@@ -35,7 +35,12 @@ Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
                   untrusted jobs
   --disk-cap SZ   cap single-file guest writes at SZ (500M, 10G); writes
                   beyond fail with EFBIG (disk-full semantics)
-  -p HOST:GUEST   publish host port to guest port (repeatable)
+  -p HOST:GUEST   publish host port to guest port (repeatable; suffix
+                  /udp for UDP, e.g. 53:53/udp)
+  --expose MODE   port exposure: all (default: auto-publish every port
+                  the guest discovers, TCP+UDP) | declared (only -p /
+                  compose-declared ports) | none. An explicit -p makes
+                  declared the default
   -v HOST:GUEST   mount a host path into the guest (repeatable)
   -e K=V          environment for the guest process (repeatable)
   --name NAME     microVM name (default: derived from the image)
@@ -50,6 +55,7 @@ EOF
 ports=()
 volumes=()
 envs=()
+expose=""
 name=""
 cpus=""
 mem=""
@@ -75,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --disk-cap) [[ $# -ge 2 ]] || usage; diskcap="$2"; shift 2 ;;
     -i|-t|-it|-ti|-itd|-dit) echo "note: '$1' ignored: microVMs have no PTY" >&2; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
+    --expose) [[ $# -ge 2 ]] || usage; expose="$2"; shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
     --name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
@@ -86,6 +93,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$image" ]] || usage
+# Port exposure mode: "all" auto-publishes every port the guest finds
+# (compose-declared plus EXPOSEd container ports, TCP+UDP); "declared"
+# publishes only explicit -p / compose-declared ports; "none" publishes
+# nothing. An explicit -p makes declared the default.
+case "${expose:-}" in
+  ""|all|declared|none) ;;
+  *) echo "error: --expose must be all|declared|none" >&2; exit 2 ;;
+esac
+expose_mode="${expose:-all}"
+if [[ -z "$expose" && ${#ports[@]} -gt 0 ]]; then
+  expose_mode=declared
+fi
 # Compose mode: a git URL or a directory containing a compose file.
 # The pipeline lives in compose-run.sh; it hands back to this script
 # with a local image tag and VMF_MODE=compose + VMF_DATA_DRIVE set.
@@ -109,7 +128,7 @@ if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_RUN_DETACH="${detach:-0}" VMF_RUN_KEEP="${keep:-0}"
   export VMF_RUN_MEM="${mem:-1024}" VMF_RUN_NETMODE="${netmode:-open}"
   export VMF_RUN_TIMEOUT_SECS="${timeout_secs:-0}" VMF_RUN_CPUS="${cpus:-2}"
-  export VMF_RUN_ENGINE="$ENGINE"
+  export VMF_RUN_ENGINE="$ENGINE" VMF_RUN_EXPOSE="$expose_mode"
   exec bash "$(cd "$(dirname "$0")" && pwd)/compose-run.sh"
 fi
 
@@ -415,7 +434,15 @@ fi
 # image's ENTRYPOINT/CMD, so argv = Entrypoint+Cmd (docker semantics), env
 # = image Env overridden by -e flags, cwd = WorkingDir, uid = User.
 # One python pass writes the guest init inputs into the run dir.
-cfg_blob=$("${SKOPEO[@]}" inspect --config "docker://$ref" 2>/dev/null || true)
+# Config blob (Env/Cmd/WorkingDir/User): local buildah tags must be read
+# through the containers-storage transport (docker:// would query the
+# registry and silently fail, losing image Env -> guest PATH falls back).
+# vmf-ssh:* tags normalize to localhost/vmf-ssh:* in the store.
+cfg_blob=""
+for tref in "containers-storage:$ref" "containers-storage:localhost/$ref" "docker://$ref"; do
+  cfg_blob=$("${SKOPEO[@]}" inspect --config "$tref" 2>/dev/null) && break
+  cfg_blob=""
+done
 # NUL-separated override list travels as a file: environment variables
 # cannot carry NUL bytes, so env-var transport would silently merge
 # multiple -e flags into one entry.
@@ -583,9 +610,14 @@ EOF
 printf '%s\n' "$name" > "$rundir/hostname"
 printf '%s\n' "$ENGINE" > "$rundir/engine"
 printf '%s\n' "${VMF_MODE:-direct}" > "$rundir/mode"
+printf '%s\n' "$expose_mode" > "$rundir/expose"
 : > "$rundir/hostfwd"
 for p in "${ports[@]:-}"; do
-  [[ -n "$p" ]] && printf '%s %s\n' "${p%%:*}" "${p##*:}" >> "$rundir/hostfwd"
+  [[ -n "$p" && "$expose_mode" != "none" ]] || continue
+  proto=tcp; spec="$p"
+  if [[ "$spec" == */udp ]]; then proto=udp; spec="${spec%/udp}"
+  elif [[ "$spec" == */tcp ]]; then spec="${spec%/tcp}"; fi
+  printf '%s %s %s\n' "$proto" "${spec%%:*}" "${spec##*:}" >> "$rundir/hostfwd"
 done
 
 if [[ "$ENGINE" == "qemu" ]]; then
@@ -668,7 +700,7 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   stage="$rundir/inputs"
   mkdir -p "$stage/auth"
   cp "$SSH_DIR/id_ed25519.pub" "$stage/auth/authorized_keys" 2>/dev/null || true
-  for f in hostname engine mode hostfwd env argv.sh cwd uid; do
+  for f in hostname engine mode expose hostfwd env argv.sh cwd uid; do
     [[ -f "$rundir/$f" ]] && cp "$rundir/$f" "$stage/$f"
   done
   if command -v mke2fs >/dev/null 2>&1; then
@@ -679,6 +711,17 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   rm -rf "$stage"
   rm -f "$RUNS_DIR/$name.log"
   echo "creating microVM '$name' from $create_ref (firecracker engine)..."
+  # Host-side expose poller: reads the guest's discovered port table
+  # over ssh and adds slirp hostfwd entries for new ports through the
+  # slirp API socket. Dynamic publishing is firecracker-only (qemu's
+  # user-net hostfwd is fixed at boot). It starts before the boot and
+  # waits for the VM to come up on its own.
+  if [[ "$ssh" -eq 1 && "${netmode:-open}" != "off" ]]; then
+    VMF_NAME="$name" VMF_RUNDIR="$rundir" VMF_CONF="$RUNS_DIR/$name.conf" \
+      nohup bash "$(cd "$(dirname "$0")" && pwd)/expose-poller.sh" \
+      >>"$rundir/expose-host.log" 2>&1 &
+    disown
+  fi
   FCB=("${FC[@]}")
   VMF_NAME="$name" VMF_RUNDIR="$rundir" VMF_ASSETS_SQUASHFS="$squash" \
   VMF_KERNEL="$MICROVM_DIR/vmlinux" VMF_INITRAMFS="$MICROVM_DIR/initramfs.cpio.gz" \

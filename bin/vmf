@@ -32,8 +32,9 @@ Usage: vmf <command> [args]
   run IMAGE [cmd...]    run an OCI image as a disposable microVM
   ssh NAME [cmd...]     shell or one-shot command in a running VM or box
   stop NAME             stop and tear down a VM or box
-  ps [--json]           list microVMs (engine, state, ssh port)
+  ps [--json]           list microVMs (engine, state, ssh port, ports)
   logs NAME [-f] [N]    console log of a microVM
+  url NAME [PORT]       reach addresses for published ports
   pin ls [--json]       digest pins (TOFU)
   context ls|use|current|add|remove   manage contexts
   login URL             provider auth (not implemented yet)
@@ -89,6 +90,7 @@ case "$cmd" in
   stop) exec "$VMF_SCRIPTS/stop.sh" "$@" ;;
   ps) exec "$VMF_SCRIPTS/ps.sh" "$@" ;;
   logs) exec "$VMF_SCRIPTS/logs.sh" "$@" ;;
+  url) exec "$VMF_SCRIPTS/url.sh" "$@" ;;
   pin) exec "$VMF_SCRIPTS/pin.sh" "$@" ;;
   login) echo "error: provider login is not implemented yet (local only for now)" >&2; exit 3 ;;
   *) echo "error: unknown command '$cmd'" >&2; usage; exit 2 ;;

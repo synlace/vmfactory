@@ -59,10 +59,16 @@ cleanup() {
 }
 
 hostfwd=""
-while IFS= read -r pair; do
-  [[ -n "$pair" ]] || continue
-  hport="${pair%% *}"; gport="${pair##* }"
-  hostfwd="$hostfwd,hostfwd=tcp::$hport-:$gport"
+while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
+  # 2 fields (legacy): "hport gport" tcp; 3 fields: "proto hport gport".
+  read -r f1 f2 f3 _ <<<"$line"
+  if [[ -z "${f3:-}" ]]; then
+    proto="tcp"; hport="$f1"; gport="$f2"
+  else
+    proto="$f1"; hport="$f2"; gport="$f3"
+  fi
+  hostfwd="$hostfwd,hostfwd=$proto::$hport-:$gport"
 done < "$VMF_RUNDIR/hostfwd"
 
 serial=(-serial "file:$VMF_CONSOLE")

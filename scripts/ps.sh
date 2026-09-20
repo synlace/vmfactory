@@ -44,7 +44,13 @@ for conf in "$RUNS_DIR"/*.conf; do
       fi
       ;;
   esac
-  rows+=("$name|$ENGINE|$state|$PORT|$IMAGE")
+  # Published ports: boot-time -p plus auto-discovered (expose poller).
+  ports_str=""
+  if [[ -f "$rundir/ports-live.txt" ]]; then
+    ports_str=$(awk '{printf "%s%s/%s", sep, $1, $2; sep=","}' "$rundir/ports-live.txt")
+  fi
+  [[ -n "$ports_str" ]] || ports_str="-"
+  rows+=("$name|$ENGINE|$state|$PORT|$IMAGE|$ports_str")
 done
 
 if [[ $json -eq 1 ]]; then
@@ -52,15 +58,16 @@ if [[ $json -eq 1 ]]; then
 import json, sys
 out = []
 for r in sys.argv[1:]:
-    name, engine, state, port, image = r.split("|", 4)
+    name, engine, state, port, image, ports = r.split("|", 5)
     out.append({"name": name, "engine": engine, "state": state,
-                "ssh_port": int(port) if port else None, "image": image})
+                "ssh_port": int(port) if port else None, "image": image,
+                "ports": [p for p in ports.split(",") if p] if ports != "-" else []})
 print(json.dumps(out, indent=2))
 PY
 else
-  printf '%-20s %-8s %-9s %-8s %s\n' NAME ENGINE STATE SSH_PORT IMAGE
+  printf '%-20s %-12s %-9s %-8s %-14s %s\n' NAME ENGINE STATE SSH_PORT IMAGE PORTS
   for r in "${rows[@]+"${rows[@]}"}"; do
-    IFS='|' read -r n e s p i <<<"$r"
-    printf '%-20s %-8s %-9s %-8s %s\n' "$n" "$e" "$s" "$p" "$i"
+    IFS='|' read -r n e s p i t <<<"$r"
+    printf '%-20s %-12s %-9s %-8s %-14s %s\n' "$n" "$e" "$s" "$p" "$i" "$t"
   done
 fi

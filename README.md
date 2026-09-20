@@ -228,6 +228,39 @@ an in-guest ssh server). For microVMs:
   (real kernel binds); nginx-style single-default-server images are
   unaffected either way.
 
+## Port exposure (firecracker engine)
+
+`vmf run` needs no `-p` knowledge: the guest discovers its own listeners
+and the host publishes them 1:1 (`--expose all`, the default).
+
+- Modes: `--expose all` (default; every port the guest finds, TCP+UDP)
+  | `declared` (only `-p` / compose-declared ports; also the default
+  once any explicit `-p` is present) | `none` (no publishing).
+- Compose projects: declared `ports:` map the VM port to the container
+  port through a static socat bridge; `expose:`-only listeners and
+  EXPOSEd image ports are auto-forwarded at their own port number.
+- Plumbing: a detached guest daemon (`/vmf/expose.sh`, log at
+  `/vmf/expose.log`) probes listeners every 2 s and writes
+  `/vmf/ports-live.txt`; a host-side poller (`scripts/expose-poller.sh`,
+  log at `<rundir>/expose-host.log`) reads it over ssh and adds slirp
+  `add_hostfwd` entries (127.0.0.1:port -> 10.0.2.15:port). The first
+  service to claim a (proto, port) keeps it; later claims on the same
+  port are recorded as conflicts. Host-port collisions (another VM or
+  host service) show up as `conflict` in the table.
+- `vmf ps` shows the published ports; `vmf url NAME [PORT]` prints the
+  reach address (`127.0.0.1:<port>`).
+- Limits: dynamic hostfwd is firecracker-only (qemu user-net hostfwd is
+  fixed at boot; the guest daemon still runs, so declared socat bridges
+  work there). UDP through slirp4netns' `add_hostfwd` is one-way:
+  host->guest datagrams arrive, but libslirp drops the guest->host
+  return path (verified with slirp4netns 1.3.3 / libslirp 4.9.1). TCP
+  request/reply works fully. For UDP services, prefer a declared
+  forward and note the one-way behavior; dynamic UDP publishing is
+  best-effort until the engine moves to a slirp port driver or pasta.
+- Auto mode never publishes ports below 1024 except ssh (bind needs
+  privileges), skips the ephemeral range (32768-60999), and skips
+  listener sockets bound to loopback only.
+
 ## Conventions
 
 - Roles build the platform (common, docker, pipx); Dockerfiles add tools.

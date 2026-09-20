@@ -48,6 +48,17 @@ fetch_pinned() { # url dest pinfile
 }
 
 fetch_pinned "$tgz_url" "$out/docker.tgz" "$pins_dir/docker.tgz.sha256"
+
+# socat: the VM-side port forwards (published host ports -> container
+# IPs) ride a static socat instead of docker-proxy, which needs the
+# iptables-free userland path that misbehaves on this guest.
+if [[ ! -f "$out/bin/socat" ]]; then
+  echo "building static socat..."
+  nix build --impure --no-link --print-out-paths \
+    --expr 'let pkgs = import <nixpkgs> {}; in pkgs.pkgsStatic.socat' \
+    > "$out/.socat-path"
+  cp "$(cat "$out/.socat-path")/bin/socat" "$out/bin/socat"
+fi
 fetch_pinned "$compose_url" "$out/docker-compose" "$pins_dir/docker-compose.sha256"
 
 if [[ ! -f "$out/bin/dockerd" ]]; then
