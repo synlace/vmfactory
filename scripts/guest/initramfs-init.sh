@@ -12,34 +12,38 @@ BB=/bin/busybox
 # and the initramfs /dev is otherwise empty (devtmpfs automount covers
 # real root filesystems, not the initramfs).
 $BB mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-# Firecracker exits when the guest reboots (reboot=k); it has no ACPI
-# power-off, so use reboot -f there and poweroff -f on qemu.
-if $BB test -b /dev/vda; then
+# Engine probe: firecracker's rootfs is a squashfs on /dev/vda; qemu has
+# no block rootfs (9p shares), though a qemu compose run still has a
+# block device on vda (the ext4 data drive). Probe the filesystem, not
+# the device node. Firecracker exits on guest reboot (reboot=k) and has
+# no ACPI poweroff -> reboot -f there; qemu powers off normally.
+fc=0
+$BB mkdir -p /ro /up /root
+if $BB test -b /dev/vda && $BB mount -t squashfs -o ro /dev/vda /ro 2>/dev/null; then
+  fc=1
+fi
+if [ "$fc" = 1 ]; then
   pw() { $BB reboot -f; }
 else
   pw() { $BB poweroff -f; }
 fi
 
-# Firecracker engine: the rootfs is a read-only squashfs drive (/dev/vda)
-# with a tmpfs overlay for writes, and the per-run inputs arrive on a
-# second read-only ext4 drive (/dev/vdb). qemu keeps the 9p shares.
-if $BB test -b /dev/vda; then
-  $BB mkdir -p /ro /up /root
-  $BB mount -t squashfs -o ro /dev/vda /ro || {
-    echo "vmf-initramfs: cannot mount squashfs rootfs" >&2
-    $BB pw
-  }
+# Firecracker branch (fc=1 from the probe above): the squashfs root is
+# already mounted on /ro; add the tmpfs overlay and the inputs drive.
+# qemu branch: 9p shares; a compose data drive on vda stays for the
+# guest init to mount.
+if [ "$fc" = 1 ]; then
   $BB mount -t tmpfs tmpfs /up
   $BB mkdir -p /up/up /up/work
   $BB mount -t overlay overlay \
     -o lowerdir=/ro,upperdir=/up/up,workdir=/up/work /root || {
     echo "vmf-initramfs: cannot mount overlay rootfs" >&2
-    $BB pw
+    pw
   }
   $BB mkdir -p /root/vmf-run
   $BB mount -t ext4 -o ro /dev/vdb /root/vmf-run || {
     echo "vmf-initramfs: cannot mount inputs drive" >&2
-    $BB pw
+    pw
   }
 else
   # qemu engine: 9p root share. cache=loose is required for writeable
@@ -50,12 +54,12 @@ else
   $BB mkdir -p /root
   $BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-root /root || {
     echo "vmf-initramfs: cannot mount root share" >&2
-    $BB pw
+    pw
   }
   $BB mkdir -p /root/vmf-run
   $BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-run /root/vmf-run || {
     echo "vmf-initramfs: cannot mount run-inputs share" >&2
-    $BB pw
+    pw
   }
 fi
 

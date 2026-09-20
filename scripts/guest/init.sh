@@ -76,8 +76,12 @@ $BB echo "vmf-init: mode=$mode"
 if [ "$mode" = "compose" ]; then
   $BB echo "vmf-init: compose branch"
   $BB mkdir -p /data
-  dd=/dev/vdb
-  $BB test -b /dev/vdc && dd=/dev/vdc
+  # Data drive by engine: firecracker = vdc (vda squashfs, vdb inputs);
+  # qemu = vda (the only block device; 9p carries root+inputs).
+  case "$($BB cat /vmf-run/engine 2>/dev/null)" in
+    qemu) dd=/dev/vda ;;
+    *) dd=/dev/vdb; $BB test -b /dev/vdc && dd=/dev/vdc ;;
+  esac
   $BB echo "vmf-init: mounting data drive $dd"
   $BB mount -t ext4 "$dd" /data || {
     echo "vmf-init: cannot mount data drive" >&2
