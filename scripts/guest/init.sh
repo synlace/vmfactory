@@ -63,6 +63,55 @@ cd "$($BB cat /vmf-run/cwd)"
 # Everything the init itself runs comes from /vmf or shell builtins:
 # distroless bases carry no coreutils and PATH may not reach /bin.
 eval "set -- $(/vmf/busybox cat /vmf-run/argv.sh)"
+
+# Compose mode: the VM runs a docker daemon and a compose project from
+# the data drive (/dev/vdc on firecracker, /dev/vdb on qemu — qemu's
+# per-run inputs arrive over 9p, firecracker's on the inputs drive).
+# dockerd uses --iptables=false: inter-container traffic rides the
+# compose bridge, published ports go through the userland proxy, and
+# the host reaches them via the usual slirp hostfwd.
+mode=$($BB cat /vmf-run/mode 2>/dev/null || echo direct)
+if [ "$mode" = "compose" ]; then
+  $BB mkdir -p /data
+  dd=/dev/vdb
+  $BB test -b /dev/vdc && dd=/dev/vdc
+  $BB mount -t ext4 "$dd" /data || {
+    echo "vmf-init: cannot mount data drive" >&2
+    exit 3
+  }
+  export PATH="/data/docker/bin:$PATH"
+  $BB mkdir -p /data/docker-data
+  dockerd --iptables=false --ip6tables=false \
+    --data-root /data/docker-data --storage-driver=overlay2 \
+    >/data/dockerd.log 2>&1 &
+  dockerd_pid=$!
+  i=0
+  while [ "$i" -lt 300 ]; do
+    $BB test -S /var/run/docker.sock && break
+    i=$((i + 1))
+    $BB sleep 0.1
+  done
+  if [ ! -S /var/run/docker.sock ]; then
+    echo "vmf-init: dockerd did not come up; see /data/dockerd.log" >&2
+    wait "$dockerd_pid"
+    exit 3
+  fi
+  for f in /data/images/*.tar; do
+    [ -e "$f" ] || continue
+    $BB echo "vmf-init: docker load $f"
+    docker load -i "$f" >/dev/null || $BB echo "vmf-init: docker load failed: $f" >&2
+  done
+  $BB echo "vmf-init: docker compose up"
+  docker compose -f /data/compose.yaml up -d || {
+    echo "vmf-init: compose up failed" >&2
+    exit 3
+  }
+  # Supervise dockerd; if it dies the VM exits (compose containers die
+  # with it). sshd keeps serving until then.
+  wait "$dockerd_pid"
+  exit 0
+fi
+
 [ $# -ge 1 ] || {
   echo "vmf-init: empty argv" >&2
   exit 2

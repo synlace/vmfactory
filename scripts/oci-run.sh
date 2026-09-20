@@ -86,10 +86,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$image" ]] || usage
+# Compose mode: a git URL or a directory containing a compose file.
+# The pipeline lives in compose-run.sh; it hands back to this script
+# with a local image tag and VMF_MODE=compose + VMF_DATA_DRIVE set.
+if [[ "$image" =~ ^(https?://|git@) ]]; then
+  repo_src="$RUNS_DIR/.compose-src.$$"
+  rm -rf "$repo_src"
+  mkdir -p "$repo_src"
+  if command -v git >/dev/null 2>&1; then
+    git clone --depth 1 "$image" "$repo_src" 2>&1 | tail -1
+  else
+    nix shell nixpkgs#git -c git clone --depth 1 "$image" "$repo_src" 2>&1 | tail -1
+  fi
+  export VMF_COMPOSE_SRC="$repo_src"
+  name="${name:-$(basename "${image%%.git}")}"
+elif [[ -d "$image" ]] && { [[ -f "$image/compose.yaml" || -f "$image/compose.yml" || -f "$image/docker-compose.yaml" || -f "$image/docker-compose.yml" ]]; }; then
+  export VMF_COMPOSE_SRC="$(cd "$image" && pwd)"
+  name="${name:-$(basename "$image")}"
+fi
+if [[ -n "${VMF_COMPOSE_SRC:-}" ]]; then
+  export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
+  export VMF_RUN_DETACH="${detach:-0}" VMF_RUN_KEEP="${keep:-0}"
+  export VMF_RUN_MEM="${mem:-1024}" VMF_RUN_NETMODE="${netmode:-open}"
+  export VMF_RUN_TIMEOUT_SECS="${timeout_secs:-0}" VMF_RUN_CPUS="${cpus:-2}"
+  exec bash "$(cd "$(dirname "$0")" && pwd)/compose-run.sh"
+fi
 
 # Docker-compatible normalization: unprefixed names imply docker.io
 # ("alpine" -> docker.io/library/alpine, "user/repo" -> docker.io/user/repo).
+# Local buildah tags (compose handoff) pass through untouched.
+is_local_tag=0
 case "$image" in
+  vmf-compose/*|vmf/*|localhost/vmf-compose/*) is_local_tag=1 ;;
   localhost/*|*.*/*|*:*/*) ;;                      # explicit registry present
   */*) image="docker.io/$image" ;;
   *) image="docker.io/library/$image" ;;
@@ -217,6 +245,140 @@ ensure_microvm_assets() {
   fi
 }
 
+# Docker-compatible normalization: unprefixed names imply docker.io
+# ("alpine" -> docker.io/library/alpine, "user/repo" -> docker.io/user/repo).
+# Local buildah tags (compose handoff) pass through untouched.
+is_local_tag=0
+case "$image" in
+  vmf-compose/*|vmf/*|localhost/vmf-compose/*) is_local_tag=1 ;;
+  localhost/*|*.*/*|*:*/*) ;;                      # explicit registry present
+  */*) image="docker.io/$image" ;;
+  *) image="docker.io/library/$image" ;;
+esac
+
+if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
+  krun() { buildah unshare -- krunvm "$@"; }
+else
+  krun() { nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm "$@"; }
+fi
+
+if [[ -z "$name" ]]; then
+  name="$(basename "${image%%:*}")"
+fi
+
+RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
+SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
+BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
+DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
+# Flag (--engine) wins over env; default qemu.
+ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
+case "$ENGINE" in
+  qemu|krunvm|firecracker) ;;
+  *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
+esac
+MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
+
+# P0 guardrails: parse network mode, run timeout, and disk cap. The
+# sandbox flags are opt-in today; the repo-run feature (P3) forces
+# restricted + timeout for un-audited code.
+case "$netmode" in
+  ""|open|restricted|off) ;;
+  *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
+esac
+timeout_secs=0
+if [[ -n "$timeout_spec" ]]; then
+  timeout_secs=$(python3 - "$timeout_spec" <<'PY'
+import re, sys
+m = re.fullmatch(r"(\d+)([smh]?)", sys.argv[1])
+if not m:
+    print(-1)
+else:
+    print(int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)])
+PY
+)
+  [[ "$timeout_secs" -gt 0 ]] || { echo "error: bad --timeout '$timeout_spec' (45s|30m|2h)" >&2; exit 2; }
+fi
+disk_blocks=0
+if [[ -n "$diskcap" ]]; then
+  disk_blocks=$(python3 - "$diskcap" <<'PY'
+import re, sys
+m = re.fullmatch(r"(\d+)([KMG]?)", sys.argv[1])
+mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+if not m:
+    print(-1)
+else:
+    print((int(m.group(1)) * mult[m.group(2)]) // 512)
+PY
+)
+  [[ "$disk_blocks" -gt 0 ]] || { echo "error: bad --disk-cap '$diskcap' (500M|10G)" >&2; exit 2; }
+fi
+
+# Per-run input directory, unique per run (<name>.<run-pid>). A
+# replace-run of the same name kills the old VM, and the old teardown
+# deletes ITS run dir without ever racing the new run's writes on
+# shared paths (the old race emptied /vmf-run mid-boot and killed init).
+
+runid=$$
+rundir="$RUNS_DIR/$name.$runid"
+
+# Kernel + initramfs for the microVM engines. The kernel is a stock
+# nixpkgs build with virtio/9p/devpts/block/squashfs/overlay/ext4 forced
+# built-in (no modules) — one kernel serves the qemu engine (9p rootfs)
+# and the firecracker engine (squashfs root + ext4 inputs, mmio via
+# firecracker's ACPI tables). Both cached by content markers; rebuilds
+# happen only when inputs change.
+ensure_microvm_assets() {
+  mkdir -p "$MICROVM_DIR"
+  local kexpr='let pkgs = import <nixpkgs> {}; k = pkgs.lib.kernel; in
+    pkgs.linux.override { ignoreConfigErrors = true; structuredExtraConfig = {
+      VIRTIO = k.yes; VIRTIO_PCI = k.yes; VIRTIO_MMIO = k.yes; VIRTIO_NET = k.yes;
+      VIRTIO_BLK = k.yes;
+      NET_9P = k.yes; "9P_FS" = k.yes; NET_9P_VIRTIO = k.yes;
+      DEVPTS_FS = k.yes; TMPFS = k.yes; DEVTMPFS = k.yes; DEVTMPFS_MOUNT = k.yes;
+      SERIAL_8250 = k.yes; SERIAL_8250_CONSOLE = k.yes; UNIX = k.yes;
+      BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes;
+      SQUASHFS = k.yes; OVERLAY_FS = k.yes; EXT4_FS = k.yes; }; }'
+  local kpath
+  kpath=$(nix build --impure --no-link --print-out-paths --expr "$kexpr" | tail -1)
+  if [[ ! -f "$MICROVM_DIR/vmlinuz" || "$(<"$MICROVM_DIR/kernel-marker" 2>/dev/null)" != "$kpath" ]]; then
+    rm -f "$MICROVM_DIR/vmlinuz"
+    cp "$kpath/bzImage" "$MICROVM_DIR/vmlinuz"
+    printf '%s\n' "$kpath" > "$MICROVM_DIR/kernel-marker"
+  fi
+  # Firecracker's x86 loader wants the uncompressed ELF kernel; nixpkgs
+  # ships only the bzImage. Extract once per kernel marker.
+  if [[ ! -f "$MICROVM_DIR/vmlinux" ]]; then
+    echo "extracting vmlinux (firecracker ELF kernel)..."
+    if command -v zstd >/dev/null 2>&1; then
+      python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
+        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
+    else
+      nix shell nixpkgs#zstd -c python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
+        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
+    fi
+  fi
+  local h stage
+  h=$(cat "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$BUNDLE_DIR/busybox" | sha256sum | cut -c1-8)
+  if [[ ! -f "$MICROVM_DIR/initramfs.cpio.gz" || "$(<"$MICROVM_DIR/initramfs-marker" 2>/dev/null)" != "$h" ]]; then
+    stage=$(mktemp -d)
+    mkdir -p "$stage/bin"
+    cp "$BUNDLE_DIR/busybox" "$stage/bin/busybox"
+    chmod 755 "$stage/bin/busybox"
+    ln -s busybox "$stage/bin/sh"
+    cp "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$stage/init"
+    chmod 755 "$stage/init"
+    if command -v cpio >/dev/null 2>&1; then
+      (cd "$stage" && find . | cpio -o -H newc | gzip -1) > "$MICROVM_DIR/initramfs.cpio.gz"
+    else
+      nix shell nixpkgs#cpio nixpkgs#gzip -c sh -c "cd '$stage' && find . | cpio -o -H newc | gzip -1" \
+        > "$MICROVM_DIR/initramfs.cpio.gz"
+    fi
+    rm -rf "$stage"
+    printf '%s\n' "$h" > "$MICROVM_DIR/initramfs-marker"
+  fi
+}
+
+
 # Digest pin: TOFU on first run; drift is a hard error afterwards.
 pins="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 mkdir -p "$(dirname "$pins")"
@@ -225,20 +387,27 @@ if command -v skopeo >/dev/null 2>&1; then
 else
   SKOPEO=(nix shell nixpkgs#skopeo -c skopeo)
 fi
-digest=$("${SKOPEO[@]}" inspect --format '{{.Digest}}' "docker://$image" 2>/dev/null || true)
+digest=""
 ref="$image"
-if [[ -n "$digest" ]]; then
-  pinned=$(awk -v img="$image" '$1 == img {print $2}' "$pins" 2>/dev/null || true)
-  if [[ -n "$pinned" && "$pinned" != "$digest" ]]; then
-    echo "error: digest drift for $image: pinned $pinned, registry $digest" >&2
-    echo "update the pin in $pins deliberately, then retry" >&2
-    exit 1
+if [[ "$is_local_tag" -eq 1 ]]; then
+  # Local buildah tag (compose handoff): its digest was pinned by
+  # compose-run.sh at build time; no registry round-trip here.
+  ref="$image"
+else
+  digest=$("${SKOPEO[@]}" inspect --format '{{.Digest}}' "docker://$image" 2>/dev/null || true)
+  if [[ -n "$digest" ]]; then
+    pinned=$(awk -v img="$image" '$1 == img {print $2}' "$pins" 2>/dev/null || true)
+    if [[ -n "$pinned" && "$pinned" != "$digest" ]]; then
+      echo "error: digest drift for $image: pinned $pinned, registry $digest" >&2
+      echo "update the pin in $pins deliberately, then retry" >&2
+      exit 1
+    fi
+    if [[ -z "$pinned" ]]; then
+      printf '%s %s\n' "$image" "$digest" >> "$pins"
+      echo "note: digest pin recorded (TOFU): $image@$digest"
+    fi
+    ref="$image@$digest"
   fi
-  if [[ -z "$pinned" ]]; then
-    printf '%s %s\n' "$image" "$digest" >> "$pins"
-    echo "note: digest pin recorded (TOFU): $image@$digest"
-  fi
-  ref="$image@$digest"
 fi
 
 # Resolve the app argv + env from the OCI config blob: krunvm ignores the
@@ -260,7 +429,11 @@ config = (json.loads(blob).get("config") or {}) if blob else {}
 if not argv:
     argv = list(config.get("Entrypoint") or []) + list(config.get("Cmd") or [])
 if not argv:
-    sys.stderr.write("error: image has no default command; pass one explicitly\n"); sys.exit(1)
+    # Compose mode manages services via dockerd; no entrypoint needed.
+    if os.environ.get("VMF_MODE") == "compose":
+        argv = ["true"]
+    else:
+        sys.stderr.write("error: image has no default command; pass one explicitly\n"); sys.exit(1)
 env = dict(kv.split("=", 1) for kv in (config.get("Env") or []) if "=" in kv)
 override_path = os.environ.get("VMF_ENVS_FILE")
 if override_path and os.path.exists(override_path):
@@ -408,6 +581,7 @@ EOF
 # for slirp hostfwd).
 printf '%s\n' "$name" > "$rundir/hostname"
 printf '%s\n' "$ENGINE" > "$rundir/engine"
+printf '%s\n' "${VMF_MODE:-direct}" > "$rundir/mode"
 : > "$rundir/hostfwd"
 for p in "${ports[@]:-}"; do
   [[ -n "$p" ]] && printf '%s %s\n' "${p%%:*}" "${p##*:}" >> "$rundir/hostfwd"

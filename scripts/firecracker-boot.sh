@@ -41,6 +41,8 @@ cat > "$boot_json" <<EOF
       "path_on_host": "$VMF_ASSETS_SQUASHFS" },
     { "drive_id": "inputs", "is_root_device": false, "is_read_only": true,
       "path_on_host": "$VMF_RUNDIR/inputs.ext4" }
+    ${VMF_DATA_DRIVE:+, { "drive_id": "data", "is_root_device": false, "is_read_only": false,
+      "path_on_host": "$VMF_DATA_DRIVE" }}
   ],
   "network-interfaces": [
     { "iface_id": "0", "guest_mac": "$guest_mac", "host_dev_name": "tap0" }

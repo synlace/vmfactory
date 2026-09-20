@@ -110,6 +110,7 @@ qemu=(qemu-system-x86_64
   -device "virtio-9p-pci,fsdev=fs0,mount_tag=vmf-root"
   -fsdev "local,id=fs1,path=$VMF_RUNDIR,security_model=none"
   -device "virtio-9p-pci,fsdev=fs1,mount_tag=vmf-run"
+  ${VMF_DATA_DRIVE:+-drive "file=$VMF_DATA_DRIVE,if=virtio,format=raw"}
   -nic "$nic"
   -pidfile "$VMF_RUNDIR/qemu.pid"
   -no-reboot
