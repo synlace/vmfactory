@@ -17,7 +17,11 @@ $BB ip addr add 10.0.2.15/24 dev eth0
 $BB ip route add default via 10.0.2.2
 
 $BB mkdir -p /root
-$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 vmf-root /root || {
+# cache=loose is required for writeable MAP_SHARED mmap on 9p (cache=none
+# returns EINVAL). Databases like LMDB (OpenLDAP slapd) mmap their files
+# and fail to open without it. Coherence is safe: the host writes to the
+# shares only before the guest boots.
+$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-root /root || {
   echo "vmf-initramfs: cannot mount root share" >&2
   $BB poweroff -f
 }
@@ -31,7 +35,7 @@ $BB mkdir -p /root/dev/pts
 $BB mount -t devpts devpts -o mode=620,ptmxmode=0666 /root/dev/pts
 $BB mount -t tmpfs tmpfs /root/tmp
 $BB mkdir -p /root/vmf-run
-$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 vmf-run /root/vmf-run || {
+$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-run /root/vmf-run || {
   echo "vmf-initramfs: cannot mount run-inputs share" >&2
   $BB poweroff -f
 }
