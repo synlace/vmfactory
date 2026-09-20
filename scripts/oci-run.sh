@@ -110,6 +110,10 @@ SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
 DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
 ENGINE="${VMF_ENGINE:-qemu}"
+case "$ENGINE" in
+  qemu|krunvm) ;;
+  *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
+esac
 MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
 
 # P0 guardrails: parse network mode, run timeout, and disk cap. The

@@ -103,54 +103,8 @@ status lab=lab:
 # Shut down a box (ACPI first, then force after 10 seconds) or a microVM
 # (engine-aware: qemu pid kill + container cleanup, or krunvm tree).
 stop lab=lab:
-    #!/bin/sh
-    if [ -f "$HOME/.vmf/runs/{{ lab }}.conf" ]; then
-      . "$HOME/.vmf/runs/{{ lab }}.conf"
-      ENGINE=${ENGINE:-krunvm}
-      if [ "$ENGINE" = "qemu" ]; then
-        pid=${PID:-$(cat "${RUNDIR:-$HOME/.vmf/runs/{{ lab }}}/qemu.pid" 2>/dev/null || true)}
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-        if command -v buildah >/dev/null 2>&1; then B=buildah; else B="nix shell nixpkgs#buildah -c buildah"; fi
-        [ -n "${CTR:-}" ] && $B unshare -- buildah rm "$CTR" >/dev/null 2>&1 || true
-      else
-        pkill -f "krunvm start {{ lab }} --" 2>/dev/null || true
-        sleep 0.5
-        if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-          buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
-        else
-          nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
-        fi
-      fi
-      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}".[0-9]* \
-             "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
-      echo "microVM {{ lab }} stopped"
-      exit 0
-    fi
-    if pgrep -f "krunvm start {{ lab }} " >/dev/null 2>&1; then
-      pkill -f "krunvm start {{ lab }} --" 2>/dev/null || true
-      sleep 0.5
-      if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-        buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
-      else
-        nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
-      fi
-      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}".[0-9]* \
-             "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
-      echo "microVM {{ lab }} stopped"
-      exit 0
-    fi
-    sock="build/{{ lab }}/mon.sock"
-    [ -S "$sock" ] && { echo system_powerdown | nc -N -U "$sock" >/dev/null 2>&1 || true; }
-    i=0
-    while [ "$i" -lt 10 ]; do
-      pgrep -f "qemu-system.*-name {{ lab }}" >/dev/null 2>&1 || { echo "box {{ lab }} stopped"; exit 0; }
-      i=$((i + 1))
-      sleep 1
-    done
-    pkill -f "qemu-system.*-name {{ lab }}" || true
-    echo "box {{ lab }} force stopped"
+    sh scripts/stop.sh {{ lab }}
 
-# Snapshot a box disk (box should be stopped for a consistent checkpoint)
 snap label lab=lab:
     qemu-img snapshot -c "{{ label }}" "build/{{ lab }}/image/vmf-{{ lab }}"
 

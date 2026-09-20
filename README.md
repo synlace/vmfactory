@@ -142,6 +142,34 @@ sandboxed combination automatically when it runs un-audited code.
 - The sandbox flags apply to the qemu engine; the krunvm engine warns
   and ignores them.
 
+## The `vmf` CLI
+
+The `vmf` command wraps the same scripts with context management and
+json output. Install: `ln -sf "$PWD/bin/vmf" ~/.local/bin/vmf`.
+
+```
+vmf run --rm -d -p 3000:3000 grafana/grafana   # same flags as just run
+vmf ps                    # name, engine, state, ssh port; --json too
+vmf ssh grafana           # interactive shell; one-shot with a command
+vmf logs grafana -f       # console log
+vmf stop grafana
+vmf pin ls                # digest pins (TOFU); --json too
+vmf context ls|use|current|add|remove
+```
+
+Contexts pick where verbs run and how. `default` is implicit (local,
+qemu engine, the global `~/.vmf/runs` state). Other local contexts get
+their own engine (`--engine qemu|krunvm`) and their own state directory
+(`~/.vmf/contexts/<name>/runs`), so names cannot collide across
+contexts. Provider contexts (`--type provider --url ...`) are
+config-first: verbs on them fail with a clear error until a cloud
+backend exists — the CLI surface is already provider-shaped.
+
+The sandbox flags (`--net restricted`, `--timeout`, `--disk-cap`) carry
+over unchanged: `vmf run` is `scripts/oci-run.sh`, and going through
+`vmf` instead of `just` also avoids the justfile quote-flattening when
+passing guest commands.
+
 ## SSH into microVMs (derived ssh server)
 
 `just ssh <name>` reaches both box types: qemu boxes (via `enter.sh`,
