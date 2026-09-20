@@ -5,3 +5,6 @@ __pycache__/
 files/
 .gitignore.swp
 *.swp
+
+# real credentials never live in the repo
+.env
