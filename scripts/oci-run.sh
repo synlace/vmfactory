@@ -247,7 +247,11 @@ PIN=${digest:-}
 DERIVED=${DERIVED_TAG:-}
 EOF
 
-# Runs are disposable: a stale VM of the same name is replaced.
+# Runs are disposable: a stale VM of the same name is replaced. krunvm
+# delete removes the config, but a still-running VM of the same name
+# (e.g. a detached run) keeps its process tree; kill it first.
+pkill -f "krunvm start ${name} --" 2>/dev/null || true
+sleep 0.5
 krun delete "$name" >/dev/null 2>&1 || true
 echo "creating microVM '$name' from $create_ref (pulls on first use)..."
 krun create "$create_ref" "${create_args[@]}"

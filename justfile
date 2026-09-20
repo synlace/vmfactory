@@ -89,11 +89,13 @@ status lab=lab:
     (printf 'info status\n'; sleep 1) | nc -N -U "build/{{ lab }}/mon.sock" 2>/dev/null | tail -2
     qemu-img snapshot -l "build/{{ lab }}/image/vmf-{{ lab }}" 2>/dev/null | head -6
 
-# Shut down a running box. ACPI first, then force after 10 seconds.
-# For microVMs (runs state present): delete via krunvm and clean state.
+# Shut down a box (ACPI first, then force after 10 seconds) or a microVM
+# (kill its krunvm start tree, delete, clean state).
 stop lab=lab:
     #!/bin/sh
-    if [ -f "$HOME/.vmf/runs/{{ lab }}.conf" ]; then
+    if pgrep -f "krunvm start {{ lab }} " >/dev/null 2>&1 || [ -f "$HOME/.vmf/runs/{{ lab }}.conf" ]; then
+      pkill -f "krunvm start {{ lab }} --" 2>/dev/null || true
+      sleep 0.5
       if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
         buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
       else
