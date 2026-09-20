@@ -25,15 +25,33 @@ done
 [[ $# -gt 0 ]] || { echo "usage: ssh.sh <name> [command...]" >&2; exit 2; }
 name="$1"; shift
 
+RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
+vm_conf="$RUNS_DIR/$name.conf"
+
+# Box liveness = its QEMU monitor socket answering "info status". A
+# pgrep on "-name $name" would also match a microVM of the same name,
+# and a dead qemu leaves a stale socket file behind.
+box_alive() {
+  [[ -S "build/$1/mon.sock" ]] || return 1
+  (printf 'info status\n'; sleep 1) | timeout 3 nc -N -U "build/$1/mon.sock" 2>/dev/null \
+    | grep -qE 'running|paused'
+}
+
 if [[ -f "build/$name/vm.conf" ]]; then
-  exec sh scripts/enter.sh "$name" "$@"
+  if box_alive "$name"; then
+    exec sh scripts/enter.sh "$name" "$@"
+  fi
+  if [[ ! -f "$vm_conf" ]]; then
+    echo "error: box '$name' is not running (stale monitor socket); boot it: just boot $name" >&2
+    exit 1
+  fi
+  echo "note: build box '$name' is not running; using the microVM '$name'" >&2
 fi
 
 # Interactive handling is engine-specific and happens below: qemu VMs
 # allow interactive PTY shells, krunvm VMs reject them with guidance.
 
-RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
-conf="$RUNS_DIR/$name.conf"
+conf="$vm_conf"
 [[ -f "$conf" ]] || {
   echo "error: no running microVM '$name'; start one with: just run --keep <image>" >&2
   exit 1

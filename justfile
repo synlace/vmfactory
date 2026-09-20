@@ -9,12 +9,10 @@ list:
     #!/bin/sh
     for spec in specs/*.yaml; do
       name=$(basename "$spec" .yaml)
-      if pgrep -f "qemu-system.*-name $name" >/dev/null 2>&1; then
-        state=$( (printf 'info status\n'; sleep 1) | nc -N -U "build/$name/mon.sock" 2>/dev/null | grep -oE 'paused|running' | head -1)
-        state=${state:-running}
-      else
-        state=stopped
-      fi
+      # Box liveness = its QEMU monitor socket answering. A pgrep on
+      # "-name $name" would also match a microVM of the same name.
+      state=$( (printf 'info status\n'; sleep 1) | nc -N -U "build/$name/mon.sock" 2>/dev/null | grep -oE 'paused|running' | head -1)
+      state=${state:-stopped}
       ip=$(awk '/network:/{f=1} f && /ip:/{print $2; exit}' "$spec")
       printf '%-24s %-10s %s\n' "$name" "$state" "${ip:--}"
     done
