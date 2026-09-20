@@ -18,17 +18,19 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: oci-run.sh [--rm] [--keep] [--name NAME] [--cpus N] [--no-ssh]
+Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--no-ssh]
                   [-p HOST:GUEST] [-v HOST:GUEST] [-e K=V] IMAGE [COMMAND...]
 
   --rm            accepted, default behavior (VM deleted on exit)
   --keep          keep the microVM after exit (re-run reuses it)
+  -d|--detach     start the VM in the background, return immediately
   --no-ssh        boot the pinned image as-is (no dropbear layer, no ssh)
   -p HOST:GUEST   publish host port to guest port (repeatable)
   -v HOST:GUEST   mount a host path into the guest (repeatable)
   -e K=V          environment for the guest process (repeatable)
   --name NAME     microVM name (default: derived from the image)
   --cpus N        vCPUs
+  -i, -t          accepted and ignored (microVMs have no PTY)
   IMAGE           OCI reference (registry/repo[:tag]); digest-pinned
   COMMAND...      optional command to run inside (default: image entrypoint)
 EOF
@@ -42,6 +44,7 @@ name=""
 cpus=""
 ssh=1
 keep=0
+detach=0
 image=""
 cmd_args=()
 
@@ -49,7 +52,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --rm) shift ;;
     --keep) keep=1; shift ;;
+    -d|--detach) detach=1; shift ;;
     --no-ssh) ssh=0; shift ;;
+    -i|-t|-it|-ti|-itd|-dit) echo "note: '$1' ignored: microVMs have no PTY" >&2; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
@@ -250,12 +255,37 @@ krun create "$create_ref" "${create_args[@]}"
 cleanup() {
   if [[ "$keep" -eq 0 ]]; then
     krun delete "$name" >/dev/null 2>&1 || true
-    rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name.conf"
+    rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name.log"
   else
     echo "note: kept microVM '$name' (krunvm delete $name to remove)"
   fi
 }
 trap cleanup EXIT
+
+if [[ "$detach" -eq 1 ]]; then
+  # Detached: a background subshell owns the VM lifecycle. When the
+  # entrypoint exits, the subshell tears the VM down (--rm) exactly like
+  # the foreground path would.
+  trap - EXIT
+  console_log="$RUNS_DIR/$name.log"
+  if [[ "$ssh" -eq 1 ]]; then
+    start_cmd=(krun start "$name" -- /vmf/init.sh)
+  else
+    mapfile -t argv < <(eval "printf '%s\n' $(cat "$RUNS_DIR/$name/argv.sh")")
+    start_cmd=(krun start "$name" -- ${argv[@]+"${argv[@]}"})
+  fi
+  (
+    "${start_cmd[@]}" </dev/null >>"$console_log" 2>&1
+    if [[ "$keep" -eq 0 ]]; then
+      krun delete "$name" >/dev/null 2>&1 || true
+      rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name.conf" "$console_log"
+    fi
+  ) >/dev/null 2>&1 &
+  disown
+  echo "microVM '$name' detached; console log: $console_log"
+  echo "ssh: just ssh $name   stop: just stop $name"
+  exit 0
+fi
 
 if [[ "$ssh" -eq 1 ]]; then
   echo "microVM '$name': ssh with 'just ssh $name' (pubkey, port $ssh_port)"

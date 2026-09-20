@@ -76,11 +76,13 @@ referenced Dockerfile blocks the export (context paths do not carry over).
 
 ```sh
 just run --rm -p 3002:3000 bkimminich/juice-shop   # run an OCI image in a microVM
+just run --rm -d -p 8080:80 nginx                  # detached: prompt returns at once
 just run --rm -e FOO=bar image cmd                 # command + env (quote-free)
 just run --keep image                              # keep the VM, then ssh in
-just ssh image                                     # interactive shell (PTY)
+just ssh image                                     # one-shot exec (PTY-free)
 just ssh image 'ls /proc'                          # one-shot, docker-exec semantics
-just ssh -it image true                            # docker-style flags accepted/ignored
+just stop image                                    # stop + delete a microVM
+just list                                          # shows microVMs + ssh ports
 ```
 
 - Runtime: krunvm (libkrun) inside a `buildah unshare` user namespace.
