@@ -30,13 +30,17 @@ done
 [[ -n "$port" ]] || { echo "vmf-expose: no ssh port in state; giving up"; exit 0; }
 
 # Seed from the boot-time hostfwd entries (already published); a
-# restarted poller must not duplicate existing lines.
+# restarted poller must not duplicate existing lines. Guest ports
+# covered by a boot hostfwd (possibly remapped) need no dynamic entry.
+covered="$VMF_RUNDIR/.expose-covered"
+: > "$covered"
 while IFS= read -r line; do
   [[ -n "$line" ]] || continue
   read -r f1 f2 f3 _ <<<"$line"
   if [[ -z "${f3:-}" ]]; then proto="tcp"; hport="$f1"; gport="$f2"
   else proto="$f1"; hport="$f2"; gport="$f3"; fi
   [[ "$gport" == "22" ]] && target="ssh" || target="-"
+  printf '%s\n' "$proto $gport" >> "$covered"
   grep -qE "^$proto $hport " "$table" 2>/dev/null && continue
   printf '%s %s %s %s published\n' "$proto" "$hport" "$gport" "$target" >> "$table"
 done < "$VMF_RUNDIR/hostfwd"
@@ -75,6 +79,7 @@ while (( $(date +%s) < deadline )); do
   while read -r proto gport rest; do
     [[ -n "$proto" && -n "$gport" ]] || continue
     [[ "$gport" == "22" ]] && continue
+    grep -qxF "$proto $gport" "$covered" 2>/dev/null && continue
     grep -qE "^$proto $gport " "$table" 2>/dev/null && continue
     resp=$(printf '{"execute":"add_hostfwd","arguments":{"proto":"%s","host_addr":"127.0.0.1","host_port":%s,"guest_addr":"10.0.2.15","guest_port":%s}}' \
       "$proto" "$gport" "$gport" | timeout 5 nc -U "$VMF_RUNDIR/slirp-api.sock" 2>/dev/null || true)

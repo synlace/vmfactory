@@ -30,7 +30,10 @@ label_target() { # proto host_port guest_port target status
 }
 
 if [[ -n "$want_port" ]]; then
-  line=$(grep -E "^[a-z]+ $want_port " "$table" | head -1) || true
+  # Match either the host port or the guest port (a remapped privileged
+  # port publishes on a different host number).
+  line=$(grep -E "^[a-z]+ $want_port ([0-9]+|-|ssh) " "$table" | head -1) || true
+  [[ -n "$line" ]] || line=$(grep -E "^[a-z]+ [0-9]+ $want_port " "$table" | head -1) || true
   [[ -n "$line" ]] || { echo "error: port $want_port not published on '$name'" >&2; exit 1; }
   read -r proto hport gport target status <<<"$line"
   [[ "$status" == published ]] || { echo "error: port $want_port could not be published (${status})" >&2; exit 1; }

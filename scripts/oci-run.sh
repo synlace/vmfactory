@@ -105,10 +105,15 @@ expose_mode="${expose:-all}"
 if [[ -z "$expose" && ${#ports[@]} -gt 0 ]]; then
   expose_mode=declared
 fi
+# Bare git-host URLs (docker-CLI convenience): github.com/org/repo[.git]
+# etc. No OCI registry lives at these hosts, so the mapping is safe.
+if [[ "$image" =~ ^(github\.com|gitlab\.com|bitbucket\.org)/[^/]+/[^/]+$ ]]; then
+  image="https://$image"
+fi
 # Compose mode: a git URL or a directory containing a compose file.
 # The pipeline lives in compose-run.sh; it hands back to this script
 # with a local image tag and VMF_MODE=compose + VMF_DATA_DRIVE set.
-if [[ "$image" =~ ^(https?://|git@) ]]; then
+if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   repo_src="$RUNS_DIR/.compose-src.$$"
   rm -rf "$repo_src"
   mkdir -p "$repo_src"
@@ -119,7 +124,9 @@ if [[ "$image" =~ ^(https?://|git@) ]]; then
   fi
   export VMF_COMPOSE_SRC="$repo_src"
   name="${name:-$(basename "${image%%.git}")}"
-elif [[ -d "$image" ]] && { [[ -f "$image/compose.yaml" || -f "$image/compose.yml" || -f "$image/docker-compose.yaml" || -f "$image/docker-compose.yml" ]]; }; then
+elif [[ -d "$image" ]]; then
+  # Any local directory: compose-run.sh locates the compose file (root,
+  # then a unique subdirectory) and errors clearly when there is none.
   export VMF_COMPOSE_SRC="$(cd "$image" && pwd)"
   name="${name:-$(basename "$image")}"
 fi
@@ -209,11 +216,15 @@ runid=$$
 rundir="$RUNS_DIR/$name.$runid"
 
 # Kernel + initramfs for the microVM engines. The kernel is a stock
-# nixpkgs build with virtio/9p/devpts/block/squashfs/overlay/ext4 forced
-# built-in (no modules) — one kernel serves the qemu engine (9p rootfs)
-# and the firecracker engine (squashfs root + ext4 inputs, mmio via
-# firecracker's ACPI tables). Both cached by content markers; rebuilds
-# happen only when inputs change.
+# nixpkgs build with every needed driver forced built-in (no modules):
+# virtio/9p/devpts/block/squashfs/overlay/ext4 for the engines, veth +
+# bridge + cgroup v2 for docker-in-VM, the netfilter family for
+# dockerd's embedded DNS resolver (127.0.0.11 DNAT) and container
+# networking, and IKCONFIG so /proc/config.gz stays inspectable. One
+# kernel serves the qemu engine (9p rootfs) and the firecracker engine
+# (squashfs root + ext4 inputs, mmio via firecracker's ACPI tables).
+# Both cached by content markers; rebuilds happen only when inputs
+# change.
 ensure_microvm_assets() {
   mkdir -p "$MICROVM_DIR"
   local kexpr='let pkgs = import <nixpkgs> {}; k = pkgs.lib.kernel; in
@@ -224,140 +235,21 @@ ensure_microvm_assets() {
       DEVPTS_FS = k.yes; TMPFS = k.yes; DEVTMPFS = k.yes; DEVTMPFS_MOUNT = k.yes;
       SERIAL_8250 = k.yes; SERIAL_8250_CONSOLE = k.yes; UNIX = k.yes;
       BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes;
-      SQUASHFS = k.yes; OVERLAY_FS = k.yes; EXT4_FS = k.yes; }; }'
-  local kpath
-  kpath=$(nix build --impure --no-link --print-out-paths --expr "$kexpr" | tail -1)
-  if [[ ! -f "$MICROVM_DIR/vmlinuz" || "$(<"$MICROVM_DIR/kernel-marker" 2>/dev/null)" != "$kpath" ]]; then
-    rm -f "$MICROVM_DIR/vmlinuz"
-    cp "$kpath/bzImage" "$MICROVM_DIR/vmlinuz"
-    printf '%s\n' "$kpath" > "$MICROVM_DIR/kernel-marker"
-  fi
-  # Firecracker's x86 loader wants the uncompressed ELF kernel; nixpkgs
-  # ships only the bzImage. Extract once per kernel marker.
-  if [[ ! -f "$MICROVM_DIR/vmlinux" ]]; then
-    echo "extracting vmlinux (firecracker ELF kernel)..."
-    if command -v zstd >/dev/null 2>&1; then
-      python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
-        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
-    else
-      nix shell nixpkgs#zstd -c python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
-        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
-    fi
-  fi
-  local h stage
-  h=$(cat "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$BUNDLE_DIR/busybox" | sha256sum | cut -c1-8)
-  if [[ ! -f "$MICROVM_DIR/initramfs.cpio.gz" || "$(<"$MICROVM_DIR/initramfs-marker" 2>/dev/null)" != "$h" ]]; then
-    stage=$(mktemp -d)
-    mkdir -p "$stage/bin"
-    cp "$BUNDLE_DIR/busybox" "$stage/bin/busybox"
-    chmod 755 "$stage/bin/busybox"
-    ln -s busybox "$stage/bin/sh"
-    cp "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$stage/init"
-    chmod 755 "$stage/init"
-    if command -v cpio >/dev/null 2>&1; then
-      (cd "$stage" && find . | cpio -o -H newc | gzip -1) > "$MICROVM_DIR/initramfs.cpio.gz"
-    else
-      nix shell nixpkgs#cpio nixpkgs#gzip -c sh -c "cd '$stage' && find . | cpio -o -H newc | gzip -1" \
-        > "$MICROVM_DIR/initramfs.cpio.gz"
-    fi
-    rm -rf "$stage"
-    printf '%s\n' "$h" > "$MICROVM_DIR/initramfs-marker"
-  fi
-}
-
-# Docker-compatible normalization: unprefixed names imply docker.io
-# ("alpine" -> docker.io/library/alpine, "user/repo" -> docker.io/user/repo).
-# Local buildah tags (compose handoff) pass through untouched.
-is_local_tag=0
-case "$image" in
-  vmf-compose/*|vmf/*|localhost/vmf-compose/*) is_local_tag=1 ;;
-  localhost/*|*.*/*|*:*/*) ;;                      # explicit registry present
-  */*) image="docker.io/$image" ;;
-  *) image="docker.io/library/$image" ;;
-esac
-
-if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-  krun() { buildah unshare -- krunvm "$@"; }
-else
-  krun() { nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm "$@"; }
-fi
-
-if [[ -z "$name" ]]; then
-  name="$(basename "${image%%:*}")"
-fi
-
-RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
-SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
-BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
-DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
-# Flag (--engine) wins over env; default qemu.
-ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
-case "$ENGINE" in
-  qemu|krunvm|firecracker) ;;
-  *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
-esac
-MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
-
-# P0 guardrails: parse network mode, run timeout, and disk cap. The
-# sandbox flags are opt-in today; the repo-run feature (P3) forces
-# restricted + timeout for un-audited code.
-case "$netmode" in
-  ""|open|restricted|off) ;;
-  *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
-esac
-timeout_secs=0
-if [[ -n "$timeout_spec" ]]; then
-  timeout_secs=$(python3 - "$timeout_spec" <<'PY'
-import re, sys
-m = re.fullmatch(r"(\d+)([smh]?)", sys.argv[1])
-if not m:
-    print(-1)
-else:
-    print(int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)])
-PY
-)
-  [[ "$timeout_secs" -gt 0 ]] || { echo "error: bad --timeout '$timeout_spec' (45s|30m|2h)" >&2; exit 2; }
-fi
-disk_blocks=0
-if [[ -n "$diskcap" ]]; then
-  disk_blocks=$(python3 - "$diskcap" <<'PY'
-import re, sys
-m = re.fullmatch(r"(\d+)([KMG]?)", sys.argv[1])
-mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
-if not m:
-    print(-1)
-else:
-    print((int(m.group(1)) * mult[m.group(2)]) // 512)
-PY
-)
-  [[ "$disk_blocks" -gt 0 ]] || { echo "error: bad --disk-cap '$diskcap' (500M|10G)" >&2; exit 2; }
-fi
-
-# Per-run input directory, unique per run (<name>.<run-pid>). A
-# replace-run of the same name kills the old VM, and the old teardown
-# deletes ITS run dir without ever racing the new run's writes on
-# shared paths (the old race emptied /vmf-run mid-boot and killed init).
-
-runid=$$
-rundir="$RUNS_DIR/$name.$runid"
-
-# Kernel + initramfs for the microVM engines. The kernel is a stock
-# nixpkgs build with virtio/9p/devpts/block/squashfs/overlay/ext4 forced
-# built-in (no modules) — one kernel serves the qemu engine (9p rootfs)
-# and the firecracker engine (squashfs root + ext4 inputs, mmio via
-# firecracker's ACPI tables). Both cached by content markers; rebuilds
-# happen only when inputs change.
-ensure_microvm_assets() {
-  mkdir -p "$MICROVM_DIR"
-  local kexpr='let pkgs = import <nixpkgs> {}; k = pkgs.lib.kernel; in
-    pkgs.linux.override { ignoreConfigErrors = true; structuredExtraConfig = {
-      VIRTIO = k.yes; VIRTIO_PCI = k.yes; VIRTIO_MMIO = k.yes; VIRTIO_NET = k.yes;
-      VIRTIO_BLK = k.yes;
-      NET_9P = k.yes; "9P_FS" = k.yes; NET_9P_VIRTIO = k.yes;
-      DEVPTS_FS = k.yes; TMPFS = k.yes; DEVTMPFS = k.yes; DEVTMPFS_MOUNT = k.yes;
-      SERIAL_8250 = k.yes; SERIAL_8250_CONSOLE = k.yes; UNIX = k.yes;
-      BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes;
-      SQUASHFS = k.yes; OVERLAY_FS = k.yes; EXT4_FS = k.yes; }; }'
+      SQUASHFS = k.yes; OVERLAY_FS = k.yes; EXT4_FS = k.yes;
+      VETH = k.yes; BRIDGE = k.yes; BRIDGE_NETFILTER = k.yes;
+      IKCONFIG = k.yes; IKCONFIG_PROC = k.yes;
+      CGROUP_DEVICE = k.yes; CGROUP_BPF = k.yes;
+      NETFILTER = k.yes; NF_CONNTRACK = k.yes;
+      NF_TABLES = k.yes; NF_TABLES_INET = k.yes; NF_TABLES_IPV4 = k.yes;
+      NFT_CT = k.yes; NFT_NAT = k.yes; NFT_MASQ = k.yes; NFT_REJECT = k.yes; NFT_COUNTER = k.yes;
+      IP_NF_IPTABLES = k.yes; IP_NF_FILTER = k.yes; IP_NF_NAT = k.yes;
+      IP_NF_TARGET_MASQUERADE = k.yes; IP_NF_TARGET_REDIRECT = k.yes; IP_NF_MANGLE = k.yes;
+      NETFILTER_XTABLES = k.yes; NETFILTER_XT_NAT = k.yes;
+      NETFILTER_XT_MATCH_ADDRTYPE = k.yes; NETFILTER_XT_MATCH_CONNTRACK = k.yes;
+      NETFILTER_XT_MATCH_COMMENT = k.yes; NETFILTER_XT_MATCH_MULTIPORT = k.yes;
+      NETFILTER_XT_MATCH_STATE = k.yes; NETFILTER_XT_TARGET_MASQUERADE = k.yes;
+      NETFILTER_XT_TARGET_REDIRECT = k.yes; NETFILTER_XT_TARGET_DNAT = k.yes;
+      NF_NAT = k.yes; NF_NAT_MASQUERADE = k.yes; NF_DEFRAG_IPV4 = k.yes; }; }'
   local kpath
   kpath=$(nix build --impure --no-link --print-out-paths --expr "$kexpr" | tail -1)
   if [[ ! -f "$MICROVM_DIR/vmlinuz" || "$(<"$MICROVM_DIR/kernel-marker" 2>/dev/null)" != "$kpath" ]]; then
@@ -611,13 +503,41 @@ printf '%s\n' "$name" > "$rundir/hostname"
 printf '%s\n' "$ENGINE" > "$rundir/engine"
 printf '%s\n' "${VMF_MODE:-direct}" > "$rundir/mode"
 printf '%s\n' "$expose_mode" > "$rundir/expose"
+# Host port pick: 1:1 when the unprivileged slirp bind can take it,
+# otherwise a stable high port (hash of name+want, probed upward). The
+# guest keeps the declared port; only the host-side bind moves.
+pick_host_port() { # name want -> usable host port
+  python3 - "$1" "$2" <<'PPY'
+import socket, sys, zlib
+name, want = sys.argv[1], int(sys.argv[2])
+def usable(p):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); s.close(); return True
+    except OSError:
+        return False
+if usable(want):
+    print(want); sys.exit(0)
+p = 30000 + zlib.crc32(("%s:%d" % (name, want)).encode()) % 10000
+for _ in range(100):
+    if usable(p):
+        print(p); break
+    p += 1
+else:
+    print(want)
+PPY
+}
 : > "$rundir/hostfwd"
 for p in "${ports[@]:-}"; do
   [[ -n "$p" && "$expose_mode" != "none" ]] || continue
   proto=tcp; spec="$p"
   if [[ "$spec" == */udp ]]; then proto=udp; spec="${spec%/udp}"
   elif [[ "$spec" == */tcp ]]; then spec="${spec%/tcp}"; fi
-  printf '%s %s %s\n' "$proto" "${spec%%:*}" "${spec##*:}" >> "$rundir/hostfwd"
+  hport="${spec%%:*}"; gport="${spec##*:}"
+  rport=$(pick_host_port "$name" "$hport")
+  [[ "$rport" != "$hport" ]] && \
+    echo "note: host port $hport unavailable; '$name' port $gport published on 127.0.0.1:$rport" >&2
+  printf '%s %s %s\n' "$proto" "$rport" "$gport" >> "$rundir/hostfwd"
 done
 
 if [[ "$ENGINE" == "qemu" ]]; then

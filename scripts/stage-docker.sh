@@ -59,6 +59,17 @@ if [[ ! -f "$out/bin/socat" ]]; then
     > "$out/.socat-path"
   cp "$(cat "$out/.socat-path")/bin/socat" "$out/bin/socat"
 fi
+
+# iptables: dockerd's embedded DNS resolver (127.0.0.11 DNAT per
+# container) invokes the iptables binary even with --iptables=false;
+# without it every user-defined network loses name resolution.
+if [[ ! -f "$out/bin/iptables" ]]; then
+  echo "building static iptables..."
+  nix build --impure --no-link --print-out-paths \
+    --expr 'let pkgs = import <nixpkgs> {}; in pkgs.pkgsStatic.iptables' \
+    | tail -1 > "$out/.iptables-path"
+  cp "$(cat "$out/.iptables-path")"/bin/* "$out/bin/"
+fi
 fetch_pinned "$compose_url" "$out/docker-compose" "$pins_dir/docker-compose.sha256"
 
 if [[ ! -f "$out/bin/dockerd" ]]; then

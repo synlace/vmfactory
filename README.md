@@ -228,6 +228,32 @@ an in-guest ssh server). For microVMs:
   (real kernel binds); nginx-style single-default-server images are
   unaffected either way.
 
+## Compose runs from git URLs
+
+`vmf run github.com/org/repo` works without a scheme (gitlab.com and
+bitbucket.org too); `https://`, `git@`, and `file://` URLs also work,
+and a plain local directory path runs the same pipeline. The compose
+file is found at the repo root or in a unique subdirectory (two levels
+deep; several matches fail with the list).
+
+The translation is deterministic (no LLM on the happy path): services,
+image|build (context, dockerfile, args), ports (TCP/UDP), expose, env
+(mapping and list forms), env_file, command, entrypoint, depends_on,
+network aliases. Known gaps (a compose file relying on them still
+boots, but those parts are inert): volumes (named volumes and bind
+mounts are dropped), custom network isolation (everything lands on one
+static-IP project network), healthchecks, replicas.
+
+Because the guest has no docker embedded DNS (its resolver DNAT needs
+iptables, which the module-less microVM kernel does not ship), each
+service gets a static IP (172.31.100.10+) on the project network and
+every other service resolves names and aliases through generated
+`extra_hosts` entries. Container restarts keep their IP.
+
+Compose-declared privileged ports (e.g. 80:80) auto-remap on the host
+side when slirp cannot bind (unprivileged port or already taken); the
+guest keeps the declared port and `vmf url NAME 80` still resolves.
+
 ## Port exposure (firecracker engine)
 
 `vmf run` needs no `-p` knowledge: the guest discovers its own listeners

@@ -54,19 +54,70 @@ fi
 import json, os, sys, yaml
 src = sys.argv[1]
 out = sys.argv[2]
-for cand in ("compose.yaml", "docker-compose.yaml", "compose.yml", "docker-compose.yml"):
-    p = os.path.join(src, cand)
-    if os.path.isfile(p):
-        break
-else:
-    sys.stderr.write("error: no compose file in %s\n" % src)
-    sys.exit(1)
-doc = yaml.safe_load(open(p))
+NAMES = ("compose.yaml", "docker-compose.yaml", "compose.yml", "docker-compose.yml")
+SKIP_DIRS = {".git", "node_modules", ".github", "__pycache__", ".idea", ".vscode"}
+
+def pick_compose(root):
+    # Root first, then a unique compose file anywhere in the first two
+    # directory levels (monorepos keep projects in subdirs).
+    for cand in NAMES:
+        p = os.path.join(src, cand)
+        if os.path.isfile(p):
+            return cand, os.path.join(src, cand)
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        rel = os.path.relpath(dirpath, src)
+        if rel != "." and rel.count(os.sep) >= 2:
+            dirnames[:] = []
+            continue
+        if dirpath == src:
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for cand in NAMES:
+            if cand in filenames:
+                hits.append((dirpath, cand))
+                break
+    if not hits:
+        sys.stderr.write("error: no compose file in %s (root or first two dir levels)\n" % src)
+        sys.exit(1)
+    if len(hits) > 1:
+        sys.stderr.write("error: several compose files under %s:\n" % src)
+        for d, cand in sorted(hits):
+            sys.stderr.write("  error:   %s/%s\n" % (os.path.relpath(d, src), cand))
+        sys.stderr.write("error: pass the project directory explicitly to pick one\n")
+        sys.exit(1)
+    d, cand = hits[0]
+    return d, os.path.join(d, cand)
+
+compose_dir, compose_path = pick_compose(src)
+if compose_dir != src:
+    # Monorepo: everything below resolves against the project dir.
+    src = compose_dir
+    sys.stderr.write("compose: using %s/%s\n" % (os.path.relpath(compose_dir, sys.argv[1]), os.path.basename(compose_path)))
+doc = yaml.safe_load(open(compose_path))
 svcs = doc.get("services") or {}
+
+def norm_image(img):
+    # Docker-style normalization: unprefixed names imply docker.io
+    # ("mariadb:11.8" -> docker.io/library/mariadb:11.8, "user/repo" ->
+    # docker.io/user/repo). A registry prefix only counts before the
+    # first slash; localhost/local buildah tags pass through.
+    if not img:
+        return img
+    base = img.split("@", 1)[0]
+    first, slash, rest = base.partition("/")
+    if slash and (first == "localhost" or "." in first or ":" in first):
+        return img
+    if slash:
+        return "docker.io/" + img
+    return "docker.io/library/" + img
+
 if not svcs:
     sys.stderr.write("error: compose file has no services\n")
     sys.exit(1)
-plan = {"compose_file": os.path.basename(p), "services": []}
+plan = {"compose_file": os.path.basename(compose_path), "services": [],
+        "project_dir": os.path.relpath(src, sys.argv[1])}
 for name, s in svcs.items():
     e = {"name": name}
     if s.get("command"):
@@ -80,10 +131,14 @@ for name, s in svcs.items():
         else:
             e["build"] = {"context": b.get("context") or ".",
                           "dockerfile": b.get("dockerfile") or "Dockerfile"}
+            args = b.get("args") or {}
+            if isinstance(args, dict) and args:
+                e["build"]["args"] = {str(k): ("" if v is None else str(v))
+                                      for k, v in args.items()}
         if "image" in s:
-            e["tag"] = s["image"]
+            e["tag"] = norm_image(str(s["image"]))
     elif "image" in s:
-        e["image"] = s["image"]
+        e["image"] = norm_image(str(s["image"]))
     else:
         sys.stderr.write("error: service '%s' has neither build nor image\n" % name)
         sys.exit(1)
@@ -119,13 +174,17 @@ for name, s in svcs.items():
         exp.append(pv)
     if exp:
         e["expose"] = exp
+    env_raw = s.get("environment")
     env = {}
-    for kv in s.get("environment") or []:
-        if isinstance(kv, str):
-            k, _, v = kv.partition("=")
-            env[k] = v
-        else:
-            env.update({k: ("" if v is None else str(v)) for k, v in kv.items()})
+    if isinstance(env_raw, dict):
+        env = {str(k): ("" if v is None else str(v)) for k, v in env_raw.items()}
+    elif isinstance(env_raw, list):
+        for kv in env_raw:
+            if isinstance(kv, str):
+                k, _, v = kv.partition("=")
+                env[k] = v
+            else:
+                env.update({k: ("" if v is None else str(v)) for k, v in kv.items()})
     if s.get("env_file"):
         for f in s["env_file"]:
             fp = os.path.join(src, f)
@@ -138,6 +197,19 @@ for name, s in svcs.items():
             else:
                 sys.stderr.write("warning: env_file %s not found; skipped\n" % f)
     e["env"] = env
+    # Network aliases declared on the service's networks: kept so the
+    # flattened compose can point every other service's extra_hosts at
+    # them (the guest has no docker embedded DNS; see the flatten step).
+    aliases = []
+    nets = s.get("networks")
+    if isinstance(nets, dict):
+        for nv in nets.values():
+            if isinstance(nv, dict):
+                aliases += list(nv.get("aliases") or [])
+    elif isinstance(nets, list):
+        aliases += [str(a) for a in nets]
+    if aliases:
+        e["aliases"] = aliases
     e["depends_on"] = list((s.get("depends_on") or {}).keys()
                            if isinstance(s.get("depends_on"), dict)
                            else s.get("depends_on") or [])
@@ -160,8 +232,14 @@ if command -v jq >/dev/null 2>&1; then
 else
   JQ=(nix shell nixpkgs#jq -c jq -r)
 fi
+if command -v awk >/dev/null 2>&1; then
+  AWK=(awk)
+else
+  AWK=(nix shell nixpkgs#gawk -c awk)
+fi
 svc_count=$("${JQ[@]}" '.services | length' "$plan_tmp/plan.json")
 primary=$("${JQ[@]}" -r '.primary' "$plan_tmp/plan.json")
+PROJ="$VMF_COMPOSE_SRC/$("${JQ[@]}" -r '.project_dir // "."' "$plan_tmp/plan.json")"
 echo "compose: $svc_count services (primary: $primary)"
 
 # --- host-side builds/pulls (pinned digests) ----------------------------
@@ -182,16 +260,47 @@ while IFS=$'\t' read -r name kind rest; do
     # Alias the pulled image to the guest-side local tag so the run
     # path (derive, squashfs) can address it like a built image.
     "${BUILD_BIN[@]}" tag "$image" "$tag"
-    digest=$("${BUILD_BIN[@]}" inspect --type image "$image" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+    digest=$("${BUILD_BIN[@]}" inspect --type image "$image" \
+      | grep -oE 'sha256:[0-9a-f]{64}' | awk 'NR==1{v=$0} END{print v}')
     pin_image "$image" "$digest"
     SVC_DIGEST["$name"]="$digest"
   else
     dockerfile="$plan_tmp/df-$name"
-    ctx="$VMF_COMPOSE_SRC/$rest"
+    # Build contexts resolve against the project dir (a monorepo compose
+    # file may live in a subdirectory of the clone).
+    ctx="$PROJ/$rest"
     echo "compose: building $name (context: ${rest#./})..."
-    "${BUILD_BIN[@]}" build -t "$tag" -f "$ctx/$(${JQ[@]} -r --arg n "$name" '.services[] | select(.name==$n) | .build.dockerfile' "$plan_tmp/plan.json")" "$ctx" >/dev/null
-    digest=$("${BUILD_BIN[@]}" inspect --type image "$tag" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
-    pin_image "$tag" "$digest"
+    # Patch unqualified FROM images in a generated copy: buildah refuses
+    # short names without a registry (FROM php@sha256:... etc.).
+    "${AWK[@]}" '
+      /^[[:space:]]*FROM[[:space:]]/ {
+        out = $1; i = 2
+        while (i <= NF && $i ~ /^--/) { out = out " " $i; i++ }
+        if (i <= NF) {
+          img = $i; t = img
+          sub(/@.*/, "", t); sub(/:.*/, "", t)
+          if (t != "scratch" && t !~ /[\/.]/) img = "docker.io/library/" img
+          out = out " " img; i++
+        }
+        while (i <= NF) { out = out " " $i; i++ }
+        print out; next
+      }
+      { print }
+    ' "$ctx/$(${JQ[@]} -r --arg n "$name" '.services[] | select(.name==$n) | .build.dockerfile' "$plan_tmp/plan.json")" > "$dockerfile"
+    build_args=()
+    while IFS=$'\t' read -r k v; do
+      [[ -n "$k" ]] && build_args+=(--build-arg "$k=$v")
+    done < <("${JQ[@]}" -r --arg n "$name" \
+      '.services[] | select(.name==$n) | ((.build.args // {}) | to_entries[]) | [(.key|tostring), (.value|tostring)] | @tsv' \
+      "$plan_tmp/plan.json")
+    "${BUILD_BIN[@]}" build -t "$tag" -f "$dockerfile" \
+      ${build_args[@]+"${build_args[@]}"} "$ctx" >/dev/null
+    # Digest of the built image. The reader must drain the full inspect
+    # output: head -1 closes the pipe early and SIGPIPEs grep (141) when
+    # the output carries several sha256 matches, which pipefail turns
+    # into a silent script exit.
+    digest=$("${BUILD_BIN[@]}" inspect --type image "$tag" \
+      | grep -oE 'sha256:[0-9a-f]{64}' | awk 'NR==1{v=$0} END{print v}')
     SVC_DIGEST["$name"]="$digest"
   fi
   SVC_TAGS["$name"]="$tag"
@@ -210,6 +319,18 @@ import json, sys, yaml
 m = json.load(open(sys.argv[1]))
 svcs = {}
 fwd = []
+# The guest dockerd's embedded DNS (127.0.0.11) does not work here (its
+# resolver DNAT needs iptables; the microVM kernel has no netfilter
+# modules and dockerd runs --iptables=false). Give every service a
+# static IP on the project network and point every other service's
+# extra_hosts at the names + aliases. Deterministic, no resolver.
+SUB = "172.31.100"
+names = [e["name"] for e in m["services"]]
+ip = {n: "%s.%d" % (SUB, 10 + i) for i, n in enumerate(names)}
+alias_ip = {}
+for e in m["services"]:
+    for a in e.get("aliases") or []:
+        alias_ip[a] = ip[e["name"]]
 for e in m["services"]:
     n = e["name"]
     tag = m["tags"].get(n) or e.get("image")
@@ -228,8 +349,16 @@ for e in m["services"]:
         entry["environment"] = e["env"]
     if e["depends_on"]:
         entry["depends_on"] = e["depends_on"]
+    entry["networks"] = {"default": {"ipv4_address": ip[n]}}
+    hosts = {o: ip[o] for o in names if o != n}
+    for a, t in alias_ip.items():
+        if t != ip[n]:
+            hosts[a] = t
+    entry["extra_hosts"] = ["%s=%s" % (k, v) for k, v in sorted(hosts.items())]
     svcs[n] = entry
-yaml.safe_dump({"services": svcs}, open(sys.argv[2], "w"), sort_keys=False)
+doc = {"services": svcs}
+doc["networks"] = {"default": {"ipam": {"config": [{"subnet": SUB + ".0/24"}]}}}
+yaml.safe_dump(doc, open(sys.argv[2], "w"), sort_keys=False)
 open(sys.argv[3], "w").write("\n".join(fwd) + ("\n" if fwd else ""))
 PYEOF
 # --- data drive ----------------------------------------------------------
@@ -243,7 +372,10 @@ while IFS=$'\t' read -r name kind rest; do
   # ref (the store only has the upstream name). Either way the tar
   # carries the guest-side tag_for() name, which compose references.
   if [[ "${SVC_KINDS[$name]:-}" == "image" ]]; then
-    ref="${SVC_IMAGES[$name]:-}@${SVC_DIGEST[$name]:-}"
+    ref="${SVC_IMAGES[$name]}"
+    # Only append the digest when the ref does not carry one already
+    # (compose files may pin their own @sha256).
+    [[ "$ref" == *@sha256:* ]] || ref="${ref}@${SVC_DIGEST[$name]:-}"
   else
     ref="${SVC_TAGS[$name]:-}"
   fi
