@@ -183,6 +183,150 @@ if candidates:
         resolved = resolve(src, candidates, hint)
 else:
     resolved = None
+
+def gapfill(root):
+    # Compose-less repo: collect deterministic evidence (readme,
+    # Dockerfiles, manifests, systemd units, package files), ask the
+    # gap-fill model for a strict-JSON plan, render compose.yaml HERE
+    # (the model never writes YAML), and gate behind an approval.
+    # Approved proposals cache by input hash; later runs replay.
+    import hashlib
+    inputs = []
+    for rn in ("README.md", "README.rst", "README.txt"):
+        if os.path.isfile(os.path.join(root, rn)):
+            inputs.append(("readme", rn,
+                           open(os.path.join(root, rn), errors="replace").read(8192)))
+            break
+    dfs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if rel != "." and rel.count(os.sep) >= 2:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            if f.startswith("Dockerfile") and len(dfs) < 3:
+                dfs.append(os.path.join(dirpath, f))
+    for p in dfs:
+        rel = os.path.relpath(p, root)
+        inputs.append(("dockerfile", rel, open(p, errors="replace").read(4096)))
+    for f, cap in (("manifest.yaml", 4096), ("pyproject.toml", 4096),
+                   ("requirements.txt", 2048), ("package.json", 4096),
+                   ("go.mod", 2048), ("Cargo.toml", 2048), ("Gemfile", 2048),
+                   ("Makefile", 4096)):
+        p = os.path.join(root, f)
+        if os.path.isfile(p):
+            inputs.append(("manifest", f, open(p, errors="replace").read(4096)))
+    units = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if rel != "." and rel.count(os.sep) >= 2:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            if f.endswith(".service") and len(units) < 3:
+                units.append(os.path.join(dirpath, f))
+    for p in units:
+        rel = os.path.relpath(p, root)
+        inputs.append(("systemd-unit", rel, open(p, errors="replace").read(4096)))
+    bundle = "\n".join("=== %s: %s ===\n%s" % (k, rp, t) for k, rp, t in inputs)
+    if not bundle.strip():
+        sys.stderr.write("error: no compose file and nothing to infer from "
+                         "(no README/Dockerfile/manifests)\n")
+        sys.exit(1)
+    key = hashlib.sha256(bundle.encode()).hexdigest()[:12]
+    gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated", key)
+    cache = os.path.join(gen, "compose.yaml")
+    if os.path.isfile(cache):
+        sys.stderr.write("gap-filler: cache hit %s\n" % cache)
+        shutil.copy(cache, os.path.join(root, "compose.yaml"))
+        return
+    llm = os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh")
+    prompt = (
+        "Build a docker-compose plan for this repository from the evidence "
+        "below. Use ONLY what the evidence shows; never invent image tags, "
+        "ports, or env values. Prefer building from the existing Dockerfile "
+        "(context '.'); one service unless several are evidenced. Leave "
+        "ports empty when unknown: vmf auto-publishes ports the app "
+        "actually listens on.\n"
+        "Reply with ONE JSON object:\n"
+        '{"services":[{"name":"<short-name>","image":"<ref or null>",'
+        '"build":{"context":".","dockerfile":"<path or null>","args":{}},'
+        '"command":"<string or null>","ports":[], "env":{}}],'
+        '"notes":"<max 12 words>"}\n'
+        "Evidence:\n" + bundle[:32768])
+    proc = subprocess.run(["bash", os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh"),
+                           "--role", "gapfill", prompt],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.stderr.write("error: gap-filler needs a model (VMF_GAPFILL_MODEL); "
+                         "the repo has no compose file\n")
+        sys.exit(3)
+    try:
+        planj = json.loads(proc.stdout.strip().strip("`"))
+        if isinstance(planj, str):
+            planj = json.loads(planj)
+    except Exception:
+        sys.stderr.write("error: gap-filler returned unparseable JSON:\n%s\n"
+                         % proc.stdout[:400])
+        sys.exit(1)
+    comp = {"services": {}}
+    for s in planj.get("services") or []:
+        e = {}
+        b = s.get("build") or {}
+        if b.get("dockerfile") or b.get("context"):
+            be = {"context": b.get("context") or ".",
+                  "dockerfile": b.get("dockerfile") or "Dockerfile"}
+            if b.get("args"):
+                be["args"] = {str(k): str(v) for k, v in b["args"].items()}
+            e["build"] = be
+        elif s.get("image"):
+            e["image"] = str(s["image"])
+        else:
+            continue
+        if s.get("command"):
+            e["command"] = s["command"]
+        if s.get("ports"):
+            e["ports"] = [str(p) for p in s["ports"]]
+        if s.get("env"):
+            e["environment"] = {str(k): str(v) for k, v in s["env"].items()}
+        comp["services"][str(s["name"])] = e
+    if not comp["services"]:
+        sys.stderr.write("error: gap-filler proposed no usable services\n")
+        sys.exit(1)
+    rendered = yaml.safe_dump(comp, sort_keys=False)
+    sys.stderr.write("gap-filler: proposal (%s)\n%s"
+                     % ((planj.get("notes") or "-")[:60], rendered))
+    accept = os.environ.get("VMF_RUN_YES") == "1"
+    if not accept and sys.stdin.isatty():
+        sys.stderr.write("gap-filler: boot with this compose? [y/N] ")
+        try:
+            accept = input().strip().lower() in ("y", "yes")
+        except EOFError:
+            accept = False
+    if not accept:
+        sys.stderr.write("gap-filler: not approved; rerun with --yes to accept\n")
+        sys.exit(2)
+    os.makedirs(gen, exist_ok=True)
+    open(cache, "w").write(rendered)
+    open(cache + ".meta.json", "w").write(json.dumps(
+        {"model": os.environ.get("VMF_GAPFILL_MODEL") or os.environ.get("VMF_LLM_MODEL", ""),
+         "notes": planj.get("notes", ""), "created": ""}, indent=2))
+    shutil.copy(cache, os.path.join(root, "compose.yaml"))
+    sys.stderr.write("gap-filler: approved; cached %s\n" % cache)
+
+if not candidates:
+    gapfill(sys.argv[1])
+    for cand in NAMES:
+        p = os.path.join(src, cand)
+        if os.path.isfile(p):
+            name_, svcs_, ports_ = meta(p)
+            candidates.append({"dir": src, "rel": ".", "file": cand,
+                               "name": name_, "services": svcs_, "ports": ports_})
+            break
+    resolved = candidates[0] if candidates else None
 if not candidates:
     sys.stderr.write("error: no compose file in %s (root or first two dir levels)\n" % src)
     sys.exit(1)
@@ -418,6 +562,10 @@ while IFS=$'\t' read -r name kind rest; do
           img = $i; t = img
           sub(/@.*/, "", t); sub(/:.*/, "", t)
           if (t != "scratch" && t !~ /[\/.]/) img = "docker.io/library/" img
+          else {
+            f1 = t; sub(/\/.*/, "", f1)
+            if (t ~ /\// && f1 !~ /\./ && f1 != "localhost") img = "docker.io/" img
+          }
           out = out " " img; i++
         }
         while (i <= NF) { out = out " " $i; i++ }
@@ -522,6 +670,21 @@ while IFS=$'\t' read -r name kind rest; do
   "${BUILD_BIN[@]}" push "$ref" "docker-archive:$stage/images/$name.tar:$(tag_for "$name")" >/dev/null
 done < <("${JQ[@]}" -r '.services[] | [.name, (if .image then "image" else "build" end), (.image // .build.context)] | @tsv' "$plan_tmp/plan.json")
 
+# mke2fs -d populate cannot write non-sparse files beyond 2GiB (its
+# byte counter is 32-bit; verified on e2fsprogs 1.47.3). Split big
+# docker archives into <2GiB parts; the guest cats them into
+# `docker load`.
+for tar in "$stage"/images/*.tar; do
+  [[ -f "$tar" ]] || continue
+  sz=$(stat -c%s "$tar")
+  if (( sz > 2000000000 )); then
+    mv "$tar" "$tar.full"
+    split -b 1800M -d -a 2 "$tar.full" "$tar.part-"
+    rm -f "$tar.full"
+    echo "compose: split $(basename "$tar") into $((sz / 1800000000 + 1)) parts (>2GiB populate limit)"
+  fi
+done
+
 size_kb=$(du -sk "$stage" | cut -f1)
 # Docker storage needs headroom: the images tars decompress into
 # docker-data on the same drive. Sparse file: host disk usage grows
@@ -538,9 +701,9 @@ if [[ ! -f "$drive" ]]; then
     nix shell nixpkgs#util-linux -c truncate -s $(( fs_size / 1024 ))M "$drive.tmp"
   fi
   if command -v mke2fs >/dev/null 2>&1; then
-    mke2fs -q -F -t ext4 -d "$stage" "$drive.tmp"
+    mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$drive.tmp"
   else
-    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -d "$stage" "$drive.tmp"
+    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$drive.tmp"
   fi
   mv "$drive.tmp" "$drive"
 else

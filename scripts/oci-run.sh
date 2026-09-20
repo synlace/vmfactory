@@ -43,6 +43,8 @@ Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
   --intent TEXT   natural-language project/version pick; resolves to a
                   pointer from the candidate menu through an LLM (needs
                   VMF_LLM_API_KEY in ~/.vmf/env; degrades to the menu)
+  --yes           accept LLM proposals without the interactive gate
+                  (gap-filler compose generation)
   --expose MODE   port exposure: all (default: auto-publish every port
                   the guest discovers, TCP+UDP) | declared (only -p /
                   compose-declared ports) | none. An explicit -p makes
@@ -62,6 +64,7 @@ ports=()
 volumes=()
 envs=()
 expose=""
+yes_flag=0
 project_hint=""
 intent=""
 name=""
@@ -93,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     -i|-t|-it|-ti|-itd|-dit) echo "note: '$1' ignored: microVMs have no PTY" >&2; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
     --project) [[ $# -ge 2 ]] || usage; project_hint="$2"; shift 2 ;;
+    --yes) yes_flag=1; shift ;;
     --intent) [[ $# -ge 2 ]] || usage; intent="$2"; shift 2 ;;
     --expose) [[ $# -ge 2 ]] || usage; expose="$2"; shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
@@ -167,6 +171,7 @@ if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   name="${name:-$(basename "${clone_url%%.git}")}"
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
+  [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
 elif [[ -d "$image" ]]; then
   # Any local directory: compose-run.sh locates the compose file (root,
   # then a unique subdirectory) and errors clearly when there is none.
@@ -174,6 +179,7 @@ elif [[ -d "$image" ]]; then
   name="${name:-$(basename "$image")}"
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
+  [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
 fi
 if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"

@@ -244,13 +244,24 @@ one by path hint, `--project <name-or-path>`, or `--intent "<phrase>"`.
 `--intent` sends the menu plus your phrase to a small LLM that returns
 a pointer ({project, ref, variant}); the pointer must be one of the
 menu entries or the run refuses. `ref` re-clones that branch or tag;
-`variant` overrides any `variant` build arg. Config lives in
-`~/.vmf/env` (chmod 600): `VMF_LLM_API_KEY`, `VMF_LLM_MODEL`,
-`VMF_LLM_BASE_URL` (any OpenAI-compatible endpoint; defaults to
-OpenRouter), `VMF_INTENT_MODEL`, `VMF_GAPFILL_MODEL`. Without a key
-the LLM paths degrade to the deterministic menu — the model is an
-accelerator, never a dependency. The compose translation itself is
-always deterministic.
+`variant` overrides any `variant` build arg.
+
+## Compose-less repos (gap-filler)
+
+A repo with no compose file anywhere (strix-style: README + a
+Dockerfile) runs through the gap-filler. It collects deterministic
+evidence (README, Dockerfiles, manifest.yaml, systemd units, package
+files), asks `VMF_GAPFILL_MODEL` for a strict-JSON plan, renders
+compose.yaml itself (the model never writes YAML), and shows the
+proposal. Booting requires the interactive `y` prompt or `--yes`.
+Approved proposals cache under `~/.vmf/generated/<input-hash>/` — the
+same repo replays without a model call. Without a key the gap-filler
+fails with a clear message; nothing is ever generated silently.
+
+Large images: host `mke2fs -d` cannot populate files beyond 2GiB (32-
+bit counter in its populate path), so docker archives over 2GiB are
+split into <2GiB parts on the host and the guest concatenates them
+into `docker load`.
 
 The compose file is found at the repo root or in a unique subdirectory
 (two levels deep). The translation is deterministic (no LLM on the

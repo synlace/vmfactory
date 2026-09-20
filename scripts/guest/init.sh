@@ -111,6 +111,14 @@ if [ "$mode" = "compose" ]; then
     $BB echo "vmf-init: docker load $f"
     docker load -i "$f" || $BB echo "vmf-init: docker load failed: $f" >&2
   done
+  # Split archives (host mke2fs cannot populate >2GiB files): each
+  # image lives as <name>.tar.part-NN and must be concatenated.
+  for f in /data/images/*.tar.part-00; do
+    [ -e "$f" ] || continue
+    base="${f%.part-00}"
+    $BB echo "vmf-init: docker load $base (split)"
+    cat "$base".part-* | docker load || $BB echo "vmf-init: docker load failed: $base" >&2
+  done
   $BB echo "vmf-init: docker compose up"
   docker-compose -f /data/compose.yaml up -d || {
     echo "vmf-init: compose up failed" >&2
