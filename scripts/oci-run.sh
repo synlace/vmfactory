@@ -170,8 +170,11 @@ fi
 # One python pass writes the guest init inputs into the run dir.
 mkdir -p "$RUNS_DIR/$name/auth"
 cfg_blob=$("${SKOPEO[@]}" inspect --config "docker://$ref" 2>/dev/null || true)
-envs_nul="$(printf '%s\0' "${envs[@]:-}" || true)"
-VMF_ENVS="$envs_nul" python3 - "$cfg_blob" "$RUNS_DIR/$name" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
+# NUL-separated override list travels as a file: environment variables
+# cannot carry NUL bytes, so env-var transport would silently merge
+# multiple -e flags into one entry.
+printf '%s\0' "${envs[@]:-}" > "$RUNS_DIR/$name/envs-nul" 2>/dev/null || : > "$RUNS_DIR/$name/envs-nul"
+VMF_ENVS_FILE="$RUNS_DIR/$name/envs-nul" python3 - "$cfg_blob" "$RUNS_DIR/$name" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
 import json, os, shlex, sys
 
 blob, rundir = sys.argv[1], sys.argv[2]
@@ -182,10 +185,14 @@ if not argv:
 if not argv:
     sys.stderr.write("error: image has no default command; pass one explicitly\n"); sys.exit(1)
 env = dict(kv.split("=", 1) for kv in (config.get("Env") or []) if "=" in kv)
-for kv in (os.environ.get("VMF_ENVS") or "").split("\x00"):
-    if kv and "=" in kv:
-        k, _, v = kv.partition("=")
-        env[k] = v
+override_path = os.environ.get("VMF_ENVS_FILE")
+if override_path and os.path.exists(override_path):
+    with open(override_path, "rb") as f:
+        for kv in f.read().split(b"\x00"):
+            kv = kv.decode("utf-8", "replace").strip()
+            if kv and "=" in kv:
+                k, _, v = kv.partition("=")
+                env[k] = v
 # Fallback tools: /vmf/bin holds a busybox symlink per applet. Append it
 # to PATH so images without coreutils (distroless) still run `ls` etc.
 # while real image binaries keep priority. The guest init inherits this
@@ -202,9 +209,13 @@ if user:
     else:
         sys.stderr.write(f"warning: image USER {user!r} is not numeric; running as root\n")
 
+# 'export' is required: the guest init sources this file, and shell
+# variables set by sourcing are invisible to the child processes
+# (sshd, the app) unless exported. grafana was the first image to hit
+# this — its run.sh depends on the image's own GF_PATHS_* env.
 with open(os.path.join(rundir, "env"), "w") as f:
     for k, v in env.items():
-        f.write(f"{k}={shlex.quote(v)}\n")
+        f.write(f"export {k}={shlex.quote(v)}\n")
 with open(os.path.join(rundir, "argv.sh"), "w") as f:
     f.write(" ".join(shlex.quote(a) for a in argv) + "\n")
 with open(os.path.join(rundir, "cwd"), "w") as f:
