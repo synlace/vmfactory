@@ -47,8 +47,9 @@ if [[ "$ENGINE" == "qemu" ]]; then
   # Real kernel: PTY sessions work, so interactive ssh is allowed. The
   # qemu pid (state file or pidfile) tells us whether the VM is alive.
   pid="${PID:-}"
-  if [[ -z "$pid" && -f "$RUNS_DIR/$name/qemu.pid" ]]; then
-    pid=$(cat "$RUNS_DIR/$name/qemu.pid")
+  rundir="${RUNDIR:-$RUNS_DIR/$name}"
+  if [[ -z "$pid" && -f "$rundir/qemu.pid" ]]; then
+    pid=$(cat "$rundir/qemu.pid")
   fi
   if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     echo "error: microVM '$name' is not running (stale state file); start it again" >&2

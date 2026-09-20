@@ -8,6 +8,17 @@ set -u
 
 BB=/vmf/busybox
 
+# This init is PID 1 of the guest kernel (qemu engine): ANY exit panics
+# the kernel ('Attempted to kill init!'). Power the VM off instead on
+# every exit path. krunvm guests stop the VM on init exit, so they
+# return the status normally. The engine file is usually present; when
+# missing (fresh boot, read race), assume qemu and power off.
+engine=$($BB cat /vmf-run/engine 2>/dev/null || true)
+case "$engine" in
+  krunvm) ;;
+  *) trap '$BB poweroff -f' EXIT ;;
+esac
+
 $BB mkdir -p /run/dropbear /root/.ssh
 # PTY support: the initramfs (qemu engine) mounts devpts with proper
 # modes; init.krun (krunvm engine) mounts it with ptmxmode=000, so

@@ -108,7 +108,7 @@ stop lab=lab:
       . "$HOME/.vmf/runs/{{ lab }}.conf"
       ENGINE=${ENGINE:-krunvm}
       if [ "$ENGINE" = "qemu" ]; then
-        pid=${PID:-$(cat "$HOME/.vmf/runs/{{ lab }}/qemu.pid" 2>/dev/null || true)}
+        pid=${PID:-$(cat "${RUNDIR:-$HOME/.vmf/runs/{{ lab }}}/qemu.pid" 2>/dev/null || true)}
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
         if command -v buildah >/dev/null 2>&1; then B=buildah; else B="nix shell nixpkgs#buildah -c buildah"; fi
         [ -n "${CTR:-}" ] && $B unshare -- buildah rm "$CTR" >/dev/null 2>&1 || true
@@ -121,7 +121,8 @@ stop lab=lab:
           nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
         fi
       fi
-      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
+      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}".[0-9]* \
+             "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
       echo "microVM {{ lab }} stopped"
       exit 0
     fi
@@ -133,7 +134,8 @@ stop lab=lab:
       else
         nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
       fi
-      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
+      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}".[0-9]* \
+             "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
       echo "microVM {{ lab }} stopped"
       exit 0
     fi

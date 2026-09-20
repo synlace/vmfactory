@@ -99,6 +99,14 @@ DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
 ENGINE="${VMF_ENGINE:-qemu}"
 MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
 
+# Per-run input directory, unique per run (<name>.<run-pid>). A
+# replace-run of the same name kills the old VM, and the old teardown
+# deletes ITS run dir without ever racing the new run's writes on
+# shared paths (the old race emptied /vmf-run mid-boot and killed init).
+
+runid=$$
+rundir="$RUNS_DIR/$name.$runid"
+
 # Kernel + initramfs for the qemu engine. The kernel is a stock nixpkgs
 # build with virtio/9p/devpts forced built-in (no modules); the initramfs
 # packs the static busybox bundle plus the initramfs init. Both cached by
@@ -168,13 +176,13 @@ fi
 # image's ENTRYPOINT/CMD, so argv = Entrypoint+Cmd (docker semantics), env
 # = image Env overridden by -e flags, cwd = WorkingDir, uid = User.
 # One python pass writes the guest init inputs into the run dir.
-mkdir -p "$RUNS_DIR/$name/auth"
 cfg_blob=$("${SKOPEO[@]}" inspect --config "docker://$ref" 2>/dev/null || true)
 # NUL-separated override list travels as a file: environment variables
 # cannot carry NUL bytes, so env-var transport would silently merge
 # multiple -e flags into one entry.
-printf '%s\0' "${envs[@]:-}" > "$RUNS_DIR/$name/envs-nul" 2>/dev/null || : > "$RUNS_DIR/$name/envs-nul"
-VMF_ENVS_FILE="$RUNS_DIR/$name/envs-nul" python3 - "$cfg_blob" "$RUNS_DIR/$name" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
+mkdir -p "$rundir"
+printf '%s\0' "${envs[@]:-}" > "$rundir/envs-nul" 2>/dev/null || : > "$rundir/envs-nul"
+VMF_ENVS_FILE="$rundir/envs-nul" python3 - "$cfg_blob" "$rundir" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
 import json, os, shlex, sys
 
 blob, rundir = sys.argv[1], sys.argv[2]
@@ -285,8 +293,8 @@ if [[ "$ssh" -eq 1 ]]; then
   VMF_BUNDLE="$BUNDLE_DIR" VMF_INIT="$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
   VMF_DERIVE_DIR="$DERIVE_DIR" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/derive.sh"
-  mkdir -p "$RUNS_DIR/$name/auth"
-  cp "$SSH_DIR/id_ed25519.pub" "$RUNS_DIR/$name/auth/authorized_keys"
+  mkdir -p "$rundir/auth"
+  cp "$SSH_DIR/id_ed25519.pub" "$rundir/auth/authorized_keys"
   create_ref="$DERIVED"
 else
   create_ref="$ref"
@@ -299,7 +307,7 @@ done
 for v in "${volumes[@]:-}"; do
   [[ -n "$v" ]] && create_args+=(-v "$v")
 done
-[[ "$ssh" -eq 1 ]] && create_args+=(-v "$RUNS_DIR/$name:/vmf-run")
+[[ "$ssh" -eq 1 ]] && create_args+=(-v "$rundir:/vmf-run")
 [[ -n "$cpus" ]] && create_args+=(--cpus "$cpus")
 
 # Stop and replace a stale VM of the same name BEFORE writing state:
@@ -318,17 +326,18 @@ IMAGE=$image
 PIN=${digest:-}
 DERIVED=${DERIVED_TAG:-}
 ENGINE=$ENGINE
+RUNDIR=$rundir
+RUN=$runid
 EOF
 
 # Per-run guest inputs shared into the VM (hostname for the kernel UTS,
 # engine marker for the guest init's power-off behavior, port forwards
 # for slirp hostfwd).
-mkdir -p "$RUNS_DIR/$name"
-printf '%s\n' "$name" > "$RUNS_DIR/$name/hostname"
-printf '%s\n' "$ENGINE" > "$RUNS_DIR/$name/engine"
-: > "$RUNS_DIR/$name/hostfwd"
+printf '%s\n' "$name" > "$rundir/hostname"
+printf '%s\n' "$ENGINE" > "$rundir/engine"
+: > "$rundir/hostfwd"
 for p in "${ports[@]:-}"; do
-  [[ -n "$p" ]] && printf '%s %s\n' "${p%%:*}" "${p##*:}" >> "$RUNS_DIR/$name/hostfwd"
+  [[ -n "$p" ]] && printf '%s %s\n' "${p%%:*}" "${p##*:}" >> "$rundir/hostfwd"
 done
 
 if [[ "$ENGINE" == "qemu" ]]; then
@@ -343,8 +352,8 @@ if [[ "$ENGINE" == "qemu" ]]; then
   else
     BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
   fi
-  VMF_IMAGE_REF="$create_ref" VMF_NAME="$name" VMF_RUNDIR="$RUNS_DIR/$name" \
-  VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$RUNS_DIR/$name.log" \
+  VMF_IMAGE_REF="$create_ref" VMF_NAME="$name" VMF_RUNDIR="$rundir" \
+  VMF_CONF="$RUNS_DIR/$name.conf" VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$RUNS_DIR/$name.log" \
   VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/qemu-boot.sh"
   if [[ "$detach" -eq 1 ]]; then
@@ -362,7 +371,8 @@ krun create "$create_ref" "${create_args[@]}"
 cleanup() {
   if [[ "$keep" -eq 0 ]]; then
     krun delete "$name" >/dev/null 2>&1 || true
-    rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name.log"
+    rm -rf "$rundir" "$RUNS_DIR/$name.log"
+    grep -q "^RUN=$runid$" "$RUNS_DIR/$name.conf" 2>/dev/null && rm -f "$RUNS_DIR/$name.conf"
   else
     echo "note: kept microVM '$name' (krunvm delete $name to remove)"
   fi
@@ -378,14 +388,15 @@ if [[ "$detach" -eq 1 ]]; then
   if [[ "$ssh" -eq 1 ]]; then
     start_cmd=(krun start "$name" -- /vmf/init.sh)
   else
-    mapfile -t argv < <(eval "printf '%s\n' $(cat "$RUNS_DIR/$name/argv.sh")")
+    mapfile -t argv < <(eval "printf '%s\n' $(cat "$rundir/argv.sh")")
     start_cmd=(krun start "$name" -- ${argv[@]+"${argv[@]}"})
   fi
   (
     "${start_cmd[@]}" </dev/null >>"$console_log" 2>&1
     if [[ "$keep" -eq 0 ]]; then
       krun delete "$name" >/dev/null 2>&1 || true
-      rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name.conf" "$console_log"
+      rm -rf "$rundir" "$console_log"
+      grep -q "^RUN=$runid$" "$RUNS_DIR/$name.conf" 2>/dev/null && rm -f "$RUNS_DIR/$name.conf"
     fi
   ) >/dev/null 2>&1 &
   disown
@@ -402,7 +413,7 @@ if [[ "$ssh" -eq 1 ]]; then
   set -e
 else
   # Plain mode: argv straight through krunvm (no derive, no ssh).
-  argv_file="$RUNS_DIR/$name/argv.sh"
+  argv_file="$rundir/argv.sh"
   mapfile -t argv < <(eval "printf '%s\n' $(cat "$argv_file")")
   set +e
   krun start "$name" -- ${argv[@]+"${argv[@]}"}
