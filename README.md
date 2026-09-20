@@ -115,6 +115,33 @@ just list                                          # shows microVMs + ssh ports
   TSI (see the apache note below); an UNMAPPED privileged bind under
   krunvm fails with `Permission denied`.
 
+### Sandbox flags (untrusted-code guardrails)
+
+Opt-in today; the planned `vmf run <repo-url>` feature will force a
+sandboxed combination automatically when it runs un-audited code.
+
+- `--net restricted`: a Landlock ruleset (kernel 6.7+, x86_64) denies
+  every outbound `connect()` of the qemu process. The guest cannot reach
+  the internet or host services through the slirp gateway — outbound
+  TCP dies with an ICMP unreachable, which slirp converts cleanly.
+  Published ports (`-p`) and `just ssh` are inbound and keep working.
+  DNS still resolves because slirp's resolver uses UDP, which Landlock
+  does not govern yet; a determined guest can exfiltrate over UDP.
+  Full network closure needs the per-VM netns work (planned).
+- `--net off`: no network device at all (also no ssh, no `-p`).
+- `--timeout 30m` (also `45s`, `2h`): the VM is powered off after the
+  duration and the run state self-cleans; for untrusted jobs that must
+  not outlive their welcome.
+- `--disk-cap 10G` (also `500M`): caps single-file guest writes through
+  the 9p root share at the storage layer (qemu's `RLIMIT_FSIZE`; SIGXFSZ
+  is ignored so the write fails with EFBIG instead of killing the VM).
+  With the loose 9p cache, in-guest writes beyond the cap may appear to
+  succeed (data sits in guest RAM, writeback fails) — the host disk
+  stays capped either way. Guest `/tmp` is tmpfs (RAM), so it is not
+  covered by this cap.
+- The sandbox flags apply to the qemu engine; the krunvm engine warns
+  and ignores them.
+
 ## SSH into microVMs (derived ssh server)
 
 `just ssh <name>` reaches both box types: qemu boxes (via `enter.sh`,

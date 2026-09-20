@@ -28,6 +28,13 @@ Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
   --no-ssh        boot the pinned image as-is (no dropbear layer, no ssh)
   --engine E      microVM engine: qemu (default) or krunvm (legacy)
   --memory MB     guest memory (default 1024)
+  --net MODE      guest network: open (default) | restricted (no outbound
+                  connections; published ports and ssh still work) | off
+                  (no network device at all, no ssh)
+  --timeout DUR   power the VM off after DUR (45s, 30m, 2h); for
+                  untrusted jobs
+  --disk-cap SZ   cap single-file guest writes at SZ (500M, 10G); writes
+                  beyond fail with EFBIG (disk-full semantics)
   -p HOST:GUEST   publish host port to guest port (repeatable)
   -v HOST:GUEST   mount a host path into the guest (repeatable)
   -e K=V          environment for the guest process (repeatable)
@@ -46,6 +53,9 @@ envs=()
 name=""
 cpus=""
 mem=""
+netmode=""
+timeout_spec=""
+diskcap=""
 ssh=1
 keep=0
 detach=0
@@ -60,6 +70,9 @@ while [[ $# -gt 0 ]]; do
     --no-ssh) ssh=0; shift ;;
     --engine) [[ $# -ge 2 ]] || usage; ENGINE="$2"; shift 2 ;;
     --memory) [[ $# -ge 2 ]] || usage; mem="$2"; shift 2 ;;
+    --net) [[ $# -ge 2 ]] || usage; netmode="$2"; shift 2 ;;
+    --timeout) [[ $# -ge 2 ]] || usage; timeout_spec="$2"; shift 2 ;;
+    --disk-cap) [[ $# -ge 2 ]] || usage; diskcap="$2"; shift 2 ;;
     -i|-t|-it|-ti|-itd|-dit) echo "note: '$1' ignored: microVMs have no PTY" >&2; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
@@ -98,6 +111,41 @@ BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
 DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
 ENGINE="${VMF_ENGINE:-qemu}"
 MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
+
+# P0 guardrails: parse network mode, run timeout, and disk cap. The
+# sandbox flags are opt-in today; the repo-run feature (P3) forces
+# restricted + timeout for un-audited code.
+case "$netmode" in
+  ""|open|restricted|off) ;;
+  *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
+esac
+timeout_secs=0
+if [[ -n "$timeout_spec" ]]; then
+  timeout_secs=$(python3 - "$timeout_spec" <<'PY'
+import re, sys
+m = re.fullmatch(r"(\d+)([smh]?)", sys.argv[1])
+if not m:
+    print(-1)
+else:
+    print(int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)])
+PY
+)
+  [[ "$timeout_secs" -gt 0 ]] || { echo "error: bad --timeout '$timeout_spec' (45s|30m|2h)" >&2; exit 2; }
+fi
+disk_blocks=0
+if [[ -n "$diskcap" ]]; then
+  disk_blocks=$(python3 - "$diskcap" <<'PY'
+import re, sys
+m = re.fullmatch(r"(\d+)([KMG]?)", sys.argv[1])
+mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+if not m:
+    print(-1)
+else:
+    print((int(m.group(1)) * mult[m.group(2)]) // 512)
+PY
+)
+  [[ "$disk_blocks" -gt 0 ]] || { echo "error: bad --disk-cap '$diskcap' (500M|10G)" >&2; exit 2; }
+fi
 
 # Per-run input directory, unique per run (<name>.<run-pid>). A
 # replace-run of the same name kills the old VM, and the old teardown
@@ -354,6 +402,8 @@ if [[ "$ENGINE" == "qemu" ]]; then
   fi
   VMF_IMAGE_REF="$create_ref" VMF_NAME="$name" VMF_RUNDIR="$rundir" \
   VMF_CONF="$RUNS_DIR/$name.conf" VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$RUNS_DIR/$name.log" \
+  VMF_NET_MODE="${netmode:-open}" VMF_TIMEOUT_SECS="$timeout_secs" \
+  VMF_DISK_BLOCKS="$disk_blocks" \
   VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/qemu-boot.sh"
   if [[ "$detach" -eq 1 ]]; then
@@ -364,6 +414,9 @@ if [[ "$ENGINE" == "qemu" ]]; then
 fi
 
 # Runs are disposable: a stale VM of the same name is replaced.
+if [[ -n "$netmode" || "$timeout_secs" -gt 0 || "$disk_blocks" -gt 0 ]]; then
+  echo "warning: --net/--timeout/--disk-cap apply to the qemu engine only; ignored on krunvm" >&2
+fi
 krun delete "$name" >/dev/null 2>&1 || true
 echo "creating microVM '$name' from $create_ref (pulls on first use)..."
 krun create "$create_ref" "${create_args[@]}"

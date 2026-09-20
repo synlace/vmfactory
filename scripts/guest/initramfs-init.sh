@@ -6,15 +6,19 @@
 # vmf-run), then hand over: derived images switch_root into /vmf/init.sh,
 # plain images run the resolved entrypoint via chroot and power off.
 set -u
+export PATH=/bin:/sbin
 BB=/bin/busybox
 
 # Static slirp networking (QEMU user-mode net): guest 10.0.2.15, gateway
 # 10.0.2.2, DNS 10.0.2.3. Host forwards arrive via the same net stack —
-# no TSI, so guest binds behave like real kernel binds.
-$BB ip link set lo up
-$BB ip link set eth0 up
-$BB ip addr add 10.0.2.15/24 dev eth0
-$BB ip route add default via 10.0.2.2
+# no TSI, so guest binds behave like real kernel binds. --net off boots
+# with no NIC at all; skip networking then.
+if $BB ip link show eth0 >/dev/null 2>&1; then
+  $BB ip link set lo up
+  $BB ip link set eth0 up
+  $BB ip addr add 10.0.2.15/24 dev eth0
+  $BB ip route add default via 10.0.2.2
+fi
 
 $BB mkdir -p /root
 # cache=loose is required for writeable MAP_SHARED mmap on 9p (cache=none
@@ -46,7 +50,9 @@ hn=$($BB cat /root/vmf-run/hostname 2>/dev/null)
 # /etc/hosts. Without this, apps that resolve their own hostname (apache
 # ServerName, slapd, postfix...) log warnings or fail at startup.
 [ -n "$hn" ] && [ -d /root/etc ] && echo "10.0.2.15 $hn" >> /root/etc/hosts
-[ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
+if $BB ip link show eth0 >/dev/null 2>&1; then
+  [ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
+fi
 
 if [ -x /root/vmf/init.sh ]; then
   exec $BB switch_root /root /vmf/init.sh
@@ -57,7 +63,7 @@ fi
 # exit powers the VM off.
 . /root/vmf-run/env
 cd "$($BB cat /root/vmf-run/cwd)"
-eval "set -- $(cat /root/vmf-run/argv.sh)"
+eval "set -- $($BB cat /root/vmf-run/argv.sh)"
 ( $BB chroot /root "$@" ) &
 wait $!
 $BB poweroff -f

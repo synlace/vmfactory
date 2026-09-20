@@ -19,6 +19,20 @@ set -euo pipefail
 
 : "${VMF_IMAGE_REF:?}" "${VMF_NAME:?}" "${VMF_RUNDIR:?}" "${VMF_ASSETS:?}" "${VMF_CONSOLE:?}"
 VMF_CONF="${VMF_CONF:-$VMF_RUNDIR.conf}"
+VMF_NET_MODE="${VMF_NET_MODE:-open}"
+VMF_TIMEOUT_SECS="${VMF_TIMEOUT_SECS:-0}"
+VMF_DISK_BLOCKS="${VMF_DISK_BLOCKS:-0}"
+
+# Disk cap: cap single-file writes done through the 9p share by capping
+# qemu's file-size rlimit (the virtfs backend writes in this process).
+# SIGXFSZ is ignored so a write beyond the cap returns EFBIG to the
+# guest (disk-full semantics) instead of killing the VM.
+if [[ "$VMF_DISK_BLOCKS" -gt 0 ]]; then
+  trap '' XFSZ
+  ulimit -f "$VMF_DISK_BLOCKS"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ctr=$(buildah from "$VMF_IMAGE_REF")
 rootfs=$(buildah mount "$ctr")
@@ -56,6 +70,33 @@ if [[ "${VMF_DETACH:-0}" != "1" ]]; then
   serial=(-serial stdio)
 fi
 
+# Network policy: open = default slirp; restricted = a Landlock ruleset
+# denies every outbound connect() of the qemu process (guest-initiated
+# internet access, host services via the slirp gateway, the slirp DNS
+# resolver's host sockets). Bind/listen stay allowed, so published ports
+# and ssh (inbound hostfwd) keep working. DNS is intentionally dead in
+# this mode: no outbound includes name resolution. off = no NIC at all
+# (also means no ssh).
+case "$VMF_NET_MODE" in
+  off)        nic=(none) ;;
+  restricted) nic=("user,model=virtio-net-pci$hostfwd") ;;
+  *)          nic=("user,model=virtio-net-pci$hostfwd") ;;
+esac
+
+# Optional run timeout: timeout execs qemu in place, so the recorded
+# pid stays the VM process and TERM tears the VM down through the
+# normal wait+cleanup path.
+vm() {
+  cmd=()
+  [[ "$VMF_NET_MODE" == "restricted" ]] && \
+    cmd=(python3 "$SCRIPT_DIR/landlock-net-deny.py")
+  if [[ "$VMF_TIMEOUT_SECS" -gt 0 ]]; then
+    cmd+=(timeout --signal=TERM "$VMF_TIMEOUT_SECS")
+  fi
+  cmd+=("${qemu[@]}")
+  "${cmd[@]}"
+}
+
 qemu=(qemu-system-x86_64
   -machine pc,accel=kvm
   -cpu host
@@ -69,7 +110,7 @@ qemu=(qemu-system-x86_64
   -device "virtio-9p-pci,fsdev=fs0,mount_tag=vmf-root"
   -fsdev "local,id=fs1,path=$VMF_RUNDIR,security_model=none"
   -device "virtio-9p-pci,fsdev=fs1,mount_tag=vmf-run"
-  -nic "user,model=virtio-net-pci$hostfwd"
+  -nic "$nic"
   -pidfile "$VMF_RUNDIR/qemu.pid"
   -no-reboot
   -display none
@@ -88,7 +129,7 @@ if [[ "${VMF_DETACH:-0}" == "1" ]]; then
   # shares the subshell's process group, so it survives the outer
   # script's exit inside the unshare mount namespace.
   (
-    "${qemu[@]}" </dev/null >>"$VMF_CONSOLE" 2>&1 &
+    vm </dev/null >>"$VMF_CONSOLE" 2>&1 &
     qpid=$!
     record_state "$qpid"
     wait "$qpid" 2>/dev/null || true
@@ -105,7 +146,7 @@ fi
 # Foreground: without job control the backgrounded qemu stays in this
 # shell's foreground process group, so Ctrl-C still reaches qemu
 # directly and the tty is readable for -serial stdio.
-"${qemu[@]}" &
+vm &
 qpid=$!
 record_state "$qpid"
 trap 'kill "$qpid" 2>/dev/null || true' INT TERM
