@@ -3,8 +3,9 @@
 #
 # Routing:
 #   build/<name>/vm.conf exists -> qemu box, via scripts/enter.sh (real sshd)
-#   ~/.vmf/runs/<name>.conf     -> krunvm microVM, via dropbear on the
-#                                  mapped port recorded at run time
+#   ~/.vmf/runs/<name>.conf     -> microVM, engine-aware: qemu VMs get real
+#                                  sshd (interactive PTY works); krunvm VMs
+#                                  get dropbear (one-shot only)
 #
 # Docker-style leading flags (-it, -i, -t, -d, --rm) are accepted and
 # ignored: ssh supports interactive PTY natively, the flags exist only for
@@ -28,15 +29,8 @@ if [[ -f "build/$name/vm.conf" ]]; then
   exec sh scripts/enter.sh "$name" "$@"
 fi
 
-# Interactive shells (no command) are impossible on microVMs: libkrun
-# cannot open pts devices, so dropbear's session dies right after the
-# login banner. Fail fast with the working alternatives.
-if [[ $# -eq 0 ]]; then
-  echo "error: interactive ssh is not supported on microVMs (no PTY in libkrun)" >&2
-  echo "run a command instead: just ssh $name '<cmd>'" >&2
-  echo "for an interactive shell, boot a box: just boot <lab> && just ssh <lab>" >&2
-  exit 1
-fi
+# Interactive handling is engine-specific and happens below: qemu VMs
+# allow interactive PTY shells, krunvm VMs reject them with guidance.
 
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 conf="$RUNS_DIR/$name.conf"
