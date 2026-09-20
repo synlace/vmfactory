@@ -24,8 +24,14 @@ list:
       name=$(basename "$conf" .conf)
       . "$conf"
       engine=${ENGINE:-krunvm}
-      if [ "$engine" = "qemu" ]; then
-        pid=${PID:-$(cat "$HOME/.vmf/runs/$name/qemu.pid" 2>/dev/null || true)}
+      if [ "$engine" = "qemu" ] || [ "$engine" = "firecracker" ]; then
+        rundir=${RUNDIR:-$HOME/.vmf/runs/$name}
+        pid=${PID:-}
+        if [ -z "$pid" ]; then
+          for f in qemu.pid fc.pid; do
+            if [ -f "$rundir/$f" ]; then pid=$(cat "$rundir/$f"); break; fi
+          done
+        fi
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state=running; else state=stopped; fi
       else
         if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
