@@ -8,8 +8,65 @@
 set -u
 export PATH=/bin:/sbin
 BB=/bin/busybox
+# Device nodes early: the firecracker branch below needs /dev/vda[vb],
+# and the initramfs /dev is otherwise empty (devtmpfs automount covers
+# real root filesystems, not the initramfs).
+$BB mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+# Firecracker exits when the guest reboots (reboot=k); it has no ACPI
+# power-off, so use reboot -f there and poweroff -f on qemu.
+if $BB test -b /dev/vda; then
+  pw() { $BB reboot -f; }
+else
+  pw() { $BB poweroff -f; }
+fi
 
-# Static slirp networking (QEMU user-mode net): guest 10.0.2.15, gateway
+# Firecracker engine: the rootfs is a read-only squashfs drive (/dev/vda)
+# with a tmpfs overlay for writes, and the per-run inputs arrive on a
+# second read-only ext4 drive (/dev/vdb). qemu keeps the 9p shares.
+if $BB test -b /dev/vda; then
+  $BB mkdir -p /ro /up /root
+  $BB mount -t squashfs -o ro /dev/vda /ro || {
+    echo "vmf-initramfs: cannot mount squashfs rootfs" >&2
+    $BB pw
+  }
+  $BB mount -t tmpfs tmpfs /up
+  $BB mkdir -p /up/up /up/work
+  $BB mount -t overlay overlay \
+    -o lowerdir=/ro,upperdir=/up/up,workdir=/up/work /root || {
+    echo "vmf-initramfs: cannot mount overlay rootfs" >&2
+    $BB pw
+  }
+  $BB mkdir -p /root/vmf-run
+  $BB mount -t ext4 -o ro /dev/vdb /root/vmf-run || {
+    echo "vmf-initramfs: cannot mount inputs drive" >&2
+    $BB pw
+  }
+else
+  # qemu engine: 9p root share. cache=loose is required for writeable
+  # MAP_SHARED mmap on 9p (cache=none returns EINVAL). Databases like
+  # LMDB (OpenLDAP slapd) mmap their files and fail to open without it.
+  # Coherence is safe: the host writes to the shares only before the
+  # guest boots.
+  $BB mkdir -p /root
+  $BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-root /root || {
+    echo "vmf-initramfs: cannot mount root share" >&2
+    $BB pw
+  }
+  $BB mkdir -p /root/vmf-run
+  $BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-run /root/vmf-run || {
+    echo "vmf-initramfs: cannot mount run-inputs share" >&2
+    $BB pw
+  }
+fi
+
+hn=$($BB cat /root/vmf-run/hostname 2>/dev/null)
+[ -n "$hn" ] && $BB hostname "$hn"
+# Docker parity: docker makes the container hostname resolvable via
+# /etc/hosts. Without this, apps that resolve their own hostname (apache
+# ServerName, slapd, postfix...) log warnings or fail at startup.
+[ -n "$hn" ] && [ -d /root/etc ] && echo "10.0.2.15 $hn" >> /root/etc/hosts
+
+# Static slirp networking (both engines): guest 10.0.2.15, gateway
 # 10.0.2.2, DNS 10.0.2.3. Host forwards arrive via the same net stack —
 # no TSI, so guest binds behave like real kernel binds. --net off boots
 # with no NIC at all; skip networking then.
@@ -18,17 +75,9 @@ if $BB ip link show eth0 >/dev/null 2>&1; then
   $BB ip link set eth0 up
   $BB ip addr add 10.0.2.15/24 dev eth0
   $BB ip route add default via 10.0.2.2
+  [ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
 fi
 
-$BB mkdir -p /root
-# cache=loose is required for writeable MAP_SHARED mmap on 9p (cache=none
-# returns EINVAL). Databases like LMDB (OpenLDAP slapd) mmap their files
-# and fail to open without it. Coherence is safe: the host writes to the
-# shares only before the guest boots.
-$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-root /root || {
-  echo "vmf-initramfs: cannot mount root share" >&2
-  $BB poweroff -f
-}
 # Mount the boot-time filesystems INTO the new root: mounts on the
 # initramfs root itself become unreachable after switch_root.
 $BB mkdir -p /root/proc /root/sys /root/dev /root/tmp
@@ -38,21 +87,6 @@ $BB mount -t devtmpfs devtmpfs /root/dev
 $BB mkdir -p /root/dev/pts
 $BB mount -t devpts devpts -o mode=620,ptmxmode=0666 /root/dev/pts
 $BB mount -t tmpfs tmpfs /root/tmp
-$BB mkdir -p /root/vmf-run
-$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000,cache=loose vmf-run /root/vmf-run || {
-  echo "vmf-initramfs: cannot mount run-inputs share" >&2
-  $BB poweroff -f
-}
-
-hn=$($BB cat /root/vmf-run/hostname 2>/dev/null)
-[ -n "$hn" ] && $BB hostname "$hn"
-# Docker parity: docker makes the container hostname resolvable via
-# /etc/hosts. Without this, apps that resolve their own hostname (apache
-# ServerName, slapd, postfix...) log warnings or fail at startup.
-[ -n "$hn" ] && [ -d /root/etc ] && echo "10.0.2.15 $hn" >> /root/etc/hosts
-if $BB ip link show eth0 >/dev/null 2>&1; then
-  [ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
-fi
 
 if [ -x /root/vmf/init.sh ]; then
   exec $BB switch_root /root /vmf/init.sh
@@ -66,4 +100,4 @@ cd "$($BB cat /root/vmf-run/cwd)"
 eval "set -- $($BB cat /root/vmf-run/argv.sh)"
 ( $BB chroot /root "$@" ) &
 wait $!
-$BB poweroff -f
+$BB pw

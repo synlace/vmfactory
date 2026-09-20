@@ -43,13 +43,15 @@ source "$conf"
 port="${PORT:?state file lacks PORT}"
 ENGINE="${ENGINE:-krunvm}"
 
-if [[ "$ENGINE" == "qemu" ]]; then
+if [[ "$ENGINE" == "qemu" || "$ENGINE" == "firecracker" ]]; then
   # Real kernel: PTY sessions work, so interactive ssh is allowed. The
   # qemu pid (state file or pidfile) tells us whether the VM is alive.
   pid="${PID:-}"
   rundir="${RUNDIR:-$RUNS_DIR/$name}"
-  if [[ -z "$pid" && -f "$rundir/qemu.pid" ]]; then
-    pid=$(cat "$rundir/qemu.pid")
+  if [[ -z "$pid" ]]; then
+    for f in qemu.pid fc.pid; do
+      [[ -f "$rundir/$f" ]] && { pid=$(cat "$rundir/$f"); break; }
+    done
   fi
   if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     echo "error: microVM '$name' is not running (stale state file); start it again" >&2

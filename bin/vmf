@@ -70,7 +70,7 @@ if [[ -f "$ctxconf" ]]; then
     exit 3
   fi
   case "${ENGINE:-}" in
-    ""|qemu|krunvm) export VMF_ENGINE="${VMF_ENGINE:-$ENGINE}" ;;
+    ""|qemu|krunvm|firecracker) export VMF_ENGINE="${VMF_ENGINE:-$ENGINE}" ;;
     *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
   esac
   if [[ "$ctx" != "default" ]]; then

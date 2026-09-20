@@ -109,9 +109,10 @@ RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
 DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
-ENGINE="${VMF_ENGINE:-qemu}"
+# Flag (--engine) wins over env; default qemu.
+ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
 case "$ENGINE" in
-  qemu|krunvm) ;;
+  qemu|krunvm|firecracker) ;;
   *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
 esac
 MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
@@ -159,25 +160,41 @@ fi
 runid=$$
 rundir="$RUNS_DIR/$name.$runid"
 
-# Kernel + initramfs for the qemu engine. The kernel is a stock nixpkgs
-# build with virtio/9p/devpts forced built-in (no modules); the initramfs
-# packs the static busybox bundle plus the initramfs init. Both cached by
-# content markers; rebuilds happen only when inputs change.
+# Kernel + initramfs for the microVM engines. The kernel is a stock
+# nixpkgs build with virtio/9p/devpts/block/squashfs/overlay/ext4 forced
+# built-in (no modules) — one kernel serves the qemu engine (9p rootfs)
+# and the firecracker engine (squashfs root + ext4 inputs, mmio via
+# firecracker's ACPI tables). Both cached by content markers; rebuilds
+# happen only when inputs change.
 ensure_microvm_assets() {
   mkdir -p "$MICROVM_DIR"
   local kexpr='let pkgs = import <nixpkgs> {}; k = pkgs.lib.kernel; in
     pkgs.linux.override { ignoreConfigErrors = true; structuredExtraConfig = {
       VIRTIO = k.yes; VIRTIO_PCI = k.yes; VIRTIO_MMIO = k.yes; VIRTIO_NET = k.yes;
+      VIRTIO_BLK = k.yes;
       NET_9P = k.yes; "9P_FS" = k.yes; NET_9P_VIRTIO = k.yes;
       DEVPTS_FS = k.yes; TMPFS = k.yes; DEVTMPFS = k.yes; DEVTMPFS_MOUNT = k.yes;
       SERIAL_8250 = k.yes; SERIAL_8250_CONSOLE = k.yes; UNIX = k.yes;
-      BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes; }; }'
+      BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes;
+      SQUASHFS = k.yes; OVERLAY_FS = k.yes; EXT4_FS = k.yes; }; }'
   local kpath
   kpath=$(nix build --impure --no-link --print-out-paths --expr "$kexpr" | tail -1)
   if [[ ! -f "$MICROVM_DIR/vmlinuz" || "$(<"$MICROVM_DIR/kernel-marker" 2>/dev/null)" != "$kpath" ]]; then
     rm -f "$MICROVM_DIR/vmlinuz"
     cp "$kpath/bzImage" "$MICROVM_DIR/vmlinuz"
     printf '%s\n' "$kpath" > "$MICROVM_DIR/kernel-marker"
+  fi
+  # Firecracker's x86 loader wants the uncompressed ELF kernel; nixpkgs
+  # ships only the bzImage. Extract once per kernel marker.
+  if [[ ! -f "$MICROVM_DIR/vmlinux" ]]; then
+    echo "extracting vmlinux (firecracker ELF kernel)..."
+    if command -v zstd >/dev/null 2>&1; then
+      python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
+        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
+    else
+      nix shell nixpkgs#zstd -c python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
+        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
+    fi
   fi
   local h stage
   h=$(cat "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$BUNDLE_DIR/busybox" | sha256sum | cut -c1-8)
@@ -366,6 +383,10 @@ done
 # the old teardown would otherwise wipe this run's state files.
 if [[ "$ENGINE" == "qemu" ]]; then
   pkill -f "qemu-system.*-name $name " 2>/dev/null || true
+elif [[ "$ENGINE" == "firecracker" ]]; then
+  oldpid=""
+  [[ -f "$RUNS_DIR/$name.conf" ]] && oldpid=$(grep -oE '^PID=[0-9]+' "$RUNS_DIR/$name.conf" | cut -d= -f2 || true)
+  [[ -n "$oldpid" ]] && kill "$oldpid" 2>/dev/null || true
 else
   pkill -f "krunvm start ${name} --" 2>/dev/null || true
 fi
@@ -410,6 +431,86 @@ if [[ "$ENGINE" == "qemu" ]]; then
   VMF_DISK_BLOCKS="$disk_blocks" \
   VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/qemu-boot.sh"
+  if [[ "$detach" -eq 1 ]]; then
+    echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
+    echo "ssh: just ssh $name   stop: just stop $name"
+  fi
+  exit 0
+fi
+
+if [[ "$ENGINE" == "firecracker" ]]; then
+  ensure_microvm_assets
+  # Firecracker toolchain (binary + slirp4netns + mksquashfs + mke2fs).
+  if command -v firecracker >/dev/null 2>&1 && command -v slirp4netns >/dev/null 2>&1 \
+     && command -v mksquashfs >/dev/null 2>&1 && command -v mke2fs >/dev/null 2>&1; then
+    FC=(firecracker)
+  else
+    echo "fetching firecracker toolchain via nix shell..."
+    FC=(nix shell nixpkgs#firecracker nixpkgs#slirp4netns nixpkgs#squashfsTools nixpkgs#e2fsprogs nixpkgs#iproute2 nixpkgs#netcat -c)
+  fi
+  if [[ "$netmode" == "restricted" ]]; then
+    echo "warning: --net restricted is not wired for firecracker yet; using open" >&2
+    netmode="open"
+  fi
+  # Read-only squashfs of the derived image, cached by the derive tag:
+  # assembly is per base+payload, not per run.
+  squash="$MICROVM_DIR/fc/$DERIVED_TAG.squashfs"
+  mkdir -p "$MICROVM_DIR/fc"
+  if [[ ! -f "$squash" ]]; then
+    echo "assembling firecracker rootfs (squashfs of $create_ref)..."
+    # The squashfs must be owned by the host user; mksquashfs runs inside
+    # the buildah unshare but the result is readable by everyone.
+    squash_stage=$(mktemp -d)
+    if command -v buildah >/dev/null 2>&1; then
+      BUILD_BIN=(buildah)
+    else
+      BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
+    fi
+    if command -v mksquashfs >/dev/null 2>&1; then
+      SQ=(mksquashfs)
+    else
+      SQ=(nix shell nixpkgs#squashfsTools -c mksquashfs)
+    fi
+    VMF_IMAGE_REF="$create_ref" VMF_OUT="$squash_stage/rootfs.squashfs" \
+      "${BUILD_BIN[@]}" unshare -- bash -c '
+      set -euo pipefail
+      ctr=$(buildah from "$VMF_IMAGE_REF")
+      rootfs=$(buildah mount "$ctr")
+      trap "buildah rm $ctr >/dev/null 2>&1 || true" EXIT
+      if command -v mksquashfs >/dev/null 2>&1; then
+        mksquashfs "$rootfs" "$VMF_OUT" -noappend -no-exports -quiet >/dev/null
+      else
+        nix shell nixpkgs#squashfsTools -c mksquashfs "$rootfs" "$VMF_OUT" -noappend -no-exports -quiet >/dev/null
+      fi
+    '
+    mv "$squash_stage/rootfs.squashfs" "$squash"
+    rm -rf "$squash_stage"
+  else
+    echo "firecracker rootfs cache hit: $squash"
+  fi
+  # Per-run inputs drive: small ext4 built WITHOUT a mount (mke2fs -d),
+  # same files the 9p share carries for qemu.
+  stage="$rundir/inputs"
+  mkdir -p "$stage/auth"
+  cp "$SSH_DIR/id_ed25519.pub" "$stage/auth/authorized_keys" 2>/dev/null || true
+  for f in hostname engine hostfwd env argv.sh cwd uid; do
+    [[ -f "$rundir/$f" ]] && cp "$rundir/$f" "$stage/$f"
+  done
+  if command -v mke2fs >/dev/null 2>&1; then
+    mke2fs -q -F -t ext4 -d "$stage" "$rundir/inputs.ext4" 16M
+  else
+    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -d "$stage" "$rundir/inputs.ext4" 16M
+  fi
+  rm -rf "$stage"
+  rm -f "$RUNS_DIR/$name.log"
+  echo "creating microVM '$name' from $create_ref (firecracker engine)..."
+  FCB=("${FC[@]}")
+  VMF_NAME="$name" VMF_RUNDIR="$rundir" VMF_ASSETS_SQUASHFS="$squash" \
+  VMF_KERNEL="$MICROVM_DIR/vmlinux" VMF_INITRAMFS="$MICROVM_DIR/initramfs.cpio.gz" \
+  VMF_CONF="$RUNS_DIR/$name.conf" VMF_CONSOLE="$RUNS_DIR/$name.log" \
+  VMF_NET_MODE="${netmode:-open}" VMF_TIMEOUT_SECS="$timeout_secs" \
+  VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
+  "${FCB[@]}" bash "$(cd "$(dirname "$0")" && pwd)/firecracker-boot.sh"
   if [[ "$detach" -eq 1 ]]; then
     echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
     echo "ssh: just ssh $name   stop: just stop $name"

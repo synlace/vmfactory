@@ -85,7 +85,8 @@ just stop image                                    # stop + delete a microVM
 just list                                          # shows microVMs + ssh ports
 ```
 
-- Runtime engines (`--engine qemu|krunvm`, default qemu; `VMF_ENGINE` env):
+- Runtime engines (`--engine qemu|firecracker|krunvm`, default qemu;
+  `VMF_ENGINE` env or a context engine):
   - **qemu** (default): a real kernel built on demand from nixpkgs
     (`pkgs.linux` with virtio/9p/devpts forced built-in, cached in
     `~/.local/share/vmf/microvm`), booted with direct kernel + a tiny
@@ -95,6 +96,18 @@ just list                                          # shows microVMs + ssh ports
     kernel means real `/dev/pts`: interactive ssh shells and sftp work.
     Falls back to `nix shell nixpkgs#qemu nixpkgs#buildah` when not on
     PATH.
+  - **firecracker**: sandbox-grade engine. The derived image is packed
+    into a cached read-only squashfs (per base+payload, like the derive
+    layer); guest writes land on a tmpfs overlay (RAM-bounded, wiped on
+    stop — `--rm` semantics become literal). Per-run inputs travel on a
+    small read-only ext4 drive. Networking is the rootless podman
+    stack: a user netns per VM (`unshare -Urn`), `slirp4netns` for the
+    tap, and `-p` forwarding via slirp4netns' add_hostfwd API with
+    `--disable-host-loopback` (guest cannot reach host services by
+    design). Same guest kernel + initramfs as qemu; devices enumerate
+    over firecracker's ACPI tables. Needs `nix shell` on first use for
+    the firecracker toolchain (firecracker, slirp4netns, mksquashfs,
+    e2fsprogs).
   - **krunvm** (legacy): libkrun microVM inside a `buildah unshare`
     user namespace. Faster boot, but libkrun's TSI network stack
     virtualizes privileged guest binds (breaking vhost-based apache —

@@ -40,12 +40,12 @@ $BB chmod 600 /root/.ssh/authorized_keys
 . /vmf-run/env
 
 # SSH server, engine-specific:
-# - qemu (real kernel): OpenSSH sshd — full PTY sessions. Dropbear
-#   2026.91 closes the pty master before TIOCSCTTY, which hangs the
-#   controlling-tty setup (verified: TIOCSCTTY EIO with the master
+# - qemu / firecracker (real kernel): OpenSSH sshd — full PTY sessions.
+#   Dropbear 2026.91 closes the pty master before TIOCSCTTY, which hangs
+#   the controlling-tty setup (verified: TIOCSCTTY EIO with the master
 #   closed, OK with it held), so sshd is the safe default here.
 # - krunvm (libkrun): dropbear on :22, one-shot exec sessions only.
-if [ "$($BB cat /vmf-run/engine 2>/dev/null)" = "qemu" ]; then
+if [ "$($BB cat /vmf-run/engine 2>/dev/null)" = "krunvm" ]; then
   $BB mkdir -p /etc/ssh /var/empty /var/run
   [ -f /etc/ssh/ssh_host_ed25519_key ] || /vmf/ssh-keygen -A >/dev/null 2>&1
   /vmf/sshd -D -e &
@@ -79,10 +79,14 @@ pid=$!
 trap 'kill -TERM "$pid" 2>/dev/null' INT TERM
 wait "$pid"
 rc=$?
-# QEMU engine: this init is PID 1 of a real kernel, so the VM must be
-# powered off explicitly (init cannot just exit). krunvm guests exit
-# when init exits, so they just return the status.
-if [ "$($BB cat /vmf-run/engine 2>/dev/null)" = "qemu" ]; then
-  $BB poweroff -f
-fi
+# Real-kernel engines (qemu, firecracker): this init is PID 1, so the
+# VM must be powered off explicitly (init cannot just exit). qemu
+# powers off via ACPI; firecracker has no power-off, so it reboots
+# (reboot=k makes firecracker exit on guest reboot). krunvm guests
+# exit when init exits.
+case "$($BB cat /vmf-run/engine 2>/dev/null)" in
+  krunvm) ;;
+  firecracker) $BB reboot -f ;;
+  *) $BB poweroff -f ;;
+esac
 exit $rc

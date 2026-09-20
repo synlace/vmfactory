@@ -9,12 +9,18 @@ if [[ -f "$RUNS_DIR/$name.conf" ]]; then
   # shellcheck source=/dev/null
   source "$RUNS_DIR/$name.conf"
   ENGINE="${ENGINE:-krunvm}"
-  if [[ "$ENGINE" == "qemu" ]]; then
+  if [[ "$ENGINE" == "qemu" || "$ENGINE" == "firecracker" ]]; then
     rundir="${RUNDIR:-$RUNS_DIR/$name}"
-    pid="${PID:-$(cat "$rundir/qemu.pid" 2>/dev/null || true)}"
+    pid="${PID:-}"
+    if [[ -z "$pid" ]]; then
+      for f in qemu.pid fc.pid; do
+        [[ -f "$rundir/$f" ]] && { pid=$(cat "$rundir/$f"); break; }
+      done
+    fi
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     if command -v buildah >/dev/null 2>&1; then B=buildah; else B="nix shell nixpkgs#buildah -c buildah"; fi
     [[ -n "${CTR:-}" ]] && $B unshare -- buildah rm "$CTR" >/dev/null 2>&1 || true
+    # firecracker: the slirp4netns process exits with the netns owner
   else
     pkill -f "krunvm start $name --" 2>/dev/null || true
     sleep 0.5

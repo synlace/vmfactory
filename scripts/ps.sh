@@ -25,9 +25,13 @@ for conf in "$RUNS_DIR"/*.conf; do
   rundir="${RUNDIR:-$RUNS_DIR/$name}"
   state="unknown"
   case "$ENGINE" in
-    qemu)
+    qemu|firecracker)
       pid="${PID:-}"
-      [[ -z "$pid" && -f "$rundir/qemu.pid" ]] && pid="$(cat "$rundir/qemu.pid" 2>/dev/null || true)"
+      if [[ -z "$pid" ]]; then
+        for f in qemu.pid fc.pid; do
+          [[ -f "$rundir/$f" ]] && { pid="$(cat "$rundir/$f" 2>/dev/null || true)"; break; }
+        done
+      fi
       if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then state=running; else state=stopped; fi
       ;;
     krunvm)
