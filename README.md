@@ -148,6 +148,15 @@ dropbear image). For microVMs:
 - `--no-ssh` boots the pinned image as-is: no derive, no ssh, entrypoint
   straight through krunvm (krunvm then mangles quoted args — the ssh
   path passes argv through files, so quoting is safe there).
+- Apache CGI images: krunvm's TSI port mapping virtualizes guest binds
+  on privileged ports, and `<VirtualHost *:80>` sections never match in
+  the running daemon (`NameVirtualHost *:80 has no VirtualHosts` on
+  every re-parse), so vhost-declared ScriptAliases vanish and
+  `/cgi-bin/*` 404s. The derive step detects Debian apache layouts
+  (`/etc/apache2` + `/usr/lib/cgi-bin`) and re-declares the cgi-bin
+  mapping at main-server level (`conf.d/zzz-vmf-cgi.conf`), where
+  directives apply. nginx-style single-default-server images are
+  unaffected.
 
 ## Conventions
 

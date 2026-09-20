@@ -63,6 +63,28 @@ else
   printf '%s\n' '/bin/sh' '/vmf/sh' > "$shells"
 fi
 
+# Apache vhost shim: under krunvm's TSI port mapping, <VirtualHost *:80>
+# sections never match in the running daemon ("NameVirtualHost *:80 has
+# no VirtualHosts" at every re-parse, while a fresh -S parse shows them),
+# so vhost-declared ScriptAliases silently vanish and CGI paths 404.
+# Main-server directives DO apply, so re-declare the standard Debian
+# cgi-bin mapping at main level when the image uses that layout.
+if [ -f "$rootfs/etc/apache2/apache2.conf" ] && [ -d "$rootfs/etc/apache2/conf.d" ] \
+   && [ -d "$rootfs/usr/lib/cgi-bin" ] && [ ! -f "$rootfs/etc/apache2/conf.d/zzz-vmf-cgi.conf" ]; then
+  cat > "$rootfs/etc/apache2/conf.d/zzz-vmf-cgi.conf" <<'EOF'
+# Added by vmfactory: main-server fallback for the vhost ScriptAlias.
+# krunvm's TSI virtual bind drops <VirtualHost *:80> matching; this
+# re-declares the Debian cgi-bin convention at main-server level.
+ScriptAlias /cgi-bin/ /usr/lib/cgi-bin/
+<Directory "/usr/lib/cgi-bin">
+    AllowOverride None
+    Options +ExecCGI -MultiViews +SymLinksIfOwnerMatch
+    Order allow,deny
+    allow from all
+</Directory>
+EOF
+fi
+
 buildah commit "$ctr" "$VMF_DERIVED" >/dev/null
 mkdir -p "$VMF_DERIVE_DIR"
 printf 'base=%s\nderived=%s\ncreated=%s\n' "$VMF_REF" "$VMF_DERIVED" "$(date -Is)" \
