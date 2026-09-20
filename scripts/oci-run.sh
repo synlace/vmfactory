@@ -18,13 +18,16 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--no-ssh]
+Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
+                  [--engine qemu|krunvm] [--no-ssh]
                   [-p HOST:GUEST] [-v HOST:GUEST] [-e K=V] IMAGE [COMMAND...]
 
   --rm            accepted, default behavior (VM deleted on exit)
   --keep          keep the microVM after exit (re-run reuses it)
   -d|--detach     start the VM in the background, return immediately
   --no-ssh        boot the pinned image as-is (no dropbear layer, no ssh)
+  --engine E      microVM engine: qemu (default) or krunvm (legacy)
+  --memory MB     guest memory (default 1024)
   -p HOST:GUEST   publish host port to guest port (repeatable)
   -v HOST:GUEST   mount a host path into the guest (repeatable)
   -e K=V          environment for the guest process (repeatable)
@@ -42,6 +45,7 @@ volumes=()
 envs=()
 name=""
 cpus=""
+mem=""
 ssh=1
 keep=0
 detach=0
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
     --keep) keep=1; shift ;;
     -d|--detach) detach=1; shift ;;
     --no-ssh) ssh=0; shift ;;
+    --engine) [[ $# -ge 2 ]] || usage; ENGINE="$2"; shift 2 ;;
+    --memory) [[ $# -ge 2 ]] || usage; mem="$2"; shift 2 ;;
     -i|-t|-it|-ti|-itd|-dit) echo "note: '$1' ignored: microVMs have no PTY" >&2; shift ;;
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
@@ -90,6 +96,49 @@ RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
 DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
+ENGINE="${VMF_ENGINE:-qemu}"
+MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
+
+# Kernel + initramfs for the qemu engine. The kernel is a stock nixpkgs
+# build with virtio/9p/devpts forced built-in (no modules); the initramfs
+# packs the static busybox bundle plus the initramfs init. Both cached by
+# content markers; rebuilds happen only when inputs change.
+ensure_microvm_assets() {
+  mkdir -p "$MICROVM_DIR"
+  local kexpr='let pkgs = import <nixpkgs> {}; k = pkgs.lib.kernel; in
+    pkgs.linux.override { ignoreConfigErrors = true; structuredExtraConfig = {
+      VIRTIO = k.yes; VIRTIO_PCI = k.yes; VIRTIO_MMIO = k.yes; VIRTIO_NET = k.yes;
+      NET_9P = k.yes; "9P_FS" = k.yes; NET_9P_VIRTIO = k.yes;
+      DEVPTS_FS = k.yes; TMPFS = k.yes; DEVTMPFS = k.yes; DEVTMPFS_MOUNT = k.yes;
+      SERIAL_8250 = k.yes; SERIAL_8250_CONSOLE = k.yes; UNIX = k.yes;
+      BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes; }; }'
+  local kpath
+  kpath=$(nix build --impure --no-link --print-out-paths --expr "$kexpr" | tail -1)
+  if [[ ! -f "$MICROVM_DIR/vmlinuz" || "$(<"$MICROVM_DIR/kernel-marker" 2>/dev/null)" != "$kpath" ]]; then
+    rm -f "$MICROVM_DIR/vmlinuz"
+    cp "$kpath/bzImage" "$MICROVM_DIR/vmlinuz"
+    printf '%s\n' "$kpath" > "$MICROVM_DIR/kernel-marker"
+  fi
+  local h stage
+  h=$(cat "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$BUNDLE_DIR/busybox" | sha256sum | cut -c1-8)
+  if [[ ! -f "$MICROVM_DIR/initramfs.cpio.gz" || "$(<"$MICROVM_DIR/initramfs-marker" 2>/dev/null)" != "$h" ]]; then
+    stage=$(mktemp -d)
+    mkdir -p "$stage/bin"
+    cp "$BUNDLE_DIR/busybox" "$stage/bin/busybox"
+    chmod 755 "$stage/bin/busybox"
+    ln -s busybox "$stage/bin/sh"
+    cp "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$stage/init"
+    chmod 755 "$stage/init"
+    if command -v cpio >/dev/null 2>&1; then
+      (cd "$stage" && find . | cpio -o -H newc | gzip -1) > "$MICROVM_DIR/initramfs.cpio.gz"
+    else
+      nix shell nixpkgs#cpio nixpkgs#gzip -c sh -c "cd '$stage' && find . | cpio -o -H newc | gzip -1" \
+        > "$MICROVM_DIR/initramfs.cpio.gz"
+    fi
+    rm -rf "$stage"
+    printf '%s\n' "$h" > "$MICROVM_DIR/initramfs-marker"
+  fi
+}
 
 # Digest pin: TOFU on first run; drift is a hard error afterwards.
 pins="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
@@ -239,19 +288,58 @@ done
 [[ "$ssh" -eq 1 ]] && create_args+=(-v "$RUNS_DIR/$name:/vmf-run")
 [[ -n "$cpus" ]] && create_args+=(--cpus "$cpus")
 
+# Stop and replace a stale VM of the same name BEFORE writing state:
+# the old teardown would otherwise wipe this run's state files.
+if [[ "$ENGINE" == "qemu" ]]; then
+  pkill -f "qemu-system.*-name $name " 2>/dev/null || true
+else
+  pkill -f "krunvm start ${name} --" 2>/dev/null || true
+fi
+sleep 0.5
+
 # State for `just ssh <name>`.
 cat > "$RUNS_DIR/$name.conf" <<EOF
 PORT=$ssh_port
 IMAGE=$image
 PIN=${digest:-}
 DERIVED=${DERIVED_TAG:-}
+ENGINE=$ENGINE
 EOF
 
-# Runs are disposable: a stale VM of the same name is replaced. krunvm
-# delete removes the config, but a still-running VM of the same name
-# (e.g. a detached run) keeps its process tree; kill it first.
-pkill -f "krunvm start ${name} --" 2>/dev/null || true
-sleep 0.5
+# Per-run guest inputs shared into the VM (hostname for the kernel UTS,
+# engine marker for the guest init's power-off behavior, port forwards
+# for slirp hostfwd).
+printf '%s\n' "$name" > "$RUNS_DIR/$name/hostname"
+printf '%s\n' "$ENGINE" > "$RUNS_DIR/$name/engine"
+: > "$RUNS_DIR/$name/hostfwd"
+for p in "${ports[@]:-}"; do
+  [[ -n "$p" ]] && printf '%s %s\n' "${p%%:*}" "${p##*:}" >> "$RUNS_DIR/$name/hostfwd"
+done
+
+if [[ "$ENGINE" == "qemu" ]]; then
+  ensure_microvm_assets
+  for v in "${volumes[@]:-}"; do
+    [[ -n "$v" ]] && echo "warning: -v not supported by the qemu engine yet; ignored: $v" >&2
+  done
+  rm -f "$RUNS_DIR/$name.log"
+  echo "creating microVM '$name' from $create_ref (qemu engine)..."
+  if command -v buildah >/dev/null 2>&1; then
+    BUILD_BIN=(buildah)
+  else
+    BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
+  fi
+  VMF_IMAGE_REF="$create_ref" VMF_NAME="$name" VMF_RUNDIR="$RUNS_DIR/$name" \
+  VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$RUNS_DIR/$name.log" \
+  VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
+  "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/qemu-boot.sh"
+  if [[ "$detach" -eq 1 ]]; then
+    echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
+    echo "ssh: just ssh $name   stop: just stop $name"
+  fi
+  exit 0
+fi
+
+# Runs are disposable: a stale VM of the same name is replaced.
 krun delete "$name" >/dev/null 2>&1 || true
 echo "creating microVM '$name' from $create_ref (pulls on first use)..."
 krun create "$create_ref" "${create_args[@]}"

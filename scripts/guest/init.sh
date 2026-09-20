@@ -9,11 +9,13 @@ set -u
 BB=/vmf/busybox
 
 $BB mkdir -p /run/dropbear /root/.ssh
-# PTY support: libkrun's init.krun already mounts devpts at /dev/pts with
-# ptmxmode=000. Remount it with usable modes; do NOT stack a second devpts
-# instance on the same path (a stacked instance breaks the /dev/ptmx ->
-# /dev/pts/N slave lookup with "No such file").
-$BB mount -o remount,mode=620,ptmxmode=0666 /dev/pts 2>/dev/null || true
+# PTY support: the initramfs (qemu engine) mounts devpts with proper
+# modes; init.krun (krunvm engine) mounts it with ptmxmode=000, so
+# remount there. Never stack a second devpts instance on /dev/pts —
+# that breaks the /dev/ptmx -> /dev/pts/N slave lookup.
+if [ "$($BB cat /vmf-run/engine 2>/dev/null)" = "krunvm" ]; then
+  $BB mount -o remount,mode=620,ptmxmode=0666 /dev/pts 2>/dev/null || true
+fi
 
 $BB cp /vmf-run/auth/authorized_keys /root/.ssh/authorized_keys
 $BB chmod 700 /root/.ssh
@@ -26,16 +28,25 @@ $BB chmod 600 /root/.ssh/authorized_keys
 }
 . /vmf-run/env
 
-# SSH server: -E stderr logging (no syslogd in the guest), -s no password
-# auth (pubkey only), -F foreground. Host keys are generated eagerly on
-# first boot: -R lazy generation fails here.
-[ -d /etc/dropbear ] || $BB mkdir -p /etc/dropbear
-for t in ed25519 ecdsa rsa; do
-  [ -f "/etc/dropbear/dropbear_${t}_host_key" ] || \
-    /vmf/dropbearkey -t "$t" $([ "$t" = rsa ] && echo "-s 2048") \
-      -f "/etc/dropbear/dropbear_${t}_host_key" >/dev/null 2>&1
-done
-/vmf/dropbear -EsF -p 22 &
+# SSH server, engine-specific:
+# - qemu (real kernel): OpenSSH sshd — full PTY sessions. Dropbear
+#   2026.91 closes the pty master before TIOCSCTTY, which hangs the
+#   controlling-tty setup (verified: TIOCSCTTY EIO with the master
+#   closed, OK with it held), so sshd is the safe default here.
+# - krunvm (libkrun): dropbear on :22, one-shot exec sessions only.
+if [ "$($BB cat /vmf-run/engine 2>/dev/null)" = "qemu" ]; then
+  $BB mkdir -p /etc/ssh /var/empty /var/run
+  [ -f /etc/ssh/ssh_host_ed25519_key ] || /vmf/ssh-keygen -A >/dev/null 2>&1
+  /vmf/sshd -D -e &
+else
+  [ -d /etc/dropbear ] || $BB mkdir -p /etc/dropbear
+  for t in ed25519 ecdsa rsa; do
+    [ -f "/etc/dropbear/dropbear_${t}_host_key" ] || \
+      /vmf/dropbearkey -t "$t" $([ "$t" = rsa ] && echo "-s 2048") \
+        -f "/etc/dropbear/dropbear_${t}_host_key" >/dev/null 2>&1
+  done
+  /vmf/dropbear -EsF -p 22 &
+fi
 
 cd "$($BB cat /vmf-run/cwd)"
 # Everything the init itself runs comes from /vmf or shell builtins:
@@ -57,6 +68,10 @@ pid=$!
 trap 'kill -TERM "$pid" 2>/dev/null' INT TERM
 wait "$pid"
 rc=$?
-# Exit immediately with the app's status: init.krun (the real PID 1) reaps
-# the dropbear child, and the VM must terminate with the app for --rm.
+# QEMU engine: this init is PID 1 of a real kernel, so the VM must be
+# powered off explicitly (init cannot just exit). krunvm guests exit
+# when init exits, so they just return the status.
+if [ "$($BB cat /vmf-run/engine 2>/dev/null)" = "qemu" ]; then
+  $BB poweroff -f
+fi
 exit $rc

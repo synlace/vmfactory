@@ -85,78 +85,78 @@ just stop image                                    # stop + delete a microVM
 just list                                          # shows microVMs + ssh ports
 ```
 
-- Runtime: krunvm (libkrun) inside a `buildah unshare` user namespace.
-  Falls back to `nix shell nixpkgs#krunvm nixpkgs#buildah` when not on PATH.
+- Runtime engines (`--engine qemu|krunvm`, default qemu; `VMF_ENGINE` env):
+  - **qemu** (default): a real kernel built on demand from nixpkgs
+    (`pkgs.linux` with virtio/9p/devpts forced built-in, cached in
+    `~/.local/share/vmf/microvm`), booted with direct kernel + a tiny
+    initramfs. The container rootfs (derived image) is shared read-write
+    over 9p; networking is QEMU user-mode slirp with `hostfwd` for `-p`
+    (port collisions fail LOUDLY at boot, no silent misbinds). Real
+    kernel means real `/dev/pts`: interactive ssh shells and sftp work.
+    Falls back to `nix shell nixpkgs#qemu nixpkgs#buildah` when not on
+    PATH.
+  - **krunvm** (legacy): libkrun microVM inside a `buildah unshare`
+    user namespace. Faster boot, but libkrun's TSI network stack
+    virtualizes privileged guest binds (breaking vhost-based apache —
+    see the apache shim note) and cannot open pts devices (no PTY
+    sessions). Kept for comparison; one-shot ssh still works.
 - `--rm` is the default: the microVM is deleted when the process exits.
   Ctrl-C in a terminal tears down the whole tree.
 - Digest pinning: first run records the digest (TOFU) in `~/.vmf/oci-pins`;
   later runs fail loudly on drift. `VMF_OCI_PINS` overrides the pin file.
 - Unprefixed image names get docker.io normalization (`alpine` ->
   `docker.io/library/alpine`).
-- `-p` uses krunvm port mapping (host:guest), rootless. `-e` is applied by
-  the guest init before the app starts — krunvm starts guests with a clean
-  environment and ignores the image's default command, so ENTRYPOINT/CMD/
-  ENV/USER/WORKDIR are resolved from the OCI config blob (skopeo) and
-  handed to the init via a per-run mount. Quoting survives: argv travels
-  in a file, not through the krunvm command line.
-- Privileged ports fail rootless when unmapped: a guest bind with no `-p`
-  mapping translates to a direct host bind under your uid, so binding
-  below 1024 fails (`listen() ... Permission denied`). With `-p 8080:80`
-  the host side binds 8080 (unprivileged OK) and the guest bind is
-  virtualized by TSI — mapped ports work even for guest port 80.
+- `-p HOST:GUEST` publishes ports docker-style. `-e` is applied by the
+  guest init before the app starts — ENTRYPOINT/CMD/ENV/USER/WORKDIR are
+  resolved from the OCI config blob (skopeo) and handed to the init via
+  a per-run share. Quoting survives: argv travels in files.
+- Privileged guest ports: qemu binds them inside the guest (guest root),
+  so `-p 8080:80` works natively. The krunvm engine virtualizes them via
+  TSI (see the apache note below); an UNMAPPED privileged bind under
+  krunvm fails with `Permission denied`.
 
-## SSH into microVMs (dropbear layer)
+## SSH into microVMs (derived ssh server)
 
 `just ssh <name>` reaches both box types: qemu boxes (via `enter.sh`,
-real sshd from the cloud image) and krunvm microVMs (via a derived
-dropbear image). For microVMs:
+real sshd from the cloud image) and microVMs (via a derived image with
+an in-guest ssh server). For microVMs:
 
 - On first use of an image, `scripts/derive.sh` commits one extra layer
-  on top of the pinned bytes: a static musl `dropbear` + `dropbearkey` +
-  `busybox` bundle (`~/.local/share/vmf/ssh-bundle`) and
-  `scripts/guest/init.sh`, plus `/etc/passwd` + `/etc/shells` fixups so
-  every base behaves identically (distroless gets a root entry; root's
-  shell is forced to `/vmf/sh` — dropbear rejects shells missing from
-  `/etc/shells`, like alpine's `/bin/ash`).
-- The derived image is cached under a content-addressed tag
-  (`vmf-ssh:<base-hash>-<payload-hash>`: base pinned ref + bundle +
-  init + derive script) in the buildah store, recorded in
-  `~/.vmf/derive/`; any payload change or base digest change rebuilds
-  it. The pinned bytes themselves are never modified.
-- The guest init (`/vmf/init.sh`) starts dropbear on guest port 22
-  (pubkey-only, host keys generated in-guest at boot) and supervises the
-  image entrypoint with signal forwarding; the VM exits when the
-  entrypoint exits (libkrun's init.krun is PID 1 and reaps).
+  on top of the pinned bytes: a static musl bundle
+  (`~/.local/share/vmf/ssh-bundle`: busybox + dropbear for krunvm,
+  OpenSSH sshd + ssh-keygen for qemu) plus `scripts/guest/init.sh`,
+  plus `/etc/passwd` + `/etc/shells` fixups so every base behaves
+  identically (distroless gets a root entry; root's shell is forced to
+  `/vmf/sh`).
+- The guest init starts the ssh server on guest port 22 (pubkey-only,
+  host keys generated in-guest at boot) and supervises the image
+  entrypoint with signal forwarding. qemu VMs power off when the
+  entrypoint exits; krunvm VMs exit when the init exits.
 - Auth: one client keypair per host user (`~/.vmf/ssh/id_ed25519`,
   TOFU-generated on first run); its public half is mounted into the VM
-  and installed as root's `authorized_keys`. Host key checking is
-  `accept-new` into `~/.vmf/ssh/known_hosts`.
+  and installed as root's `authorized_keys`. MicroVM host keys are
+  ephemeral, so `just ssh` uses `StrictHostKeyChecking=no`.
 - The ssh host port is stable per VM name (hash, 20000-29999) and stored
   in `~/.vmf/runs/<name>.conf`, which `just ssh` reads; `just list`
-  shows it.
-- One-shot commands are the contract for microVMs: `just ssh <name> cmd`
-  gives docker-exec semantics (live process space, exit code, scp -O
-  works — it is exec-based). The derived layer also symlinks every
-  busybox applet into `/vmf/bin` and appends that directory to PATH, so
-  even distroless images run plain `ls`, `grep`, `ps` etc. (real image
-  binaries keep priority). Interactive PTY shells are impossible
-  inside libkrun microVMs: opening a pts slave device returns EIO while
-  the master is held (verified with an in-guest probe: `open(/dev/ptmx)`
-  and `TIOCGPTN` succeed, `open(/dev/pts/N)` fails). `just ssh` strips
-  `-t` style flags with a notice. For interactive shells, boot a qemu
-  box (`just boot <lab>`), which runs real sshd with a full PTY.
-- `--no-ssh` boots the pinned image as-is: no derive, no ssh, entrypoint
-  straight through krunvm (krunvm then mangles quoted args — the ssh
-  path passes argv through files, so quoting is safe there).
-- Apache CGI images: krunvm's TSI port mapping virtualizes guest binds
-  on privileged ports, and `<VirtualHost *:80>` sections never match in
-  the running daemon (`NameVirtualHost *:80 has no VirtualHosts` on
-  every re-parse), so vhost-declared ScriptAliases vanish and
-  `/cgi-bin/*` 404s. The derive step detects Debian apache layouts
-  (`/etc/apache2` + `/usr/lib/cgi-bin`) and re-declares the cgi-bin
-  mapping at main-server level (`conf.d/zzz-vmf-cgi.conf`), where
-  directives apply. nginx-style single-default-server images are
-  unaffected.
+  shows it with engine and state.
+- qemu engine: interactive shells and sftp work (`Subsystem sftp
+  internal-sftp`; plain `scp` works too). krunvm engine: one-shot
+  commands are the contract (libkrun cannot open pts devices); `just
+  ssh` strips `-t` style flags with a notice there. The derived layer
+  symlinks every busybox applet into `/vmf/bin` and appends it to PATH,
+  so even distroless images run plain `ls`, `grep`, `ps` etc.
+- `--no-ssh` boots the pinned image as-is: no derive, no ssh,
+  entrypoint through the engine directly.
+- Apache CGI images on the krunvm engine: TSI port mapping virtualizes
+  guest binds on privileged ports, and `<VirtualHost *:80>` sections
+  never match in the running daemon (`NameVirtualHost *:80 has no
+  VirtualHosts` on every re-parse), so vhost-declared ScriptAliases
+  vanish and `/cgi-bin/*` 404s. The derive step detects Debian apache
+  layouts (`/etc/apache2` + `/usr/lib/cgi-bin`) and re-declares the
+  cgi-bin mapping at main-server level (`conf.d/zzz-vmf-cgi.conf`),
+  where directives apply. The qemu engine does not have this problem
+  (real kernel binds); nginx-style single-default-server images are
+  unaffected either way.
 
 ## Conventions
 

@@ -18,17 +18,28 @@ list:
       ip=$(awk '/network:/{f=1} f && /ip:/{print $2; exit}' "$spec")
       printf '%-24s %-10s %s\n' "$name" "$state" "${ip:--}"
     done
-    # Ephemeral microVMs (krunvm), if any; names are plain single tokens
-    if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-      buildah unshare -- krunvm list 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+$'
-    else
-      nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm list 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+$'
-    fi | while IFS= read -r vm; do
-      port=-
-      if [ -f "$HOME/.vmf/runs/$vm.conf" ]; then
-        port=$(. "$HOME/.vmf/runs/$vm.conf"; echo "$PORT")
+    # Ephemeral microVMs, from run state files (engine-aware)
+    for conf in "$HOME"/.vmf/runs/*.conf; do
+      [ -f "$conf" ] || continue
+      name=$(basename "$conf" .conf)
+      . "$conf"
+      engine=${ENGINE:-krunvm}
+      if [ "$engine" = "qemu" ]; then
+        pid=${PID:-$(cat "$HOME/.vmf/runs/$name/qemu.pid" 2>/dev/null || true)}
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state=running; else state=stopped; fi
+      else
+        if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
+          KR=1
+        else
+          KR=0
+        fi
+        if [ "$KR" = "1" ] && buildah unshare -- krunvm list 2>/dev/null | grep -qx -- "$name"; then
+          state=running
+        else
+          state=stopped
+        fi
       fi
-      printf '%-24s %-10s %s\n' "$vm" "microvm" "ssh port $port"
+      printf '%-24s %-10s %s\n' "$name" "microvm/$engine" "ssh port ${PORT:--} ($state)"
     done
 
 # Validate a spec: schema, base pin, roles, Dockerfile subset
@@ -90,10 +101,31 @@ status lab=lab:
     qemu-img snapshot -l "build/{{ lab }}/image/vmf-{{ lab }}" 2>/dev/null | head -6
 
 # Shut down a box (ACPI first, then force after 10 seconds) or a microVM
-# (kill its krunvm start tree, delete, clean state).
+# (engine-aware: qemu pid kill + container cleanup, or krunvm tree).
 stop lab=lab:
     #!/bin/sh
-    if pgrep -f "krunvm start {{ lab }} " >/dev/null 2>&1 || [ -f "$HOME/.vmf/runs/{{ lab }}.conf" ]; then
+    if [ -f "$HOME/.vmf/runs/{{ lab }}.conf" ]; then
+      . "$HOME/.vmf/runs/{{ lab }}.conf"
+      ENGINE=${ENGINE:-krunvm}
+      if [ "$ENGINE" = "qemu" ]; then
+        pid=${PID:-$(cat "$HOME/.vmf/runs/{{ lab }}/qemu.pid" 2>/dev/null || true)}
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+        if command -v buildah >/dev/null 2>&1; then B=buildah; else B="nix shell nixpkgs#buildah -c buildah"; fi
+        [ -n "${CTR:-}" ] && $B unshare -- buildah rm "$CTR" >/dev/null 2>&1 || true
+      else
+        pkill -f "krunvm start {{ lab }} --" 2>/dev/null || true
+        sleep 0.5
+        if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
+          buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
+        else
+          nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm delete {{ lab }} >/dev/null 2>&1 || true
+        fi
+      fi
+      rm -rf "$HOME/.vmf/runs/{{ lab }}" "$HOME/.vmf/runs/{{ lab }}.conf" "$HOME/.vmf/runs/{{ lab }}.log"
+      echo "microVM {{ lab }} stopped"
+      exit 0
+    fi
+    if pgrep -f "krunvm start {{ lab }} " >/dev/null 2>&1; then
       pkill -f "krunvm start {{ lab }} --" 2>/dev/null || true
       sleep 0.5
       if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then

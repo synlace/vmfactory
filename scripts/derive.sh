@@ -27,6 +27,31 @@ cp "$VMF_INIT" "$rootfs/vmf/init.sh"
 ln -sf busybox "$rootfs/vmf/sh"
 chmod 755 "$rootfs/vmf/dropbear" "$rootfs/vmf/busybox" "$rootfs/vmf/init.sh"
 
+# OpenSSH suite for the qemu engine (real kernel): sshd + its split
+# session binary (sshd looks for sshd-session at its compiled-in store
+# path, so the file is placed there) and ssh-keygen for host keys.
+cp "$VMF_BUNDLE/sshd" "$rootfs/vmf/sshd"
+cp "$VMF_BUNDLE/ssh-keygen" "$rootfs/vmf/ssh-keygen"
+chmod 755 "$rootfs/vmf/sshd" "$rootfs/vmf/ssh-keygen"
+libexec=$(cat "$VMF_BUNDLE/sshd-libexec-path")
+mkdir -p "$rootfs$libexec"
+cp "$VMF_BUNDLE/sshd-session" "$rootfs$libexec/sshd-session"
+cp "$VMF_BUNDLE/sshd-auth" "$rootfs$libexec/sshd-auth"
+chmod 755 "$rootfs$libexec/sshd-session" "$rootfs$libexec/sshd-auth"
+mkdir -p "$rootfs/etc/ssh"
+cp "$VMF_BUNDLE/moduli" "$rootfs/etc/ssh/moduli"
+mkdir -p "$rootfs/var/empty"
+cat > "$rootfs/etc/ssh/sshd_config" <<'EOF'
+Port 22
+ListenAddress 0.0.0.0
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+AuthorizedKeysFile .ssh/authorized_keys
+PidFile /var/run/sshd.pid
+Subsystem sftp internal-sftp
+EOF
+
 # Fallback tool symlinks: busybox dispatches on argv[0], so one symlink
 # per applet gives every image (including distroless) a full coreutils
 # set under /vmf/bin. The directory is APPENDED to PATH by oci-run.sh,
@@ -61,6 +86,13 @@ if [ -f "$shells" ]; then
   grep -qx '/vmf/sh' "$shells" || printf '%s\n' '/vmf/sh' >> "$shells"
 else
   printf '%s\n' '/bin/sh' '/vmf/sh' > "$shells"
+fi
+
+# OpenSSH privilege separation needs the sshd user to exist.
+if grep -q '^sshd:' "$passwd"; then
+  :
+else
+  printf 'sshd:x:74:65534:privsep:/var/empty:/vmf/sh\n' >> "$passwd"
 fi
 
 # Apache vhost shim: under krunvm's TSI port mapping, <VirtualHost *:80>
