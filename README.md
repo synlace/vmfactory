@@ -304,6 +304,16 @@ closed), and execs the app — interactive CLIs paint their TUI on the
 console in foreground runs, or use `-d` + `vmf ssh`. "Latest" resolves
 at install time inside the VM; the image is digest-pinned as usual.
 
+`--intent` also refines a resolved plan when the run has one project
+(or a cached gap-fill plan): the phrase becomes a bounded, validated
+overlay — e.g. "Run 5 instances" scales a service to N replicas. The
+base plan and its cache stay untouched; the flatten step applies the
+overlay deterministically: numbered instances (`cyberchef-2`...),
+distinct static IPs, VM ports offset per instance (8080-8084), and
+the extra ports ride the boot-time hostfwd on both engines. Anything
+outside the vocabulary (unknown service, count outside 2-12) is
+ignored. The refinement prints one line before the boot.
+
 The compose file is found at the repo root or in a unique subdirectory
 (two levels deep). The translation is deterministic (no LLM on the
 happy path): services, image|build (context, dockerfile, args), ports

@@ -682,6 +682,49 @@ primary=$("${JQ[@]}" -r '.primary' "$plan_tmp/plan.json")
 PROJ="$VMF_COMPOSE_SRC/$("${JQ[@]}" -r '.project_dir // "."' "$plan_tmp/plan.json")"
 echo "compose: $svc_count services (primary: $primary)"
 
+# Intent refinement: an unconsumed --intent phrase (single-project run)
+# becomes a bounded, validated plan overlay - e.g. "Run 5 instances"
+# scales a service. The base plan (and its cache) stays untouched; the
+# flatten step applies the overlay deterministically.
+export VMF_PLAN_REFINES="$plan_tmp/refines.json"
+if [[ -n "${VMF_RUN_INTENT:-}" && ! -f "$VMF_PLAN_REFINES" ]]; then
+  VMF_RUN_INTENT="$VMF_RUN_INTENT" "${PY[@]}" - "$plan_tmp/plan.json" "$VMF_PLAN_REFINES" <<'PYR'
+import json, os, subprocess, sys
+plan = json.load(open(sys.argv[1]))
+phrase = os.environ["VMF_RUN_INTENT"]
+svcs = [{"name": e["name"],
+         "ports": ["%d/%s" % (p["host"], p["proto"]) for p in e["ports"]]}
+        for e in plan["services"]]
+names = {e["name"] for e in plan["services"]}
+prompt = (
+    "A run plan already exists with these services:\n%s\n\n"
+    "The user's intent for this run: %s\n\n"
+    "If the intent asks for INSTANCES/replicas of one service, reply "
+    'ONE JSON object: {"replicas": {"<service from the list>": <count>}} '
+    "with count between 2 and 12. Otherwise reply {\"replicas\": {}}. "
+    "Never name a service outside the list; ignore any other request."
+    % (json.dumps(svcs), phrase))
+proc = subprocess.run(["bash", os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh"),
+                       "--role", "intent", prompt],
+                      capture_output=True, text=True)
+reps = {}
+if proc.returncode == 0:
+    try:
+        j = json.loads(proc.stdout.strip().strip("`"))
+        if isinstance(j, str):
+            j = json.loads(j)
+        for k, v in (j.get("replicas") or {}).items():
+            k = str(k)
+            if k in names and isinstance(v, int) and 2 <= v <= 12:
+                reps[k] = v
+    except Exception:
+        reps = {}
+json.dump({"replicas": reps}, open(sys.argv[2], "w"))
+for k, v in reps.items():
+    print("intent: scaling %s to %d instances (extra ports on the VM side)" % (k, v))
+PYR
+fi
+
 # --- host-side builds/pulls (pinned digests) ----------------------------
 mkdir -p "$(dirname "$PINS")"
 pin_image() { # name digest
@@ -759,23 +802,32 @@ tags_json=$(printf '{%s}' "$(for k in "${!SVC_TAGS[@]}"; do printf '"%s":"%s",' 
 
 # --- flattened compose file (no builds, local tags only) ----------------
 "${PY[@]}" - "$plan_tmp/manifest.json" "$plan_tmp/compose.yaml" "$plan_tmp/ports.txt" <<'PYEOF'
-import json, sys, yaml
+import json, os, sys, yaml
 m = json.load(open(sys.argv[1]))
 svcs = {}
 fwd = []
-# The guest dockerd's embedded DNS (127.0.0.11) does not work here (its
-# resolver DNAT needs iptables; the microVM kernel has no netfilter
-# modules and dockerd runs --iptables=false). Give every service a
-# static IP on the project network and point every other service's
-# extra_hosts at the names + aliases. Deterministic, no resolver.
+# Intent refinement (e.g. "Run 5 instances"): the base service keeps
+# its name and declared VM ports; extra instances get a numbered name,
+# their own static IP, and VM ports offset by the instance index. The
+# docker image is shared - one archive, N containers.
+refines = {}
+rf = os.environ.get("VMF_PLAN_REFINES", "")
+if rf and os.path.isfile(rf):
+    refines = json.load(open(rf)).get("replicas") or {}
 SUB = "172.31.100"
-names = [e["name"] for e in m["services"]]
+expanded = []
+for e in m["services"]:
+    reps = int(refines.get(e["name"]) or 1)
+    for i in range(reps):
+        iname = e["name"] if i == 0 else "%s-%d" % (e["name"], i + 1)
+        expanded.append((iname, e, i))
+names = [n for n, _, _ in expanded]
 ip = {n: "%s.%d" % (SUB, 10 + i) for i, n in enumerate(names)}
 alias_ip = {}
 for e in m["services"]:
     for a in e.get("aliases") or []:
         alias_ip[a] = ip[e["name"]]
-for e in m["services"]:
+for iname, e, i in expanded:
     n = e["name"]
     tag = m["tags"].get(n) or e.get("image")
     entry = {"image": tag}
@@ -785,21 +837,19 @@ for e in m["services"]:
         entry["entrypoint"] = e["entrypoint"]
     if e.get("expose"):
         entry["expose"] = e["expose"]
-    # ports are NOT published by docker: the guest expose daemon runs
-    # socat forwards from ports.txt, exposing them on the VM address.
     for p in e["ports"]:
-        fwd.append("%s %d %d %s" % (p["proto"], p["host"], p["cport"], n))
+        fwd.append("%s %d %d %s" % (p["proto"], p["host"] + i, p["cport"], iname))
     if e["env"]:
-        entry["environment"] = e["env"]
+        entry["environment"] = dict(e["env"])
     if e["depends_on"]:
-        entry["depends_on"] = e["depends_on"]
-    entry["networks"] = {"default": {"ipv4_address": ip[n]}}
-    hosts = {o: ip[o] for o in names if o != n}
+        entry["depends_on"] = list(e["depends_on"])
+    entry["networks"] = {"default": {"ipv4_address": ip[iname]}}
+    hosts = {o: ip[o] for o in names if o != iname}
     for a, t in alias_ip.items():
-        if t != ip[n]:
+        if t != ip[iname]:
             hosts[a] = t
     entry["extra_hosts"] = ["%s=%s" % (k, v) for k, v in sorted(hosts.items())]
-    svcs[n] = entry
+    svcs[iname] = entry
 doc = {"services": svcs}
 doc["networks"] = {"default": {"ipam": {"config": [{"subnet": SUB + ".0/24"}]}}}
 yaml.safe_dump(doc, open(sys.argv[2], "w"), sort_keys=False)
@@ -879,6 +929,34 @@ while IFS=$'\t' read -r h proto; do
     ports_args+=(-p "$h:$h")
   fi
 done < <("${JQ[@]}" -r '.services[] | .ports[]? | [(.host|tostring), .proto] | @tsv' "$plan_tmp/plan.json")
+# Intent-refined instances: extra VM ports are offsets of the service's
+# first declared port; qemu publishes hostfwd only at boot, so they
+# must ride the boot-time -p list (firecracker's poller would cover
+# them, but qemu has no dynamic hostfwd).
+if [[ -f "$VMF_PLAN_REFINES" ]]; then
+  while IFS=$'\t' read -r h proto reps; do
+    [[ -n "$h" ]] || continue
+    for (( i=1; i<reps; i++ )); do
+      hp=$((h + i))
+      if [[ "$proto" == "udp" ]]; then
+        ports_args+=(-p "$hp:$hp/udp")
+      else
+        ports_args+=(-p "$hp:$hp")
+      fi
+    done
+  done < <(VMF_PLAN_REFINES="$VMF_PLAN_REFINES" python3 - "$plan_tmp/plan.json" <<'PY'
+import json, os, sys
+plan = json.load(open(sys.argv[1]))
+rf = os.environ.get("VMF_PLAN_REFINES", "")
+reps = json.load(open(rf)).get("replicas") if rf and os.path.isfile(rf) else {}
+for e in plan["services"]:
+    r = int(reps.get(e["name"]) or 1)
+    if r > 1 and e["ports"]:
+        p = e["ports"][0]
+        print("%s\t%s\t%d" % (p["host"], p["proto"], r))
+PY
+)
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${VMF_COMPOSE_NOEXEC:-0}" == "1" ]]; then
