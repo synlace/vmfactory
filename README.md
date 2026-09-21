@@ -258,6 +258,17 @@ Approved plans cache under `~/.vmf/generated/<input-hash>/` — the
 same repo replays without a model call. Without a key the gap-filler
 fails with a clear message; nothing is ever generated silently.
 
+Spec'ing is grounded: the gap-filler runs in three phases. A draft
+call states the plan and names the topics whose CURRENT facts matter;
+`scripts/context7.sh` then fetches up-to-date library docs for each
+topic (Context7 REST API, `CONTEXT7_API_KEY` optional, `VMF_CONTEXT7`
+off to disable); the final plan prompt carries those doc blocks, and
+the gate prints the provenance line (`grounding: grounded via
+context7: /astral-sh/uv [...], ...`). Package names, install steps,
+and prerequisites come from current docs, not model recall. Degraded
+runs say `NOT grounded` on the gate; provenance lands in the plan's
+`.meta.json`.
+
 Two run shapes come out of the gap-filler:
 
 - `mode: docker` — the compose path (build the repo image, dockerd in

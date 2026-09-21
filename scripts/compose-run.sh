@@ -237,7 +237,7 @@ def gapfill(root):
         sys.exit(1)
     # Prompt version: part of the cache key, so improved prompts
     # invalidate stale cached plans.
-    PROMPT_V = "3"
+    PROMPT_V = "4"
     key = hashlib.sha256((PROMPT_V + "\n" + bundle).encode()).hexdigest()[:12]
     gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated", key)
     cache = os.path.join(gen, "compose.yaml")
@@ -256,7 +256,9 @@ def gapfill(root):
         shutil.copy(dcache, os.path.join(os.path.dirname(out), "direct.json"))
         sys.exit(0)
     def gate(text):
-        sys.stderr.write(text)
+        g = ("grounded via context7: " + ", ".join(c7_ids[:3])) if c7_ids \
+            else "NOT grounded (context7 unavailable)"
+        sys.stderr.write(text + "  grounding: %s\n" % g)
         accept = os.environ.get("VMF_RUN_YES") == "1"
         if not accept and sys.stdin.isatty():
             sys.stderr.write("gap-filler: boot with this plan? [y/N] ")
@@ -273,8 +275,64 @@ def gapfill(root):
         open(path, "w").write(obj_text)
         open(path + ".meta.json", "w").write(json.dumps(
             {"model": os.environ.get("VMF_GAPFILL_MODEL") or os.environ.get("VMF_LLM_MODEL", ""),
-             "notes": planj.get("notes", ""), "created": ""}, indent=2))
+             "notes": planj.get("notes", ""), "created": "",
+             "context7": c7_ids}, indent=2))
     llm = os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh")
+    ctx7 = os.path.join(os.environ["VMF_SCRIPTS_DIR"], "context7.sh")
+    # Phase 1: draft. The model states what it plans and which topics it
+    # needs verified against CURRENT docs - its recall of package names
+    # and install steps may be stale.
+    draft_prompt = (
+        "Draft a run plan for this repository inside a disposable microVM "
+        "(the VM is the sandbox). Use ONLY the evidence below, but ALSO "
+        "list up to 3 topics whose CURRENT facts matter (package names, "
+        "install steps, prerequisites) so they can be verified against "
+        "up-to-date docs. Reply with ONE JSON object:\n"
+        '{"mode": "direct" | "docker", '
+        '"lookup": ["<doc topic, e.g. <tool> install on linux>"], '
+        '"why": "<max 8 words>"}\n'
+        "Evidence:\n" + bundle[:32768])
+    proc = subprocess.run(["bash", llm, "--role", "gapfill", draft_prompt],
+                          capture_output=True, text=True)
+    lookup = []
+    if proc.returncode == 0:
+        try:
+            dj = json.loads(proc.stdout.strip().strip("`"))
+            if isinstance(dj, str):
+                dj = json.loads(dj)
+            lookup = [str(x) for x in (dj.get("lookup") or [])[:3]]
+        except Exception:
+            lookup = []
+    # Phase 2: grounding. Fetch current docs per lookup topic via
+    # Context7; every failure degrades silently.
+    grounding = []
+    c7_ids = []
+    for topic in lookup:
+        s = subprocess.run(["bash", ctx7, "search", topic],
+                           capture_output=True, text=True)
+        if s.returncode != 0:
+            continue
+        try:
+            hits = [json.loads(l) for l in s.stdout.strip().splitlines() if l.strip()]
+        except Exception:
+            continue
+        if not hits:
+            continue
+        lib = hits[0]["id"]
+        d = subprocess.run(["bash", ctx7, "docs", lib, topic],
+                           capture_output=True, text=True)
+        if d.returncode != 0 or not d.stdout.strip():
+            continue
+        grounding.append("=== context7: %s (%s, updated %s) ===\n%s"
+                         % (lib, topic, hits[0].get("updated", "?"),
+                            d.stdout[:3000]))
+        c7_ids.append("%s [%s]" % (lib, topic))
+    grounded = ("\nGrounding - CURRENT documentation fetched for the lookup "
+                "topics; prefer these facts over your recall:\n"
+                + "\n".join(grounding)) if grounding else \
+               ("\nGrounding: context7 unavailable for this run; state facts "
+                "conservatively and prefer the evidence below.\n")
+
     prompt = (
         "Decide how to run this repository inside a disposable microVM "
         "(the VM is the sandbox). Use ONLY the evidence below; never "
@@ -303,6 +361,7 @@ def gapfill(root):
         "(sandbox builders, container-based tools), set needs_docker=true "
         "with mode=direct (vmf starts dockerd in the VM); if the app IS "
         "container-native, prefer mode=docker instead.\n"
+        + grounded +
         "Evidence:\n" + bundle[:32768])
     proc = subprocess.run(["bash", os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh"),
                            "--role", "gapfill", prompt],
