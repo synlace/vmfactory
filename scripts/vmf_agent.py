@@ -53,6 +53,8 @@ SYSTEM_BRIEF = (
     "app serve, then write back the exact recipe. Facts: you are root; "
     "the VM has a fresh base image, no plan yet; the app only needs to "
     "serve IN THE GUEST (host publishing happens on the replay boot). "
+    "Batch work: one turn = one complete phase (a full script), not one "
+    "micro-command; aim for under 6 turns. "
     "dockerd is ALREADY running in the VM (docker pull/run works, `docker` "
     "is on PATH). Prefer the host's image supply over in-VM pulls: to "
     "use an official image reply ONCE with "
@@ -63,6 +65,14 @@ SYSTEM_BRIEF = (
     "straight to the app's own official image, and list every image "
     "the plan needs in plan.images so the replay boot preloads them. "
     "Speed rules: prefer an official image "
+    "or the app's release artifact (GitHub releases); "
+    "build from source only when neither exists. If the plan's install "
+    "or command uses "
+    "docker, set needs_docker=true so the replay boot starts dockerd. "
+    "Guest tools are minimal: /vmf/busybox provides coreutils + wget + "
+    "httpd; install what the app needs. Make installs idempotent (they "
+    "re-run on a fresh VM). When the app serves, reply "
+    "done=true with the plan:\n"
     "or the app's release artifact (GitHub releases); build from source "
     "only when neither exists. If the plan's install or command uses "
     "docker, set needs_docker=true so the replay boot starts dockerd. "
@@ -200,8 +210,9 @@ def transcript_block(turns):
     return "\n".join(lines)
 
 
-def agent_turn(image, phrase, turns, note=""):
+def agent_turn(image, phrase, turns, note="", brief=None):
     prompt = (
+        (brief or SYSTEM_BRIEF) +
         "Base image: %s\nIntent: %s\n%s\n"
         "Command transcript so far (last %d):\n%s\n"
         "Reply with ONE JSON object: "
@@ -293,16 +304,56 @@ def agent_model_configured():
     return False
 
 
+REPAIR_BRIEF = (
+    "You REPAIR a RUNNING microVM whose app failed its post-boot checks. "
+    "The VM is LIVE (ssh works) — fix the app in place, do not reboot. "
+    "The current plan's install already ran on this VM. The failure "
+    "evidence and the current plan are in the transcript below. Fix "
+    "the app live (ssh commands) until the declared checks pass, then "
+    "reply done with the FULL corrected plan: its install[] must ALSO "
+    "reproduce the fix on a FRESH VM (idempotent — include the original "
+    "install steps plus the repair steps), command[] must start the "
+    "app. Batch work: one turn = one complete phase. Reply ONE JSON "
+    "object per turn.\n")
+
+
+def save_transcript(path, turns):
+    try:
+        json.dump(turns, open(path, "w"))
+    except OSError:
+        pass
+
+
+def load_transcript(path):
+    try:
+        t = json.load(open(path))
+        return t if isinstance(t, list) else []
+    except (OSError, ValueError):
+        return []
+
+
 def agent_cmd(args):
     if not agent_model_configured():
         sys.stderr.write("agent: no agent model configured (VMF_AGENT_MODEL)\n")
         return 3
     deadline = time.time() + args.budget
     turns, note = [], ""
+    if getattr(args, "resume", None) and os.path.isfile(args.resume):
+        turns = load_transcript(args.resume)
+        if turns:
+            sys.stderr.write("agent: resumed %d prior turns\n" % len(turns))
+    if getattr(args, "context", None) and os.path.isfile(args.context):
+        ctx = json.load(open(args.context))
+        turns.insert(0, {"cmd": "(current plan + failure evidence)",
+                         "out": json.dumps(ctx)[:OUT_CAP * 2]})
     spec = None
     turn_no = 0
     infra_streak = 0
     seed_state = {"thread": None, "refs": [], "result": {}}
+
+    def persist():
+        if getattr(args, "resume", None):
+            save_transcript(args.resume, turns[-40:])
 
     def collect_seed():
         if seed_state["thread"] is not None:
@@ -325,9 +376,12 @@ def agent_cmd(args):
         fail_note = collect_seed()
         if fail_note:
             note = fail_note
-        reply = agent_turn(args.image, args.phrase, turns, note)
+        reply = agent_turn(args.image, args.phrase, turns, note,
+                           brief=REPAIR_BRIEF if getattr(
+                               args, "repair", False) else None)
         if reply is None:
             return 1
+        persist()
         if reply.get("seed_images") and seed_state["thread"] is None:
             seed_state["refs"] = [str(x)
                                   for x in reply["seed_images"]][:4]
@@ -351,6 +405,7 @@ def agent_cmd(args):
                           "out": ("rc=%d\n%s" % (rc, (out + err)[-OUT_CAP:]))})
             show_cmd(cmd)
             show_result(rc, out, err)
+            persist()
             if infra_diagnostic(str(cmd), (out or "") + (err or "")):
                 infra_streak += 1
             else:
@@ -381,6 +436,19 @@ def agent_cmd(args):
             if spec is None:
                 note = ("Your done had no command; a plan needs a "
                         "non-empty command array.")
+                continue
+            if not spec["install"] and sum(
+                    1 for t in turns
+                    if t.get("out", "").startswith("rc=0")) >= 2:
+                note = ("Your install list is EMPTY, but this session "
+                        "built state with shell commands (users, "
+                        "packages, files). The replay VM starts FRESH "
+                        "from the base image: move every state-building "
+                        "step into install[] (idempotent), then reply "
+                        "done again.")
+                turns.append({"cmd": "(replay check)",
+                              "out": note[:OUT_CAP]})
+                print("agent:   → empty install cannot replay; re-asking")
                 continue
             runnable_ports = vmf_plan._clamp_ports(raw_plan.get("ports"))
             runnable_checks = vmf_plan._clamp_checks(raw_plan.get("checks"))
@@ -485,6 +553,9 @@ def main(argv):
                     default=int(os.environ.get("VMF_AGENT_TURNS", "16")))
     ap.add_argument("--budget", type=int,
                     default=int(os.environ.get("VMF_AGENT_BUDGET", "900")))
+    ap.add_argument("--repair", action="store_true")
+    ap.add_argument("--context")
+    ap.add_argument("--resume")
     a = ap.parse_args(argv[1:])
     return agent_cmd(a)
 

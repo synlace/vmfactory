@@ -456,55 +456,67 @@ if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; the
   mkdir -p "$rundir"
   intent_plan="$rundir/intent-direct.json"
   intent_rc=0
-  # Agent session: boot a dedicated plan VM, drive it over ssh until the
-  # app works, write back the demonstrated spec. The gate reviews it.
-  # Falls back to the blind propose path when no agent model is
-  # configured or the budget runs out. A cache hit short-circuits both.
-  if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]]; then
-    cache_dir=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import vmf_plan; print(vmf_plan.intent_cache_dir(sys.argv[2], sys.argv[3]))' "$VMF_SCRIPTS_DIR" "$image" "$intent")
-    if [[ -f "$cache_dir/direct.json" ]]; then
-      echo "intent: cache hit; agent session skipped"
-      cp "$cache_dir/direct.json" "$intent_plan"
-      VMF_INTENT_MODE=plan
+  # Propose FIRST: one grounded model call, seconds. The agent wakes
+  # only when the boot's checks fail (the repair path in the verify
+  # stage) or when the propose path itself fails — most intents never
+  # pay for a session.
+  if [[ "${VMF_INTENT_MODE:-auto}" != "agent" ]]; then
+    if python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" intent "$image" "$intent" \
+        "$intent_plan"; then
+      echo "intent: propose path (the agent wakes only if checks fail)"
+    else
+      intent_rc=1
     fi
   fi
-  if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]]; then
+  if [[ "$intent_rc" != 0 && "${VMF_INTENT_MODE:-auto}" != "plan" ]]; then
+    # Agent session (deep fallback): boot a dedicated plan VM, drive it
+    # over ssh, write back the demonstrated spec. The transcript
+    # persists: a failed session keeps its plan VM and resumes on the
+    # next run instead of paying from zero.
     agent_vm="${name}-planagent"
-    echo "intent: agent session on plan VM '$agent_vm' (fallback: propose path)"
-    # The plan VM carries dockerd: container-native apps start with
-    # docker pull instead of a from-source build (the guest init starts
-    # dockerd whenever the bundle is staged).
-    ( VMF_WANT_DOCKER=1 bash "$0" "$image" -d --yes --name "$agent_vm" \
-        --memory "${VMF_AGENT_MEM:-2048}" \
-        ${netmode:+--net "$netmode"} \
-        ${timeout_spec:+--timeout "$timeout_spec"} \
-        ${diskcap:+--disk-cap "$diskcap"} \
-        -- /vmf/busybox sleep 100000 ) >>"$RUNS_DIR/$agent_vm.log" 2>&1 || true
+    agent_transcript="$RUNS_DIR/$agent_vm.transcript.json"
+    echo "intent: agent session on plan VM '$agent_vm'"
     agent_rundir=$(grep -oE '^RUNDIR=.*' "$RUNS_DIR/$agent_vm.conf" \
       2>/dev/null | cut -d= -f2- || true)
+    agent_alive=0
+    if [[ -n "$agent_rundir" && -f "$agent_transcript" ]] && \
+        bash "$SCRIPTS_DIR/ssh.sh" "$agent_vm" -- echo ok >/dev/null 2>&1; then
+      agent_alive=1
+      echo "intent: resuming plan VM '$agent_vm' (prior session kept)"
+    else
+      ( VMF_WANT_DOCKER=1 bash "$0" "$image" -d --yes --name "$agent_vm" \
+          --memory "${VMF_AGENT_MEM:-2048}" \
+          ${netmode:+--net "$netmode"} \
+          ${timeout_spec:+--timeout "$timeout_spec"} \
+          ${diskcap:+--disk-cap "$diskcap"} \
+          -- /vmf/busybox sleep 100000 ) >>"$RUNS_DIR/$agent_vm.log" 2>&1 || true
+      agent_rundir=$(grep -oE '^RUNDIR=.*' "$RUNS_DIR/$agent_vm.conf" \
+        2>/dev/null | cut -d= -f2- || true)
+      rm -f "$agent_transcript"
+    fi
     if python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$agent_vm" \
         --image "$image" --phrase "$intent" \
         ${agent_rundir:+--rundir "$agent_rundir"} \
+        --resume "$agent_transcript" \
         --out "$intent_plan"; then
       intent_rc=0
+      bash "$SCRIPTS_DIR/stop.sh" "$agent_vm" >/dev/null 2>&1 || true
+      rm -f "$agent_transcript"
     else
       intent_rc=$?
+      # Keep the plan VM and its transcript: the next run resumes from
+      # real state instead of paying from zero.
+      echo "note: agent session ended rc=$intent_rc; plan VM kept for resume"
     fi
-    bash "$SCRIPTS_DIR/stop.sh" "$agent_vm" >/dev/null 2>&1 || true
     case "$intent_rc" in
       0) ;;
       2) echo "error: agent plan not approved" >&2; exit 2 ;;
-      *) echo "note: agent session unavailable (rc=$intent_rc); propose path" >&2 ;;
+      *) echo "error: agent session failed (rc=$intent_rc)" >&2; exit 1 ;;
     esac
   fi
   if [[ "$intent_rc" != 0 ]]; then
-    if python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" intent "$image" "$intent" \
-        "$intent_plan"; then
-      :
-    else
-      echo "error: intent planning failed" >&2
-      exit 2
-    fi
+    echo "error: intent planning failed (no model configured?)" >&2
+    exit 2
   fi
   mapfile -t cmd_args < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1]))['command']]" "$intent_plan")
     while IFS=$'\t' read -r k v; do
@@ -789,8 +801,16 @@ vmf_verify_stage() {
   [[ "$detach" -eq 1 && "$ssh" -eq 1 ]] || return 0
   [[ "${VMF_VERIFY:-1}" == "1" ]] || return 0
   local vplan=""
+  # The intent cache is the stable plan source: a --rm teardown of a
+  # fast-dying VM removes the rundir before this stage runs, so the
+  # rundir copies are not enough for boot-time deaths.
+  local cache_plan=""
+  if [[ -n "$intent" ]]; then
+    cache_plan=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import vmf_plan; print(vmf_plan.intent_cache_dir(sys.argv[2], sys.argv[3]) + "/direct.json")' \
+      "$VMF_SCRIPTS_DIR" "$image" "$intent" 2>/dev/null || true)
+  fi
   for f in "${VMF_VERIFY_PLAN:-}" "$rundir/intent-direct.json" \
-           "$rundir/direct.json"; do
+           "$rundir/direct.json" "$cache_plan"; do
     [[ -n "$f" && -f "$f" ]] && { vplan="$f"; break; }
   done
   [[ -n "$vplan" ]] || return 0
@@ -798,8 +818,46 @@ vmf_verify_stage() {
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
     --hostfwd "$rundir/hostfwd" --console "$RUNS_DIR/$name.log" \
     --evidence-out "$rundir/verify-evidence.json" || vrc=$?
+  if [[ "$vrc" -eq 0 ]]; then
+    rm -f "$RUNS_DIR/$name.transcript.json"
+    return 0
+  fi
   if [[ "$vrc" -ne 1 || "$turn" -ge "${VMF_VERIFY_TURNS:-2}" ]]; then
     return 0
+  fi
+  # Repair-first (the inversion): when the VM is alive, the agent fixes
+  # the app in place and rewrites the spec — no reboot, seconds of a
+  # small model instead of minutes of a rebuild.
+  if bash "$SCRIPTS_DIR/ssh.sh" "$name" -- echo ok >/dev/null 2>&1; then
+    if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]] && \
+        python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$name" \
+        --rundir "$rundir" --out "$RUNS_DIR/$name.repaired.json" \
+        --repair --context "$rundir/verify-evidence.json" \
+        --resume "$RUNS_DIR/$name.transcript.json" \
+        --image "$image" --phrase "$intent"; then
+      if python3 -c 'import json,sys
+a, b = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
+          "$vplan" "$RUNS_DIR/$name.repaired.json"; then
+        cp "$RUNS_DIR/$name.repaired.json" "$vplan" 2>/dev/null || true
+        echo "verify: repaired in place; re-checking..."
+        VMF_VERIFY_TURN=$((turn + 1)) vmf_verify_stage
+        return
+      fi
+      # The repair changed the published ports: reboot with the new
+      # spec (the child re-run reads the updated intent cache).
+      echo "verify: repair changed the ports; rebooting..."
+      bash "$SCRIPTS_DIR/stop.sh" "$name" >/dev/null 2>&1 || true
+      child_args=()
+      if [[ -n "${VMF_ORIG_ARGS_B64:-}" ]]; then
+        while IFS= read -r -d '' a; do
+          child_args+=("$a")
+        done < <(printf '%s' "$VMF_ORIG_ARGS_B64" | base64 -d)
+      fi
+      VMF_VERIFY_TURN=$((turn + 1)) VMF_RUN_YES=1 bash "$0" \
+        ${child_args[@]+"${child_args[@]}"}
+      exit $?
+    fi
   fi
   # The revision needs a cache target: intent runs recompute the cache
   # from image+phrase; gap-fill runs carry it in VMF_VERIFY_CACHE

@@ -171,6 +171,8 @@ CRASH_PATTERNS = (
     r"SyntaxError: .*", r"ModuleNotFoundError: .*",
     r"Address already in use", r"permission denied",
     r"command not found: .*", r"not found: .*",
+    r"user \S+ does not exist", r"No such file or directory",
+    r"FATAL:", r"EADDRINUSE",
 )
 
 
@@ -224,12 +226,15 @@ def oom_evidence(console, plan):
 def wait_ssh(name, deadline):
     # Readiness gate: the guest starts sshd before the install runs, so
     # ssh-up alone is not success — but a VM that never answers ssh is
-    # unreachable and no revision can fix that from outside.
+    # unreachable and no revision can fix that from outside. A torn-down
+    # VM (conf gone) is provably dead: stop polling.
     while time.time() < deadline:
-        rc, _, _ = vmf_llm.run(exec_transport(name, "echo vmf-verify-ready"),
-                               timeout=20)
+        rc, _, err = vmf_llm.run(exec_transport(
+            name, "echo vmf-verify-ready"), timeout=20)
         if rc == 0:
             return True
+        if "no running microVM" in (err or ""):
+            return False
         time.sleep(POLL)
     return False
 
@@ -382,8 +387,14 @@ def revise_cmd(args):
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int>, "notes": "<max 12 words>"}'
         % (json.dumps(plan, indent=2), json.dumps(evidence, indent=2)))
-    rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=300,
-                                  env={"VMF_LLM_TIMEOUT": "240"})
+    rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=330,
+                                  env={"VMF_LLM_TIMEOUT": "300"})
+    if rc != 0:
+        # One retry: a stalled stream (curl 28 with a partial body) is a
+        # provider hiccup, not a missing model — the evidence is worth
+        # one more attempt before the verdict stands.
+        rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=330,
+                                      env={"VMF_LLM_TIMEOUT": "300"})
     if rc != 0:
         sys.stderr.write(err or "")
         sys.stderr.write("error: verify revision needs a reachable model\n")

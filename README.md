@@ -370,15 +370,18 @@ that boots and publishes ports but serves the wrong content fails its
 verdict with evidence (expected vs actual status, body head, exit
 codes).
 
-A failed verdict triggers one bounded revision: the evidence feeds the
-model, the revised plan validates against the same bounded vocabulary
-(idempotent install, clamped ports, probe/exec checks only), and the
-gate applies it — auto-applied on detached runs, prompted on a
-terminal, and a declined gate keeps the failed verdict. Applying
-reboots the VM with the revised plan and verifies again (one turn;
-`VMF_VERIFY_TURNS` caps the loop). The revised plan writes back into
-the intent cache, so the same image+phrase replays the fix instead of
-the failure.
+A failed verdict triggers repair, cheapest first. When the VM is
+alive, the agent fixes the app in place over ssh and rewrites the
+spec — no reboot; only a port change reboots. A dead VM falls to the
+bounded blind revise (one model turn from the evidence), then a
+reboot. The revised plan writes back into the intent cache, so the
+same image+phrase replays the fix instead of the failure.
+
+The plan itself is proposed first (one grounded model call), and the
+full agent session is the deep fallback — a dedicated plan VM the
+agent drives, kept alive with its transcript when a session ends
+unresolved, so the next run resumes from real state instead of paying
+from zero.
 
 Detached runs are the verify scope: foreground runs hold the console,
 and compose-mode runs carry no plan in the rundir, so their verdict

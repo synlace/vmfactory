@@ -30,6 +30,9 @@ class Args:
         self.out = os.path.join(tmp, "direct.json")
         self.turns = 8
         self.budget = 120
+        self.repair = False
+        self.context = None
+        self.resume = None
 
 
 def env_setup(tmp, fixture="agent-stub", yes="1"):
@@ -189,6 +192,38 @@ class AgentLoop(unittest.TestCase):
             os.environ["VMF_SCRIPTS_DIR"] = saved_scripts
         self.assertEqual(rc, 1)
         self.assertIn("plumbing turns", err.getvalue())
+
+    def test_repair_mode_seeds_context_and_persists(self):
+        os.environ["VMF_AGENT_SSH"] = GUEST_STUB
+        a = Args(self.tmp)
+        a.repair = True
+        a.resume = os.path.join(self.tmp, "transcript.json")
+        a.context = os.path.join(self.tmp, "ctx.json")
+        json.dump({"plan": {"install": ["x"]},
+                   "evidence": [{"check": "probe:8021",
+                                 "actual": "status 403"}]},
+                  open(a.context, "w"))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = vmf_agent.agent_cmd(a)
+        self.assertEqual(rc, 0, err.getvalue())
+        spec = json.load(open(a.out))
+        self.assertEqual(spec["ports"], [8021])
+        turns = json.load(open(a.resume))
+        self.assertIn("current plan + failure evidence", turns[0]["cmd"])
+        self.assertGreaterEqual(len(turns), 3)
+
+    def test_resume_loads_prior_turns(self):
+        os.environ["VMF_AGENT_SSH"] = GUEST_STUB
+        a = Args(self.tmp)
+        a.resume = os.path.join(self.tmp, "transcript.json")
+        json.dump([{"cmd": "old command", "out": "rc=0\nold output"}],
+                  open(a.resume, "w"))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = vmf_agent.agent_cmd(a)
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("resumed 1 prior turns", err.getvalue())
 
 
 if __name__ == "__main__":
