@@ -217,12 +217,25 @@ while IFS=$'\t' read -r name kind rest; do
         line = substr(line, RSTART + RLENGTH)
       }
     }' "$dockerfile")
+    # Synthesized env (missing env_file) must be visible to the build:
+    # some apps read it while building (Next.js page-data collection).
+    # The generated copy declares ARG/ENV right after the last FROM, so
+    # the app stage carries them; values must be substitution-free.
+    "${JQ[@]}" -r --arg n "$name" \
+      '.services[] | select(.name==$n) | ((.synth_env // {}) | to_entries[]) | [(.key|tostring), (.value|tostring)] | @tsv' \
+      "$plan_tmp/plan.json" > "$plan_tmp/synth-$name.tsv"
+    if [[ -s "$plan_tmp/synth-$name.tsv" ]]; then
+      while IFS=$'\t' read -r k v; do
+        [[ -n "$k" ]] || continue
+        printf 'ARG %s\nENV %s="%s"\n' "$k" "$k" "$v" >> "$plan_tmp/synth-$name.block"
+      done < "$plan_tmp/synth-$name.tsv"
+      "${AWK[@]}" -v bf="$plan_tmp/synth-$name.block" '
+        NR==FNR { if (tolower($0) ~ /^[[:space:]]*from[[:space:]]/) last = FNR; next }
+        { print; if (FNR == last) { while ((getline l < bf) > 0) print l } }
+      ' "$plan_tmp/synth-$name.block" "$dockerfile" > "$dockerfile.tmp" \
+        && mv "$dockerfile.tmp" "$dockerfile"
+    fi
     build_args=()
-    while IFS=$'\t' read -r k v; do
-      [[ -n "$k" ]] && build_args+=(--build-arg "$k=$v")
-    done < <("${JQ[@]}" -r --arg n "$name" \
-      '.services[] | select(.name==$n) | ((.build.args // {}) | to_entries[]) | [(.key|tostring), (.value|tostring)] | @tsv' \
-      "$plan_tmp/plan.json")
     "${BUILD_BIN[@]}" build -t "$tag" -f "$dockerfile" \
       ${build_args[@]+"${build_args[@]}"} "$ctx" >/dev/null
     # Digest of the built image. The reader must drain the full inspect

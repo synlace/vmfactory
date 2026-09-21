@@ -438,6 +438,42 @@ def norm_image(img):
     return "docker.io/library/" + img
 
 
+def _synth_db_env(env, svcs, self_name):
+    # A missing env_file is the common bootstrap gap (repos tell users to
+    # "cp .env.example .env" and ship neither). Synthesize the documented
+    # connection vars from the compose's own topology: a sibling db
+    # service names the in-network host, its environment block names the
+    # credentials. Only keys that are still absent are set.
+    from urllib.parse import quote
+
+    def _cred(svc, key):
+        eraw = svc.get("environment") or {}
+        if isinstance(eraw, dict):
+            v = eraw.get(key)
+            return "" if v is None else str(v)
+        if isinstance(eraw, list):
+            for kv in eraw:
+                if isinstance(kv, str) and kv.partition("=")[0] == key:
+                    return kv.partition("=")[2]
+        return ""
+
+    out = {}
+    for n, svc in svcs.items():
+        img = str(svc.get("image") or "")
+        base = img.rsplit(":", 1)[0].rsplit("/", 1)[-1].lower()
+        if base.startswith("mongo"):
+            if n == self_name:
+                continue
+            user = quote(_cred(svc, "MONGO_INITDB_ROOT_USERNAME") or "root", safe="")
+            pw = quote(_cred(svc, "MONGO_INITDB_ROOT_PASSWORD") or "example", safe="")
+            uri = "mongodb://%s:%s@%s:27017/%s?authSource=admin" \
+                % (user, pw, n, self_name)
+            for k in ("MONGODB_URI", "MONGO_URI"):
+                if k not in env and k not in out:
+                    out[k] = uri
+    return out
+
+
 def translate(compose_path, src, root):
     # compose file → plan dict. `src` is the project dir (env_file and
     # build contexts resolve there); `root` is the clone root.
@@ -536,6 +572,14 @@ def translate(compose_path, src, root):
                             env[k] = v
                 else:
                     sys.stderr.write("warning: env_file %s not found; skipped\n" % f)
+        # Build-time visibility for the synthesized vars: the app may read
+        # them during the image build (Next.js page-data collection does).
+        synth_env = _synth_db_env(env, svcs, name)
+        if synth_env:
+            env.update(synth_env)
+            e["synth_env"] = synth_env
+            sys.stderr.write("note: %s: synthesized %s from the compose "
+                             "topology\n" % (name, ", ".join(sorted(synth_env))))
         e["env"] = env
         # Network aliases declared on the service's networks: kept so the
         # flattened compose can point every other service's extra_hosts at
