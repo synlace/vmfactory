@@ -25,6 +25,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +36,17 @@ import vmf_verify
 CMD_TIMEOUT = 180
 OUT_CAP = 3500
 TRANSCRIPT_CAP = 12
+# Infra-symptom watchdog: transport plumbing (TLS, proxies, DNS, CAs)
+# belongs to the deterministic substrate, not the agent's turn budget.
+# Repeated diagnostic turns on the same plumbing abort the session and
+# hand the work to the honest fallback path.
+INFRA_DIAG = re.compile(
+    r"openssl|s_client|getent|_PROXY|certificate|ca-cert|registry-1"
+    r"|tls:|SSL|no-curl|command -v", re.I)
+
+
+def infra_diagnostic(cmd, out):
+    return bool(INFRA_DIAG.search("%s %s" % (cmd, out)[:4000]))
 
 SYSTEM_BRIEF = (
     "You drive a disposable microVM over ssh one-shot commands to make an "
@@ -42,9 +54,15 @@ SYSTEM_BRIEF = (
     "the VM has a fresh base image, no plan yet; the app only needs to "
     "serve IN THE GUEST (host publishing happens on the replay boot). "
     "dockerd is ALREADY running in the VM (docker pull/run works, `docker` "
-    "is on PATH), so for "
-    "container-native apps prefer the official image: docker run -d "
-    "--restart=no -p GUESTPORT... Speed rules: prefer an official image "
+    "is on PATH). Prefer the host's image supply over in-VM pulls: to "
+    "use an official image reply ONCE with "
+    '{"thought":"...","cmd":null,"seed_images":["ghost:5"],"done":false}'
+    " — the host pulls it with its own trust and loads it into this "
+    "VM's docker while you think; then docker run it. Never pull the "
+    "base image this VM already runs (e.g. you are inside ubuntu); go "
+    "straight to the app's own official image, and list every image "
+    "the plan needs in plan.images so the replay boot preloads them. "
+    "Speed rules: prefer an official image "
     "or the app's release artifact (GitHub releases); build from source "
     "only when neither exists. If the plan's install or command uses "
     "docker, set needs_docker=true so the replay boot starts dockerd. "
@@ -57,6 +75,7 @@ SYSTEM_BRIEF = (
     '"command": ["<argv>"], "ports": [<guest tcp ports>], '
     '"checks": [{"probe": {"port": P, "path": "/", "expect_status": 200, '
     '"expect_contains": "<text that proves it>"}}], '
+    '"images": ["<container images the plan needs>"], '
     '"env": {"K": "V"}, "needs_docker": <bool>, '
     '"memory_mb": <measured need, 1024-8192>, "notes": "<max 12 words>"}\n'
     "checks must reproduce what you verified (status and a distinctive "
@@ -213,12 +232,45 @@ def validate_spec(raw, plan):
             "command": cmd,
             "ports": vmf_plan._clamp_ports(raw.get("ports")),
             "checks": vmf_plan._clamp_checks(raw.get("checks")),
+            "images": vmf_plan._clamp_images(raw.get("images")),
             "env": {str(k): str(v)
                     for k, v in (raw.get("env") or {}).items()},
             "needs_docker": bool(raw.get("needs_docker")),
             "memory_mb": vmf_plan._clamp_memory(raw.get("memory_mb"),
                                                 raw.get("needs_docker")),
             "notes": str(raw.get("notes") or "")[:80]}
+
+
+def seed_images(args, refs):
+    # Host-side supply: pull with the host's trust, pin TOFU, archive
+    # into the agent VM's inputs, then `docker load` in the guest. The
+    # guest never dials a registry.
+    for i, ref in enumerate(refs[:4]):
+        out = os.path.join(args.rundir, "images-seed-%d.tar" % i)
+        override = os.environ.get("VMF_AGENT_PULL")
+        if override:
+            sh = override.replace("{ref}", shlex.quote(ref)) \
+                .replace("{path}", shlex.quote(out))
+            rc = subprocess.run(["bash", "-c", sh],
+                                capture_output=True, text=True,
+                                timeout=900).returncode
+        else:
+            try:
+                rc = subprocess.run(
+                    ["bash", os.path.join(scripts(), "image-supply.sh"),
+                     ref, out], capture_output=True, text=True,
+                    timeout=900).returncode
+            except subprocess.TimeoutExpired:
+                rc = 99
+        if rc != 0:
+            return False, "host supply failed for %s (rc=%d)" % (ref, rc)
+        lrc, lo, le = ssh_exec(
+            args.vm, "docker load -i /vmf-run/%s" % os.path.basename(out),
+            timeout=300)
+        if lrc != 0:
+            return False, "guest load failed for %s: %s" % (
+                ref, (lo + le).strip()[:200])
+    return True, ""
 
 
 def agent_model_configured():
@@ -249,18 +301,66 @@ def agent_cmd(args):
     turns, note = [], ""
     spec = None
     turn_no = 0
+    infra_streak = 0
+    seed_state = {"thread": None, "refs": [], "result": {}}
+
+    def collect_seed():
+        if seed_state["thread"] is not None:
+            seed_state["thread"].join()
+            seed_state["thread"] = None
+            ok, msg = seed_state["result"].get("v", (True, ""))
+            refs = ", ".join(seed_state["refs"])
+            if ok:
+                print("agent:   → images loaded: %s" % refs)
+                turns.append({"cmd": "(host image supply)",
+                              "out": "loaded %s" % refs})
+            else:
+                print("agent:   → supply failed: %s" % msg)
+                turns.append({"cmd": "(host image supply)", "out": msg})
+                return msg
+        return ""
+
     while turn_no < args.turns and time.time() < deadline:
         turn_no += 1
+        fail_note = collect_seed()
+        if fail_note:
+            note = fail_note
         reply = agent_turn(args.image, args.phrase, turns, note)
         if reply is None:
             return 1
+        if reply.get("seed_images") and seed_state["thread"] is None:
+            seed_state["refs"] = [str(x)
+                                  for x in reply["seed_images"]][:4]
+            if seed_state["refs"]:
+                print("agent:   → host supplying %s (pulls while the "
+                      "model thinks)" % ", ".join(seed_state["refs"]))
+
+                def _seed():
+                    seed_state["result"]["v"] = seed_images(
+                        args, seed_state["refs"])
+                seed_state["thread"] = threading.Thread(target=_seed)
+                seed_state["thread"].start()
         cmd = reply.get("cmd")
         if cmd:
+            if seed_state["thread"] is not None:
+                fail_note = collect_seed()
+                if fail_note:
+                    note = fail_note
             rc, out, err = ssh_exec(args.vm, str(cmd)[:2000])
             turns.append({"cmd": str(cmd)[:300],
                           "out": ("rc=%d\n%s" % (rc, (out + err)[-OUT_CAP:]))})
             show_cmd(cmd)
             show_result(rc, out, err)
+            if infra_diagnostic(str(cmd), (out or "") + (err or "")):
+                infra_streak += 1
+            else:
+                infra_streak = 0
+            if infra_streak >= 3:
+                sys.stderr.write(
+                    "agent: %d consecutive plumbing turns (TLS/proxy/DNS "
+                    "diagnostics); the substrate should own this — "
+                    "aborting to the propose path\n" % infra_streak)
+                return 1
             if not vm_alive(args.vm) and not reply.get("done"):
                 sys.stderr.write("agent: VM lost (crash or OOM); aborting\n")
                 return 1
@@ -355,6 +455,7 @@ def main(argv):
     ap.add_argument("--vm", required=True)
     ap.add_argument("--image", required=True)
     ap.add_argument("--phrase", required=True)
+    ap.add_argument("--rundir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--turns", type=int,
                     default=int(os.environ.get("VMF_AGENT_TURNS", "16")))

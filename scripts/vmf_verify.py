@@ -404,6 +404,7 @@ def revise_cmd(args):
                "command": cmd,
                "ports": vmf_plan._clamp_ports(j.get("ports")),
                "checks": vmf_plan._clamp_checks(j.get("checks")),
+               "images": vmf_plan._clamp_images(j.get("images")),
                "env": {str(k): str(v)
                        for k, v in (j.get("env") or {}).items()},
                "needs_docker": bool(j.get("needs_docker")),

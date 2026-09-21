@@ -347,6 +347,7 @@ def gapfill(root, plan_out):
                                 "command": [str(x) for x in cmd][:16],
                                 "ports": _clamp_ports(pj.get("ports")),
                                 "checks": _clamp_checks(pj.get("checks")),
+                                "images": _clamp_images(pj.get("images")),
                                 "env": {str(k): str(v) for k, v in (pj.get("env") or {}).items()},
                                 "needs_docker": bool(pj.get("needs_docker")),
                                 "memory_mb": _clamp_memory(pj.get("memory_mb"),
@@ -1164,6 +1165,19 @@ def _clamp_ports(raw):
     return ports
 
 
+def _clamp_images(raw):
+    # Direct-plan image refs the HOST supplies (pull with the host's
+    # trust, pin TOFU, archive for the guest's docker load). Junk is
+    # dropped, not guessed.
+    out = []
+    for x in (raw or [])[:4]:
+        s = str(x).strip()
+        if s and " " not in s and "\n" not in s and len(s) < 200 \
+                and s not in out:
+            out.append(s)
+    return out
+
+
 def _clamp_memory(raw, needs_docker):
     # Direct-plan VM sizing. needs_docker=true brings dockerd +
     # containerd + the app into one VM (measured: ~150 MB of daemons
@@ -1323,6 +1337,7 @@ def intent_cmd(image, phrase, out):
         '"ports": [<guest tcp port, e.g. 1337>], '
         '"checks": [{"probe": {"port": 1337, "path": "/", '
         '"expect_status": 200, "expect_contains": "<optional text>"}}], '
+        '"images": ["<container image the app needs; the host pulls it>"], '
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int vm ram, 1024-8192>, '
         '"notes": "<max 12 words>"}\n'
@@ -1361,6 +1376,7 @@ def intent_cmd(image, phrase, out):
         payload = {"install": install, "command": cmd,
                    "ports": _clamp_ports(plan.get("ports")),
                    "checks": _clamp_checks(plan.get("checks")),
+                   "images": _clamp_images(plan.get("images")),
                    "env": {str(k): str(v)
                            for k, v in (plan.get("env") or {}).items()},
                    "needs_docker": bool(plan.get("needs_docker")),

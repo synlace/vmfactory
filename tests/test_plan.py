@@ -353,6 +353,18 @@ class Cli(unittest.TestCase):
         self.assertIn("no compose file", proc.stderr)
 
 
+class ClampImages(unittest.TestCase):
+    def test_keeps_clean_refs(self):
+        self.assertEqual(vmf_plan._clamp_images(["ghost:5", " nginx "]),
+                         ["ghost:5", "nginx"])
+
+    def test_drops_junk_and_caps(self):
+        self.assertEqual(vmf_plan._clamp_images(
+            ["", "a b", "x\ny", "ok", "ok", 42]), ["ok"])
+        self.assertEqual(len(vmf_plan._clamp_images(
+            ["a%d" % i for i in range(10)])), 4)
+
+
 class ClampMemory(unittest.TestCase):
     def test_default_and_bounds(self):
         self.assertEqual(vmf_plan._clamp_memory(None, False), 1024)

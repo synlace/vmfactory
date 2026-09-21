@@ -69,6 +69,19 @@ if [ -s /vmf-run/repo.tar.gz ]; then
   $BB tar -xzf /vmf-run/repo.tar.gz -C /workspace
   $BB echo "vmf-init: repo staged at /workspace"
 fi
+# Host CA trust: the staged bundle carries the host's anchors (incl.
+# interception CAs the host already trusts). Install into the system
+# pool BEFORE dockerd or anything else dials TLS.
+if [ -s /vmf-run/ca-bundle.crt ]; then
+  $BB mkdir -p /usr/local/share/ca-certificates
+  $BB cp /vmf-run/ca-bundle.crt /usr/local/share/ca-certificates/vmf-host.crt
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    update-ca-certificates >/dev/null 2>&1 || true
+  elif [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    $BB cat /vmf-run/ca-bundle.crt >> /etc/ssl/certs/ca-certificates.crt
+  fi
+  $BB echo "vmf-init: host CA bundle installed"
+fi
 # In-VM docker runtime (needs_docker plans, agent plan VMs): the
 # static bundle is staged; dockerd starts BEFORE install.sh so the
 # install can docker pull/run.
@@ -106,6 +119,14 @@ if [ -s /vmf-run/docker-bundle.tar.gz ]; then
   done
   docker info >/dev/null 2>&1 || \
     $BB echo "vmf-init: dockerd did not come up; see /data/dockerd.log" >&2
+  # Host-supplied images: the host pulled with its own trust and
+  # archived them onto the inputs; load before install.sh runs.
+  for f in /vmf-run/images-*.tar; do
+    [ -e "$f" ] || break
+    $BB echo "vmf-init: docker load $f"
+    docker load -i "$f" >/dev/null 2>&1 || \
+      $BB echo "vmf-init: docker load failed: $f" >&2
+  done
 fi
 if [ -s /vmf-run/install.sh ]; then
   $BB echo "vmf-init: running install.sh"

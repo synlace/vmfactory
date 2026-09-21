@@ -480,8 +480,12 @@ if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; the
         ${timeout_spec:+--timeout "$timeout_spec"} \
         ${diskcap:+--disk-cap "$diskcap"} \
         -- /vmf/busybox sleep 100000 ) >>"$RUNS_DIR/$agent_vm.log" 2>&1 || true
+    agent_rundir=$(grep -oE '^RUNDIR=.*' "$RUNS_DIR/$agent_vm.conf" \
+      2>/dev/null | cut -d= -f2- || true)
     if python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$agent_vm" \
-        --image "$image" --phrase "$intent" --out "$intent_plan"; then
+        --image "$image" --phrase "$intent" \
+        ${agent_rundir:+--rundir "$agent_rundir"} \
+        --out "$intent_plan"; then
       intent_rc=0
     else
       intent_rc=$?
@@ -529,6 +533,20 @@ PY
       mem="$pmb"
     fi
     echo "intent: plan applied to $image (${#cmd_args[@]}-arg command)"
+    # Host-side image supply (row 3): direct plans declare images[]; the
+    # host pulls with its own trust, pins TOFU, and archives for the
+    # guest's docker load at init — the guest never dials a registry.
+    n=0
+    while IFS= read -r imgref; do
+      [[ -n "$imgref" ]] || continue
+      n=$((n + 1))
+      echo "intent: supplying image $imgref from the host..."
+      bash "$SCRIPTS_DIR/image-supply.sh" "$imgref" \
+        "$rundir/images-$n.tar" || {
+        echo "error: image supply failed for $imgref" >&2
+        exit 1
+      }
+    done < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1])).get('images',[])]" "$intent_plan")
 fi
 VMF_ENVS_FILE="$rundir/envs-nul" python3 - "$cfg_blob" "$rundir" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
 import json, os, shlex, sys
@@ -698,6 +716,12 @@ printf '%s\n' "$name" > "$rundir/hostname"
 printf '%s\n' "$ENGINE" > "$rundir/engine"
 printf '%s\n' "${VMF_MODE:-direct}" > "$rundir/mode"
 printf '%s\n' "$expose_mode" > "$rundir/expose"
+# Host CA trust: the host already verifies what it trusts (registry TLS,
+# interception CAs); the guest inherits the same anchors so its own TLS
+# (dockerd, package fetches) verifies instead of failing.
+if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
+  cp /etc/ssl/certs/ca-certificates.crt "$rundir/ca-bundle.crt"
+fi
 # Gap-fill direct mode: a one-shot install script and the repo tar ride
 # the per-run inputs; the guest stages the repo at /workspace, runs the
 # install at boot, then execs the app. The VM is the sandbox.

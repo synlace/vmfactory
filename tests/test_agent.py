@@ -26,6 +26,7 @@ class Args:
         self.vm = "agent-vm"
         self.image = "python:3.12-slim"
         self.phrase = "static server on 8021"
+        self.rundir = tmp
         self.out = os.path.join(tmp, "direct.json")
         self.turns = 8
         self.budget = 120
@@ -33,12 +34,14 @@ class Args:
 
 def env_setup(tmp, fixture="agent-stub", yes="1"):
     saved = {k: os.environ.get(k) for k in
-             ("VMF_SCRIPTS_DIR", "VMF_AGENT_SSH", "VMF_RUN_YES", "HOME",
-              "VMF_AGENT_MODEL")}
+             ("VMF_SCRIPTS_DIR", "VMF_AGENT_SSH", "VMF_AGENT_PULL",
+              "VMF_RUN_YES", "HOME", "VMF_AGENT_MODEL")}
     os.environ["HOME"] = tmp
     os.environ["VMF_SCRIPTS_DIR"] = os.path.join(FIXTURES, fixture)
     os.environ["VMF_RUN_YES"] = yes
     os.environ["VMF_AGENT_MODEL"] = "stub"
+    # host supply stub: "pull" = create the archive file in place
+    os.environ["VMF_AGENT_PULL"] = "touch {path}"
     open(os.path.join(FIXTURES, fixture, "calls"), "w").write("0")
     return saved
 
@@ -134,6 +137,10 @@ class AgentLoop(unittest.TestCase):
                          ["/vmf/busybox", "httpd", "-f", "-p", "8021",
                           "-h", "/srv"])
         self.assertEqual(spec["ports"], [8021])
+        # the seed turn: the host supplied ghost:5 into the VM inputs
+        self.assertEqual(spec["images"], ["ghost:5"])
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.tmp, "images-seed-0.tar")))
         self.assertIn("agent: spec written", err.getvalue())
         # the payoff: the demonstrated spec lands in the intent cache
         gen = vmf_agent.vmf_plan.intent_cache_dir(a.image, a.phrase)
@@ -166,6 +173,22 @@ class AgentLoop(unittest.TestCase):
             rc = vmf_agent.agent_cmd(a)
         self.assertEqual(rc, 1)
         self.assertIn("VM lost", err.getvalue())
+
+    def test_infra_watchdog_aborts(self):
+        saved_scripts = os.environ["VMF_SCRIPTS_DIR"]
+        with open(os.path.join(FIXTURES, "agent-infra", "calls"), "w") as f:
+            f.write("0")
+        os.environ["VMF_SCRIPTS_DIR"] = os.path.join(FIXTURES, "agent-infra")
+        os.environ["VMF_AGENT_SSH"] = "exit 0"
+        try:
+            a = Args(self.tmp)
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = vmf_agent.agent_cmd(a)
+        finally:
+            os.environ["VMF_SCRIPTS_DIR"] = saved_scripts
+        self.assertEqual(rc, 1)
+        self.assertIn("plumbing turns", err.getvalue())
 
 
 if __name__ == "__main__":
