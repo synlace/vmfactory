@@ -456,6 +456,7 @@ if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; the
   mkdir -p "$rundir"
   intent_plan="$rundir/intent-direct.json"
   intent_rc=0
+  echo "note: --intent on a plain image is experimental; a repo or an official image input is more reliable"
   # Propose FIRST: one grounded model call, seconds. The agent wakes
   # only when the boot's checks fail (the repair path in the verify
   # stage) or when the propose path itself fails — most intents never
@@ -822,7 +823,28 @@ vmf_verify_stage() {
     rm -f "$RUNS_DIR/$name.transcript.json"
     return 0
   fi
-  if [[ "$vrc" -ne 1 || "$turn" -ge "${VMF_VERIFY_TURNS:-2}" ]]; then
+  if [[ "$vrc" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "$turn" -ge "${VMF_VERIFY_TURNS:-2}" ]]; then
+    # Cache hygiene: record the failed replay on the intent cache —
+    # a fresh grounded plan then replaces a repeatedly-dead spec.
+    if [[ -n "$intent" ]]; then
+      python3 - "$image" "$intent" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ.get("VMF_SCRIPTS_DIR") or ".")
+import vmf_plan
+gen = vmf_plan.intent_cache_dir(sys.argv[1], sys.argv[2])
+p = os.path.join(gen, "direct.json.meta.json")
+try:
+    meta = json.load(open(p))
+except (OSError, ValueError):
+    meta = {}
+meta["failed"] = int(meta.get("failed", 0)) + 1
+os.makedirs(gen, exist_ok=True)
+open(p, "w").write(json.dumps(meta, indent=2))
+PY
+    fi
     return 0
   fi
   # Repair-first (the inversion): when the VM is alive, the agent fixes

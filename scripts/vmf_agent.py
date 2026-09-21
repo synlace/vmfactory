@@ -210,9 +210,12 @@ def transcript_block(turns):
     return "\n".join(lines)
 
 
-def agent_turn(image, phrase, turns, note="", brief=None):
+def agent_turn(image, phrase, turns, note="", brief=None, facts=None):
     prompt = (
         (brief or SYSTEM_BRIEF) +
+        ("Grounded facts from context7 (authoritative — supported "
+         "versions, official images, ports override your priors):\n%s\n"
+         % facts if facts else "") +
         "Base image: %s\nIntent: %s\n%s\n"
         "Command transcript so far (last %d):\n%s\n"
         "Reply with ONE JSON object: "
@@ -350,6 +353,19 @@ def agent_cmd(args):
     turn_no = 0
     infra_streak = 0
     seed_state = {"thread": None, "refs": [], "result": {}}
+    # Grounding before the first turn: the doc facts (supported
+    # versions, official images, ports) replace stale priors — the
+    # Ghost/node class of failure becomes un-navigable.
+    facts = ""
+    try:
+        grounded, c7_ids = vmf_plan.ground_for_app(args.image, args.phrase,
+                                                   role="agent")
+        if grounded.strip():
+            facts = grounded
+            sys.stderr.write("agent: grounded %s\n"
+                             % vmf_llm.grounding_note(c7_ids))
+    except Exception as e:
+        sys.stderr.write("agent: grounding unavailable (%s); priors\n" % e)
 
     def persist():
         if getattr(args, "resume", None):
@@ -378,7 +394,8 @@ def agent_cmd(args):
             note = fail_note
         reply = agent_turn(args.image, args.phrase, turns, note,
                            brief=REPAIR_BRIEF if getattr(
-                               args, "repair", False) else None)
+                               args, "repair", False) else None,
+                           facts=facts or None)
         if reply is None:
             return 1
         persist()
@@ -500,7 +517,8 @@ def agent_cmd(args):
         reply = agent_turn(args.image, args.phrase, turns,
                            "The user instructs: %s\nApply it live "
                            "(run commands), then reply done with the "
-                           "updated plan." % line)
+                           "updated plan." % line,
+                           facts=facts or None)
         if reply is None:
             return 1
         if reply.get("cmd"):

@@ -1269,13 +1269,39 @@ def _norm_phrase(phrase):
     return " ".join(phrase.split()).casefold()
 
 
+def ground_for_app(image, phrase, role="intent"):
+    # One draft + context7 grounding pass for an app name. Shared by the
+    # propose path, the agent session, and the revise loop: the doc
+    # facts (version matrices, official images, ports) replace stale
+    # priors. Returns (grounded_text, c7_ids) — the grounded text is ""
+    # when nothing grounded.
+    draft = ("A user wants to run an intent inside a disposable microVM "
+             "based on the image '%s'. Intent: %s\n"
+             "List up to 3 topics whose CURRENT facts matter (supported "
+             "versions, official container images, install steps, "
+             "prerequisites). Reply "
+             'ONE JSON object: {"lookup": ["<doc topic>"], '
+             '"why": "<max 8 words>"}' % (image, phrase))
+    rc, o, e = vmf_llm.llm_call(role, draft)
+    lookup = []
+    if rc == 0:
+        try:
+            dj = vmf_llm.parse_llm_json(o)
+            lookup = [str(x) for x in (dj.get("lookup") or [])[:3]]
+        except Exception:
+            lookup = []
+    return vmf_llm.ground(lookup, doc_cap=2500)
+
+
 def intent_cache_dir(image, phrase):
     # The verify-revision loop recomputes this path to write a revised
     # plan back; the formula is the intent cache key itself.
     # v5 adds the checks field to direct plans (the verify runner needs
     # the model's own definition of success; tcp checks derive from
-    # declared ports either way).
-    key = hashlib.sha256(("image-intent-v5\n%s\n%s"
+    # declared ports either way). v6 routes to official images first:
+    # the host supplies them, so version-sensitive stacks (Ghost and
+    # node) stop being built from source on a bare OS.
+    key = hashlib.sha256(("image-intent-v6\n%s\n%s"
                           % (image, _norm_phrase(phrase)))
                          .encode()).hexdigest()[:12]
     return os.path.join(os.path.expanduser("~"), ".vmf", "generated",
@@ -1293,32 +1319,38 @@ def intent_cmd(image, phrase, out):
     gen = intent_cache_dir(image, phrase)
     dcache = os.path.join(gen, "direct.json")
     if os.path.isfile(dcache):
-        sys.stderr.write("intent: cache hit %s\n" % dcache)
-        open(out, "w").write(open(dcache).read())
-        return 0
-
-    # Phase 1: draft - which topics need CURRENT docs.
-    draft = ("A user wants to run an intent inside a disposable microVM "
-             "based on the image '%s'. Intent: %s\n"
-             "List up to 3 topics whose CURRENT facts matter (package "
-             "names on registries, install steps, prerequisites). Reply "
-             'ONE JSON object: {"lookup": ["<doc topic>"], '
-             '"why": "<max 8 words>"}' % (image, phrase))
-    rc, o, e = vmf_llm.llm_call("intent", draft)
-    lookup = []
-    if rc == 0:
+        # Cache hygiene: a spec that failed its replay verdict
+        # repeatedly is rejected here — a fresh grounded plan replaces
+        # it instead of the same death loop.
+        meta = {}
         try:
-            dj = vmf_llm.parse_llm_json(o)
-            lookup = [str(x) for x in (dj.get("lookup") or [])[:3]]
-        except Exception:
-            lookup = []
-    grounded, c7_ids = vmf_llm.ground(lookup, doc_cap=2500)
+            meta = json.load(open(dcache + ".meta.json"))
+        except (OSError, ValueError):
+            meta = {}
+        if meta.get("failed", 0) >= 2:
+            sys.stderr.write(
+                "intent: cache rejected (%d failed replays); fresh plan\n"
+                % meta.get("failed", 0))
+        else:
+            sys.stderr.write("intent: cache hit %s\n" % dcache)
+            open(out, "w").write(open(dcache).read())
+            return 0
+
+    # Phase 1: draft + grounding — shared with the agent session and
+    # the revise loop.
+    grounded, c7_ids = ground_for_app(image, phrase)
 
     final = (
         "Plan how to fulfil this intent inside a disposable microVM whose "
         "base image is FIXED: %s (already chosen - do not pick another). "
         "The VM boots, runs the install commands once (network available, "
-        "root shell), then execs the command as PID 1. The image family "
+        "root shell), then execs the command as PID 1. "
+        "ROUTE FIRST: when the grounded facts name an official container "
+        "image for the app, the plan USES it — set needs_docker=true and "
+        "images=[\"<ref>\"]; install only docker setup steps (the host "
+        "supplies the image) and make command/docker run the app. "
+        "Source-install the app only when no official image exists. "
+        "The image family "
         "matters for the package manager (ubuntu/debian: apt; alpine: "
         "apk). Include every prerequisite (e.g. 'pip install uv' before "
         "'uv sync'; curl/repos before npm). List every guest TCP port the "

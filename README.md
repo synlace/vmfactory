@@ -21,6 +21,22 @@ build/             generated output (gitignored)
 
 ## Quickstart
 
+The most grounded mode is a repo: the plan comes from the project's
+own evidence (README, manifests), not from model priors.
+
+```sh
+just run https://github.com/org/repo       # plan -> boot -> verify
+just run https://github.com/org/repo --intent "Run 3 instances"
+```
+
+A plain image with `--intent` is EXPERIMENTAL — the plan is conjured
+from model priors, so version-sensitive apps are safer as a repo, or
+as their official image (the propose route now prefers it):
+
+```sh
+just run --rm ubuntu --intent "nginx on 1337 and 1338"   # experimental
+```
+
 ```sh
 just validate strix     # schema + pins + roles + Dockerfile subset
 just build strix        # generate -> packer build (pinned noble + ansible)
@@ -339,6 +355,11 @@ split into <2GiB parts on the host and the guest concatenates them
 into `docker load`.
 
 ## Intent on a plain image
+
+EXPERIMENTAL: a repo, or the app's official image, carries more
+evidence than a phrase. The propose route now prefers the official
+container image (host-supplied, digest-pinned) when one exists; source
+installs are the fallback.
 
 `--intent` also works without a repo:
 `vmf run ubuntu --intent "Latest version of kilocode CLI"`. The same

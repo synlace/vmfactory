@@ -379,16 +379,37 @@ def revise_cmd(args):
         "guest tcp port the revised app listens on. When the evidence "
         "shows the app was OOM-killed, raise memory_mb to fit the "
         "measured resident size plus 1024 MB of headroom (at most 8192). "
-        "Do not weaken a "
+        "If the grounded facts name an official container image for the "
+        "app, prefer it (needs_docker=true and images=[ref]) over "
+        "rebuilding from source. Do not weaken a "
         "check to match the observed failure unless the evidence proves "
         "the check itself was wrong; prefer fixing the app config. "
         "Reply with ONE JSON object, same shape:\n"
         '{"install": [...], "command": [...], "ports": [...], '
         '"checks": [{"probe": {"port": N, "path": "/", '
         '"expect_status": 200, "expect_contains": "..."}}], '
+        '"images": ["<container images the plan needs>"], '
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int>, "notes": "<max 12 words>"}'
         % (json.dumps(plan, indent=2), json.dumps(evidence, indent=2)))
+    # Grounding for the revise: the doc facts (version matrices,
+    # official images) sit beside the console evidence — the revise
+    # stops re-picking the incompatible version the traceback names.
+    facts = ""
+    if args.image and args.phrase:
+        try:
+            grounded, c7_ids = vmf_plan.ground_for_app(args.image,
+                                                       args.phrase)
+            if grounded.strip():
+                facts = ("Grounded facts from context7 (authoritative — "
+                         "supported versions, official images):\n%s\n"
+                         % grounded)
+                sys.stderr.write("verify: revise grounded %s\n"
+                                 % vmf_llm.grounding_note(c7_ids))
+        except Exception as e:
+            sys.stderr.write("verify: revise grounding unavailable (%s)\n"
+                             % e)
+    prompt = facts + prompt
     rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=200,
                                   env={"VMF_LLM_TIMEOUT": "180"})
     if rc != 0:
