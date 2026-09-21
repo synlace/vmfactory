@@ -41,9 +41,12 @@ SYSTEM_BRIEF = (
     "app serve, then write back the exact recipe. Facts: you are root; "
     "the VM has a fresh base image, no plan yet; the app only needs to "
     "serve IN THE GUEST (host publishing happens on the replay boot). "
-    "Guest tools are minimal: /vmf/busybox provides coreutils + wget; "
-    "install what the app needs. Make installs idempotent (they re-run "
-    "on a fresh VM). When the app serves, reply done=true with the plan:\n"
+    "Run the app as a PLAIN PROCESS in the VM; do not install docker, "
+    "podman or any container runtime — the intent wants the app "
+    "directly. Guest tools are minimal: /vmf/busybox provides coreutils "
+    "+ wget + httpd; install what the app needs. Make installs "
+    "idempotent (they re-run on a fresh VM). When the app serves, reply "
+    "done=true with the plan:\n"
     '{"install": ["<shell, idempotent, run once at boot>"], '
     '"command": ["<argv>"], "ports": [<guest tcp ports>], '
     '"checks": [{"probe": {"port": P, "path": "/", "expect_status": 200, '
@@ -163,7 +166,8 @@ def agent_turn(image, phrase, turns, note=""):
         '"plan": null} — or done=true with the plan filled in.'
         % (image, phrase, note, len(turns[-TRANSCRIPT_CAP:]),
            transcript_block(turns) or "(nothing yet)"))
-    rc, o, err = vmf_llm.llm_call("agent", prompt, timeout=240)
+    rc, o, err = vmf_llm.llm_call("agent", prompt, timeout=240,
+                                  env={"VMF_LLM_TIMEOUT": "220"})
     if rc != 0:
         sys.stderr.write((err or "") + "\nerror: agent needs a reachable "
                                       "model (VMF_AGENT_MODEL)\n")
