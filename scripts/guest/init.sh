@@ -62,29 +62,18 @@ fi
 
 cd "$($BB cat /vmf-run/cwd)"
 # Gap-fill direct mode: the host stages the repo tar and a one-shot
-# install script on the inputs. The VM is the sandbox - the app runs in
-# the rootfs directly, no docker.
+# install script on the inputs. The VM is the sandbox - the app runs
+# in the rootfs directly, no docker.
 if [ -s /vmf-run/repo.tar.gz ]; then
   $BB mkdir -p /workspace
   $BB tar -xzf /vmf-run/repo.tar.gz -C /workspace
   $BB echo "vmf-init: repo staged at /workspace"
 fi
-if [ -s /vmf-run/install.sh ]; then
-  $BB echo "vmf-init: running install.sh"
-  # Non-interactive and stdin-free: base-image packages (tzdata) must
-  # not open debconf dialogs, and the app must never read the console.
-  if DEBIAN_FRONTEND=noninteractive sh /vmf-run/install.sh \
-      </dev/null >/tmp/install.log 2>&1; then
-    $BB echo "vmf-init: install.sh ok"
-  else
-    $BB echo "vmf-init: install.sh FAILED; last lines:" >&2
-    $BB tail -15 /tmp/install.log >&2 || true
-  fi
-  [ -d /workspace ] && cd /workspace
-fi
-# Direct mode with an in-VM docker runtime (gap-fill needs_docker):
-# the host stages the static docker bundle; dockerd serves the app.
+# In-VM docker runtime (needs_docker plans, agent plan VMs): the
+# static bundle is staged; dockerd starts BEFORE install.sh so the
+# install can docker pull/run.
 if [ -s /vmf-run/docker-bundle.tar.gz ]; then
+
   $BB echo "vmf-init: starting in-VM dockerd (direct mode)"
   $BB mkdir -p /data/docker
   $BB tar -xzf /vmf-run/docker-bundle.tar.gz -C /data/docker
@@ -93,6 +82,11 @@ if [ -s /vmf-run/docker-bundle.tar.gz ]; then
   $BB mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
   $BB mkdir -p /data/docker-data /root/.docker/cli-plugins
   $BB ln -sf /data/docker/bin/docker-compose /root/.docker/cli-plugins/docker-compose
+  # PATH shims: ssh sessions and the app see `docker` on the default
+  # PATH; the static binaries live in /data/docker/bin.
+  $BB mkdir -p /usr/local/bin
+  $BB ln -sf /data/docker/bin/docker /usr/local/bin/docker
+  $BB ln -sf /data/docker/bin/docker-compose /usr/local/bin/docker-compose
   # vfs storage: /data sits on the VM's tmpfs overlay, and overlay2 on
   # overlayfs degrades (xattr/redirect_dir fallbacks). vfs is slower
   # but reliable here.
@@ -112,6 +106,19 @@ if [ -s /vmf-run/docker-bundle.tar.gz ]; then
   done
   docker info >/dev/null 2>&1 || \
     $BB echo "vmf-init: dockerd did not come up; see /data/dockerd.log" >&2
+fi
+if [ -s /vmf-run/install.sh ]; then
+  $BB echo "vmf-init: running install.sh"
+  # Non-interactive and stdin-free: base-image packages (tzdata) must
+  # not open debconf dialogs, and the app must never read the console.
+  if DEBIAN_FRONTEND=noninteractive sh /vmf-run/install.sh \
+      </dev/null >/tmp/install.log 2>&1; then
+    $BB echo "vmf-init: install.sh ok"
+  else
+    $BB echo "vmf-init: install.sh FAILED; last lines:" >&2
+    $BB tail -15 /tmp/install.log >&2 || true
+  fi
+  [ -d /workspace ] && cd /workspace
 fi
 # Everything the init itself runs comes from /vmf or shell builtins:
 # distroless bases carry no coreutils and PATH may not reach /bin.

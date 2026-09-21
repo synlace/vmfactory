@@ -471,7 +471,10 @@ if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; the
   if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]]; then
     agent_vm="${name}-planagent"
     echo "intent: agent session on plan VM '$agent_vm' (fallback: propose path)"
-    ( bash "$0" "$image" -d --yes --name "$agent_vm" \
+    # The plan VM carries dockerd: container-native apps start with
+    # docker pull instead of a from-source build (the guest init starts
+    # dockerd whenever the bundle is staged).
+    ( VMF_WANT_DOCKER=1 bash "$0" "$image" -d --yes --name "$agent_vm" \
         --memory "${VMF_AGENT_MEM:-2048}" \
         ${netmode:+--net "$netmode"} \
         ${timeout_spec:+--timeout "$timeout_spec"} \
