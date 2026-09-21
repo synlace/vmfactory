@@ -43,6 +43,7 @@ model="${model:-${VMF_INTENT_MODEL:-${VMF_GAPFILL_MODEL:-${VMF_LLM_MODEL:-}}}}"
 case "${role:-}" in
   intent)  model="${model:-${VMF_INTENT_MODEL:-${VMF_LLM_MODEL:-z-ai/glm-5.3-flash}}}" ;;
   gapfill) model="${model:-${VMF_GAPFILL_MODEL:-${VMF_LLM_MODEL:-z-ai/glm-5.3-flash}}}" ;;
+  agent)   model="${model:-${VMF_AGENT_MODEL:-${VMF_GAPFILL_MODEL:-${VMF_LLM_MODEL:-z-ai/glm-5.3-flash}}}}" ;;
   *)       model="${model:-${VMF_LLM_MODEL:-z-ai/glm-5.3-flash}}" ;;
 esac
 

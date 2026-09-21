@@ -454,10 +454,52 @@ printf '%s\0' "${envs[@]:-}" > "$rundir/envs-nul" 2>/dev/null || : > "$rundir/en
 if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; then
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
   mkdir -p "$rundir"
-  if python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" intent "$image" "$intent" \
-      "$rundir/intent-direct.json"; then
-    intent_plan="$rundir/intent-direct.json"
-    mapfile -t cmd_args < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1]))['command']]" "$intent_plan")
+  intent_plan="$rundir/intent-direct.json"
+  intent_rc=0
+  # Agent session: boot a dedicated plan VM, drive it over ssh until the
+  # app works, write back the demonstrated spec. The gate reviews it.
+  # Falls back to the blind propose path when no agent model is
+  # configured or the budget runs out. A cache hit short-circuits both.
+  if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]]; then
+    cache_dir=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import vmf_plan; print(vmf_plan.intent_cache_dir(sys.argv[2], sys.argv[3]))' "$VMF_SCRIPTS_DIR" "$image" "$intent")
+    if [[ -f "$cache_dir/direct.json" ]]; then
+      echo "intent: cache hit; agent session skipped"
+      cp "$cache_dir/direct.json" "$intent_plan"
+      VMF_INTENT_MODE=plan
+    fi
+  fi
+  if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]]; then
+    agent_vm="${name}-planagent"
+    echo "intent: agent session on plan VM '$agent_vm' (fallback: propose path)"
+    ( bash "$0" "$image" -d --yes --name "$agent_vm" \
+        --memory "${VMF_AGENT_MEM:-2048}" \
+        ${netmode:+--net "$netmode"} \
+        ${timeout_spec:+--timeout "$timeout_spec"} \
+        ${diskcap:+--disk-cap "$diskcap"} \
+        -- /vmf/busybox sleep 100000 ) >>"$RUNS_DIR/$agent_vm.log" 2>&1 || true
+    if python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$agent_vm" \
+        --image "$image" --phrase "$intent" --out "$intent_plan"; then
+      intent_rc=0
+    else
+      intent_rc=$?
+    fi
+    bash "$SCRIPTS_DIR/stop.sh" "$agent_vm" >/dev/null 2>&1 || true
+    case "$intent_rc" in
+      0) ;;
+      2) echo "error: agent plan not approved" >&2; exit 2 ;;
+      *) echo "note: agent session unavailable (rc=$intent_rc); propose path" >&2 ;;
+    esac
+  fi
+  if [[ "$intent_rc" != 0 ]]; then
+    if python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" intent "$image" "$intent" \
+        "$intent_plan"; then
+      :
+    else
+      echo "error: intent planning failed" >&2
+      exit 2
+    fi
+  fi
+  mapfile -t cmd_args < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1]))['command']]" "$intent_plan")
     while IFS=$'\t' read -r k v; do
       [[ -n "$k" ]] && envs+=("$k=$v")
     done < <(python3 - "$intent_plan" <<'PY'
@@ -484,10 +526,6 @@ PY
       mem="$pmb"
     fi
     echo "intent: plan applied to $image (${#cmd_args[@]}-arg command)"
-  else
-    echo "error: intent planning failed" >&2
-    exit 2
-  fi
 fi
 VMF_ENVS_FILE="$rundir/envs-nul" python3 - "$cfg_blob" "$rundir" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
 import json, os, shlex, sys
