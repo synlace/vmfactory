@@ -365,10 +365,34 @@ def agent_cmd(args):
                 sys.stderr.write("agent: VM lost (crash or OOM); aborting\n")
                 return 1
         if reply.get("done"):
-            spec = validate_spec(reply.get("plan") or {}, {})
+            raw_plan = reply.get("plan")
+            if not isinstance(raw_plan, dict):
+                note = ("Your done plan was not a JSON object (got %s). "
+                        "Reply the plan as ONE object with install, "
+                        "command, ports, checks, images, env, "
+                        "needs_docker, memory_mb, notes."
+                        % type(raw_plan).__name__)
+                turns.append({"cmd": "(plan format)",
+                              "out": note[:OUT_CAP]})
+                print("agent:   → plan was %s, not an object; re-asking"
+                      % type(raw_plan).__name__)
+                continue
+            spec = validate_spec(raw_plan, {})
             if spec is None:
                 note = ("Your done had no command; a plan needs a "
                         "non-empty command array.")
+                continue
+            runnable_ports = vmf_plan._clamp_ports(raw_plan.get("ports"))
+            runnable_checks = vmf_plan._clamp_checks(raw_plan.get("checks"))
+            if not runnable_ports and not runnable_checks:
+                note = ("The plan declares no ports and no checks; the "
+                        "acceptance has nothing to verify. Declare the "
+                        "guest tcp port(s) the app serves and one probe "
+                        "per HTTP port (status + distinctive body text), "
+                        "then reply done again.")
+                turns.append({"cmd": "(acceptance)",
+                              "out": note[:OUT_CAP]})
+                print("agent:   → plan declares no checks; re-asking")
                 continue
             ok, failures = guest_acceptance(args.vm, spec)
             if ok:
