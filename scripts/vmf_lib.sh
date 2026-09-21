@@ -66,5 +66,7 @@ vmf_fwd_parse() {
     2) VMF_FWD_HOST="${f[0]}"; VMF_FWD_GUEST="${f[1]}" ;;
     *) return 1 ;;
   esac
-  [[ "$VMF_FWD_BIND" == "0.0.0.0" ]] && VMF_FWD_BIND=""
+  if [[ "$VMF_FWD_BIND" == "0.0.0.0" ]]; then
+    VMF_FWD_BIND=""
+  fi
 }
