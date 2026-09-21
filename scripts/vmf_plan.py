@@ -382,7 +382,7 @@ def gapfill(root, plan_out):
         if not comp["services"]:
             sys.stderr.write("error: gap-filler proposed no usable services\n")
             sys.exit(1)
-        rendered = yaml_safe_dump(comp, sort_keys=False)
+        rendered = yaml_safe_dump(comp, None, sort_keys=False)
         proposal = "gap-filler: proposal (%s)\n%s" \
             % ((pj.get("notes") or "-")[:60], rendered)
         return proposal, comp, rendered, cache
