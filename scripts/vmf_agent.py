@@ -57,6 +57,24 @@ SYSTEM_BRIEF = (
     "body substring). Reply with ONE JSON object only.")
 
 
+def show_cmd(cmd):
+    # Terminal display: multi-line commands shown in full (bounded),
+    # so the session reads like a transcript, not a cut-off.
+    shown = str(cmd)
+    if len(shown) > 400:
+        shown = shown[:400] + " …(+%d chars)" % (len(shown) - 400)
+    print("agent: $ %s" % shown)
+
+
+def show_result(rc, out, err):
+    lines = [l for l in ((out or "") + (err or "")).strip().splitlines()
+             if l.strip()]
+    head = lines[0][:100] if lines else ""
+    tail = (" (%d lines)" % len(lines)) if len(lines) > 1 else ""
+    print("agent:   → rc=%d %s%s" % (rc, head, tail if head else
+                                     "(no output)"))
+
+
 def scripts():
     return os.environ.get("VMF_SCRIPTS_DIR") or \
         os.path.dirname(os.path.abspath(__file__))
@@ -235,7 +253,8 @@ def agent_cmd(args):
             rc, out, err = ssh_exec(args.vm, str(cmd)[:2000])
             turns.append({"cmd": str(cmd)[:300],
                           "out": ("rc=%d\n%s" % (rc, (out + err)[-OUT_CAP:]))})
-            print("agent: $ %s" % str(cmd)[:120])
+            show_cmd(cmd)
+            show_result(rc, out, err)
             if not vm_alive(args.vm) and not reply.get("done"):
                 sys.stderr.write("agent: VM lost (crash or OOM); aborting\n")
                 return 1
@@ -290,6 +309,8 @@ def agent_cmd(args):
             rc, out, err = ssh_exec(args.vm, str(reply["cmd"])[:2000])
             turns.append({"cmd": str(reply["cmd"])[:300],
                           "out": ("rc=%d\n%s" % (rc, (out + err)[-OUT_CAP:]))})
+            show_cmd(reply["cmd"])
+            show_result(rc, out, err)
         if reply.get("done"):
             cand = validate_spec(reply.get("plan") or {}, spec)
             if cand is not None:
