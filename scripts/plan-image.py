@@ -145,11 +145,22 @@ def main():
         else "NOT grounded (context7 unavailable)"
     accept = os.environ.get("VMF_RUN_YES") == "1"
     sys.stderr.write("%s\n  grounding: %s\n" % (proposal_head(plan_text), g))
-    if not accept and sys.stdin.isatty():
-        sys.stderr.write("  boot with this plan? [y/N] ")
+    if not accept:
+        # Prompt on the controlling terminal (stdin may be a pipe); raw
+        # fd I/O - buffered streams misbehave on some ttys.
+        import os as _os
         try:
-            accept = input().strip().lower() in ("y", "yes")
-        except EOFError:
+            fd = _os.open("/dev/tty", _os.O_RDWR)
+            _os.write(fd, b"intent: boot with this plan? [y/N] ")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                c = _os.read(fd, 1)
+                if not c:
+                    break
+                buf += c
+            _os.close(fd)
+            accept = buf.decode().strip().lower() in ("y", "yes")
+        except OSError:
             accept = False
     if not accept:
         sys.stderr.write("intent: not approved; rerun with --yes to accept\n")

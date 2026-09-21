@@ -259,13 +259,28 @@ def gapfill(root):
         g = ("grounded via context7: " + ", ".join(c7_ids[:3])) if c7_ids \
             else "NOT grounded (context7 unavailable)"
         sys.stderr.write(text + "  grounding: %s\n" % g)
-        accept = os.environ.get("VMF_RUN_YES") == "1"
-        if not accept and sys.stdin.isatty():
-            sys.stderr.write("gap-filler: boot with this plan? [y/N] ")
+
+        def tty_ask(prompt):
+            # This script runs with a heredoc stdin; the controlling
+            # terminal is reachable through /dev/tty regardless. Raw fd
+            # I/O: buffered streams misbehave on some ttys.
+            import os
             try:
-                accept = input().strip().lower() in ("y", "yes")
-            except EOFError:
-                accept = False
+                fd = os.open("/dev/tty", os.O_RDWR)
+                os.write(fd, prompt.encode())
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    c = os.read(fd, 1)
+                    if not c:
+                        break
+                    buf += c
+                os.close(fd)
+                return buf.decode().strip().lower() in ("y", "yes")
+            except OSError:
+                return False
+        accept = os.environ.get("VMF_RUN_YES") == "1"
+        if not accept:
+            accept = tty_ask("gap-filler: boot with this plan? [y/N] ")
         if not accept:
             sys.stderr.write("gap-filler: not approved; rerun with --yes to accept\n")
             sys.exit(2)
