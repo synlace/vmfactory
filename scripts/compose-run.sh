@@ -186,6 +186,37 @@ while IFS=$'\t' read -r name kind rest; do
       }
       { print }
     ' "$ctx/$(${JQ[@]} -r --arg n "$name" '.services[] | select(.name==$n) | .build.dockerfile' "$plan_tmp/plan.json")" > "$dockerfile"
+    # COPY --from=<name> images: buildah resolves them from local storage
+    # only. Pre-pull every external ref; refs that name a local build
+    # stage (FROM ... AS <stage>) must not be pulled.
+    stage_names=$("${AWK[@]}" 'tolower($0) ~ /^[[:space:]]*from[[:space:]]/ {
+      for (i = 1; i <= NF; i++) if (tolower($i) == "as" && i < NF) print $(i+1)
+    }' "$dockerfile" | tr '[:upper:]' '[:lower:]')
+    seen_from=""
+    while IFS= read -r ref; do
+      [[ -z "$ref" || "$ref" == \$* ]] && continue
+      lr="$(printf '%s' "$ref" | tr '[:upper:]' '[:lower:]')"
+      skip=0
+      while IFS= read -r s; do [[ -n "$s" && "$s" == "$lr" ]] && skip=1; done <<< "$stage_names"
+      [[ "$skip" == 1 ]] && continue
+      case "$seen_from" in *"|$lr|"*) continue ;; esac
+      seen_from="$seen_from|$lr|"
+      t="${lr%%@*}"; t="${t%%:*}"
+      if [[ "$t" != "scratch" && "$t" != *"/"* && "$t" != *"."* ]]; then
+        lr="docker.io/library/$lr"
+      elif [[ "$lr" == *"/"* ]]; then
+        f1="${lr%%/*}"
+        case "$f1" in localhost|*.*|*:*) ;; *) lr="docker.io/$lr" ;; esac
+      fi
+      echo "compose: pulling stage image ($lr)..."
+      "${BUILD_BIN[@]}" pull "$lr" || true
+    done < <("${AWK[@]}" '{
+      line = $0
+      while (match(line, /--[Ff][Rr][Oo][Mm]=[A-Za-z0-9_.$@:\/-]+/)) {
+        print substr(line, RSTART + 7, RLENGTH - 7)
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }' "$dockerfile")
     build_args=()
     while IFS=$'\t' read -r k v; do
       [[ -n "$k" ]] && build_args+=(--build-arg "$k=$v")
