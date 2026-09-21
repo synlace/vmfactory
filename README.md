@@ -251,12 +251,28 @@ menu entries or the run refuses. `ref` re-clones that branch or tag;
 A repo with no compose file anywhere (strix-style: README + a
 Dockerfile) runs through the gap-filler. It collects deterministic
 evidence (README, Dockerfiles, manifest.yaml, systemd units, package
-files), asks `VMF_GAPFILL_MODEL` for a strict-JSON plan, renders
-compose.yaml itself (the model never writes YAML), and shows the
+files), asks `VMF_GAPFILL_MODEL` for a strict-JSON plan, renders the
+plan itself (the model never writes YAML or files), and shows the
 proposal. Booting requires the interactive `y` prompt or `--yes`.
-Approved proposals cache under `~/.vmf/generated/<input-hash>/` — the
+Approved plans cache under `~/.vmf/generated/<input-hash>/` — the
 same repo replays without a model call. Without a key the gap-filler
 fails with a clear message; nothing is ever generated silently.
+
+Two run shapes come out of the gap-filler:
+
+- `mode: docker` — the compose path (build the repo image, dockerd in
+  the VM, compose up). Container-native repos and multi-service apps.
+- `mode: direct` — the VM is the sandbox. The plan carries a base
+  image, boot-time install commands, and the argv. The host stages the
+  repo tar and install script on the per-run inputs; the guest unpacks
+  to /workspace, runs the install, then execs the app. No docker,
+  fast boot. If the app itself needs a docker daemon at runtime (its
+  plan sets `needs_docker`), the static docker bundle is staged too
+  and dockerd starts in the VM (vfs storage) before the app.
+  `--runtime direct|docker|auto` forces a shape; auto lets the model
+  pick from the evidence. Install failures print their last lines on
+  the console. The install runs at every boot (the tmpfs overlay
+  resets); the approval gate is the supply-chain review point.
 
 Large images: host `mke2fs -d` cannot populate files beyond 2GiB (32-
 bit counter in its populate path), so docker archives over 2GiB are

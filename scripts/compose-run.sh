@@ -235,26 +235,74 @@ def gapfill(root):
         sys.stderr.write("error: no compose file and nothing to infer from "
                          "(no README/Dockerfile/manifests)\n")
         sys.exit(1)
-    key = hashlib.sha256(bundle.encode()).hexdigest()[:12]
+    # Prompt version: part of the cache key, so improved prompts
+    # invalidate stale cached plans.
+    PROMPT_V = "3"
+    key = hashlib.sha256((PROMPT_V + "\n" + bundle).encode()).hexdigest()[:12]
     gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated", key)
     cache = os.path.join(gen, "compose.yaml")
-    if os.path.isfile(cache):
+    runtime = os.environ.get("VMF_RUN_RUNTIME", "auto").strip().lower()
+    if runtime not in ("auto", "direct", "docker"):
+        runtime = "auto"
+    # The cache respects the requested runtime: a docker-mode cache hit
+    # must not hijack a --runtime direct run and vice versa.
+    if runtime in ("auto", "docker") and os.path.isfile(cache):
         sys.stderr.write("gap-filler: cache hit %s\n" % cache)
         shutil.copy(cache, os.path.join(root, "compose.yaml"))
         return
+    dcache = os.path.join(gen, "direct.json")
+    if runtime in ("auto", "direct") and os.path.isfile(dcache):
+        sys.stderr.write("gap-filler: cache hit %s (direct)\n" % dcache)
+        shutil.copy(dcache, os.path.join(os.path.dirname(out), "direct.json"))
+        sys.exit(0)
+    def gate(text):
+        sys.stderr.write(text)
+        accept = os.environ.get("VMF_RUN_YES") == "1"
+        if not accept and sys.stdin.isatty():
+            sys.stderr.write("gap-filler: boot with this plan? [y/N] ")
+            try:
+                accept = input().strip().lower() in ("y", "yes")
+            except EOFError:
+                accept = False
+        if not accept:
+            sys.stderr.write("gap-filler: not approved; rerun with --yes to accept\n")
+            sys.exit(2)
+        return True
+    def save(obj_text, path):
+        os.makedirs(gen, exist_ok=True)
+        open(path, "w").write(obj_text)
+        open(path + ".meta.json", "w").write(json.dumps(
+            {"model": os.environ.get("VMF_GAPFILL_MODEL") or os.environ.get("VMF_LLM_MODEL", ""),
+             "notes": planj.get("notes", ""), "created": ""}, indent=2))
     llm = os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh")
     prompt = (
-        "Build a docker-compose plan for this repository from the evidence "
-        "below. Use ONLY what the evidence shows; never invent image tags, "
-        "ports, or env values. Prefer building from the existing Dockerfile "
-        "(context '.'); one service unless several are evidenced. Leave "
-        "ports empty when unknown: vmf auto-publishes ports the app "
-        "actually listens on.\n"
+        "Decide how to run this repository inside a disposable microVM "
+        "(the VM is the sandbox). Use ONLY the evidence below; never "
+        "invent versions, ports, or env values.\n"
         "Reply with ONE JSON object:\n"
-        '{"services":[{"name":"<short-name>","image":"<ref or null>",'
-        '"build":{"context":".","dockerfile":"<path or null>","args":{}},'
-        '"command":"<string or null>","ports":[], "env":{}}],'
-        '"notes":"<max 12 words>"}\n'
+        '{"mode": "direct" | "docker",\n'
+        ' "base_image": "<oci ref like python:3.12-slim, only for direct>",\n'
+        ' "install": ["<shell commands run once at boot in the VM>"],\n'
+        ' "command": ["<argv that starts the app>"],\n'
+        ' "env": {"K": "V"},\n'
+        ' "needs_docker": <true when the app itself shells out to docker>,\n'
+        ' "services": [<docker shape, only for docker: {"name", "image" or '
+        '"build": {"context", "dockerfile", "args"}, "command", "ports", '
+        '"env"}>],\n'
+        ' "notes": "<max 12 words>"}\n'
+        "mode=direct when the evidence shows a direct install path "
+        "(README install steps, pyproject.toml/package.json etc.) and no "
+        "multi-service dependencies; mode=docker when the repo is "
+        "container-native (compose, Dockerfile-only, multi-service). For "
+        "direct, install the app from the repo source (staged at "
+        "/workspace) unless the README pins an external package. The "
+        "base image is minimal: include prerequisite installs in the "
+        "install list (e.g. 'pip install uv' before 'uv sync'). Leave "
+        "ports empty when unknown - vmf auto-publishes what the app "
+        "listens on. If the app itself needs a docker daemon at runtime "
+        "(sandbox builders, container-based tools), set needs_docker=true "
+        "with mode=direct (vmf starts dockerd in the VM); if the app IS "
+        "container-native, prefer mode=docker instead.\n"
         "Evidence:\n" + bundle[:32768])
     proc = subprocess.run(["bash", os.path.join(os.environ["VMF_SCRIPTS_DIR"], "llm.sh"),
                            "--role", "gapfill", prompt],
@@ -272,6 +320,34 @@ def gapfill(root):
         sys.stderr.write("error: gap-filler returned unparseable JSON:\n%s\n"
                          % proc.stdout[:400])
         sys.exit(1)
+    if runtime == "direct":
+        planj["mode"] = "direct"
+    elif runtime == "docker":
+        planj["mode"] = "docker"
+    if planj.get("mode") == "direct":
+        # Direct mode: base image + boot-time install + argv. The VM is
+        # the sandbox; no docker. The bash layer turns this into a plain
+        # image run with a staged repo tar and install script.
+        base = (planj.get("base_image") or "").strip()
+        cmd = planj.get("command") or []
+        if not base or not cmd:
+            sys.stderr.write("error: gap-fill direct plan lacks base_image or command\n")
+            sys.exit(1)
+        dtext = json.dumps({"base_image": base,
+                            "install": [str(x) for x in (planj.get("install") or [])][:20],
+                            "command": [str(x) for x in cmd][:16],
+                            "env": {str(k): str(v) for k, v in (planj.get("env") or {}).items()},
+                            "needs_docker": bool(planj.get("needs_docker")),
+                            "notes": planj.get("notes", "")}, indent=2)
+        proposal = ("gap-filler: proposal (%s)\nmode: direct\nbase: %s\ninstall:\n%s\ncommand: %s\n"
+                    % ((planj.get("notes") or "-")[:60], base,
+                       "\n".join("  - %s" % i for i in json.loads(dtext)["install"]) or "  - (none)",
+                       cmd))
+        gate(proposal)
+        save(dtext, dcache)
+        shutil.copy(dcache, os.path.join(os.path.dirname(out), "direct.json"))
+        sys.stderr.write("gap-filler: approved; cached %s\n" % dcache)
+        sys.exit(0)
     comp = {"services": {}}
     for s in planj.get("services") or []:
         e = {}
@@ -297,23 +373,9 @@ def gapfill(root):
         sys.stderr.write("error: gap-filler proposed no usable services\n")
         sys.exit(1)
     rendered = yaml.safe_dump(comp, sort_keys=False)
-    sys.stderr.write("gap-filler: proposal (%s)\n%s"
-                     % ((planj.get("notes") or "-")[:60], rendered))
-    accept = os.environ.get("VMF_RUN_YES") == "1"
-    if not accept and sys.stdin.isatty():
-        sys.stderr.write("gap-filler: boot with this compose? [y/N] ")
-        try:
-            accept = input().strip().lower() in ("y", "yes")
-        except EOFError:
-            accept = False
-    if not accept:
-        sys.stderr.write("gap-filler: not approved; rerun with --yes to accept\n")
-        sys.exit(2)
-    os.makedirs(gen, exist_ok=True)
-    open(cache, "w").write(rendered)
-    open(cache + ".meta.json", "w").write(json.dumps(
-        {"model": os.environ.get("VMF_GAPFILL_MODEL") or os.environ.get("VMF_LLM_MODEL", ""),
-         "notes": planj.get("notes", ""), "created": ""}, indent=2))
+    gate("gap-filler: proposal (%s)\n%s"
+         % ((planj.get("notes") or "-")[:60], rendered))
+    save(rendered, cache)
     shutil.copy(cache, os.path.join(root, "compose.yaml"))
     sys.stderr.write("gap-filler: approved; cached %s\n" % cache)
 
@@ -519,6 +581,28 @@ if command -v awk >/dev/null 2>&1; then
 else
   AWK=(nix shell nixpkgs#gawk -c awk)
 fi
+# Gap-fill direct mode: the VM is the sandbox. Run the base image with
+# the resolved argv; the repo tar and the install script ride the
+# per-run inputs (the guest installs at boot, before the app).
+if [[ -f "$plan_tmp/direct.json" ]]; then
+  base=$("${JQ[@]}" -r '.base_image' "$plan_tmp/direct.json")
+  mapfile -t gcmd < <("${JQ[@]}" -r '.command[]' "$plan_tmp/direct.json")
+  ginst=$("${JQ[@]}" -r '.install | join("\n")' "$plan_tmp/direct.json")
+  genv_args=()
+  while IFS=$'\t' read -r k v; do
+    [[ -n "$k" ]] && genv_args+=(-e "$k=$v")
+  done < <("${JQ[@]}" -r '(.env // {}) | to_entries[] | [(.key|tostring), (.value|tostring)] | @tsv' \
+    "$plan_tmp/direct.json")
+  gneed_docker=$("${JQ[@]}" -r '.needs_docker // false' "$plan_tmp/direct.json")
+  echo "gap-fill direct: base=$base command=${gcmd[*]} needs_docker=$gneed_docker"
+  exec env -u VMF_MODE -u VMF_COMPOSE_SRC \
+    VMF_REPO_DIR="$VMF_COMPOSE_SRC" VMF_INSTALL_CMD="$ginst" \
+    ${gneed_docker:+VMF_WANT_DOCKER=1} \
+    "$SCRIPT_DIR/oci-run.sh" \
+    ${genv_args[@]+"${genv_args[@]}"} ${run_args[@]+"${run_args[@]}"} \
+    "$base" ${gcmd[@]+"${gcmd[@]}"}
+fi
+
 svc_count=$("${JQ[@]}" '.services | length' "$plan_tmp/plan.json")
 primary=$("${JQ[@]}" -r '.primary' "$plan_tmp/plan.json")
 PROJ="$VMF_COMPOSE_SRC/$("${JQ[@]}" -r '.project_dir // "."' "$plan_tmp/plan.json")"

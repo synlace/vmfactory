@@ -64,6 +64,7 @@ ports=()
 volumes=()
 envs=()
 expose=""
+runtime=""
 yes_flag=0
 project_hint=""
 intent=""
@@ -97,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     -p|--publish) [[ $# -ge 2 ]] || usage; ports+=("$2"); shift 2 ;;
     --project) [[ $# -ge 2 ]] || usage; project_hint="$2"; shift 2 ;;
     --yes) yes_flag=1; shift ;;
+    --runtime) [[ $# -ge 2 ]] || usage; runtime="$2"; shift 2 ;;
     --intent) [[ $# -ge 2 ]] || usage; intent="$2"; shift 2 ;;
     --expose) [[ $# -ge 2 ]] || usage; expose="$2"; shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
@@ -172,6 +174,7 @@ if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
+  [[ -z "$runtime" ]] || export VMF_RUN_RUNTIME="$runtime"
 elif [[ -d "$image" ]]; then
   # Any local directory: compose-run.sh locates the compose file (root,
   # then a unique subdirectory) and errors clearly when there is none.
@@ -180,6 +183,7 @@ elif [[ -d "$image" ]]; then
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
+  [[ -z "$runtime" ]] || export VMF_RUN_RUNTIME="$runtime"
 fi
 if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
@@ -554,6 +558,27 @@ printf '%s\n' "$name" > "$rundir/hostname"
 printf '%s\n' "$ENGINE" > "$rundir/engine"
 printf '%s\n' "${VMF_MODE:-direct}" > "$rundir/mode"
 printf '%s\n' "$expose_mode" > "$rundir/expose"
+# Gap-fill direct mode: a one-shot install script and the repo tar ride
+# the per-run inputs; the guest stages the repo at /workspace, runs the
+# install at boot, then execs the app. The VM is the sandbox.
+if [[ -n "${VMF_INSTALL_CMD:-}" ]]; then
+  printf '%s\n' "$VMF_INSTALL_CMD" > "$rundir/install.sh"
+  chmod 755 "$rundir/install.sh"
+fi
+if [[ -n "${VMF_REPO_DIR:-}" && -d "${VMF_REPO_DIR:-}" ]]; then
+  echo "staging repo ($VMF_REPO_DIR) into the inputs..."
+  tar -czf "$rundir/repo.tar.gz" -C "$VMF_REPO_DIR" \
+    --exclude=.git --exclude=node_modules --exclude=__pycache__ \
+    --exclude=.venv --exclude=dist .
+fi
+# Direct mode with an in-VM docker runtime (gap-fill needs_docker):
+# stage the static docker bundle; the guest untars it and starts
+# dockerd before the app.
+if [[ "${VMF_WANT_DOCKER:-0}" == "1" ]]; then
+  DB_DIR="${VMF_DOCKER_BUNDLE:-$HOME/.local/share/vmf/docker-bundle}"
+  echo "staging docker bundle into the inputs..."
+  tar -czf "$rundir/docker-bundle.tar.gz" -C "$DB_DIR" bin
+fi
 # Host port pick: 1:1 when the unprivileged slirp bind can take it,
 # otherwise a stable high port (hash of name+want, probed upward). The
 # guest keeps the declared port; only the host-side bind moves.
@@ -674,10 +699,21 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   for f in hostname engine mode expose hostfwd env argv.sh cwd uid; do
     [[ -f "$rundir/$f" ]] && cp "$rundir/$f" "$stage/$f"
   done
+  # Gap-fill direct mode artifacts (written before the engine branches):
+  # copy them into the ext4 inputs; qemu reads the rundir over 9p.
+  for f in install.sh repo.tar.gz docker-bundle.tar.gz; do
+    [[ -f "$rundir/$f" ]] && cp "$rundir/$f" "$stage/$f"
+  done
+  input_extra=0
+  [[ -f "$rundir/repo.tar.gz" ]] && \
+    input_extra=$(($(stat -c%s "$rundir/repo.tar.gz") / 1024 / 1024 + 8))
+  [[ -f "$rundir/docker-bundle.tar.gz" ]] && \
+    input_extra=$(($input_extra + $(stat -c%s "$rundir/docker-bundle.tar.gz") / 1024 / 1024 + 16))
+  input_size=$(( 16 + input_extra ))M
   if command -v mke2fs >/dev/null 2>&1; then
-    mke2fs -q -F -t ext4 -d "$stage" "$rundir/inputs.ext4" 16M
+    mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$rundir/inputs.ext4" "$input_size"
   else
-    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -d "$stage" "$rundir/inputs.ext4" 16M
+    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$rundir/inputs.ext4" "$input_size"
   fi
   rm -rf "$stage"
   rm -f "$RUNS_DIR/$name.log"

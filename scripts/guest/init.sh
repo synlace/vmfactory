@@ -61,6 +61,55 @@ else
 fi
 
 cd "$($BB cat /vmf-run/cwd)"
+# Gap-fill direct mode: the host stages the repo tar and a one-shot
+# install script on the inputs. The VM is the sandbox - the app runs in
+# the rootfs directly, no docker.
+if [ -s /vmf-run/repo.tar.gz ]; then
+  $BB mkdir -p /workspace
+  $BB tar -xzf /vmf-run/repo.tar.gz -C /workspace
+  $BB echo "vmf-init: repo staged at /workspace"
+fi
+if [ -s /vmf-run/install.sh ]; then
+  $BB echo "vmf-init: running install.sh"
+  if sh /vmf-run/install.sh >/tmp/install.log 2>&1; then
+    $BB echo "vmf-init: install.sh ok"
+  else
+    $BB echo "vmf-init: install.sh FAILED; last lines:" >&2
+    $BB tail -15 /tmp/install.log >&2 || true
+  fi
+  [ -d /workspace ] && cd /workspace
+fi
+# Direct mode with an in-VM docker runtime (gap-fill needs_docker):
+# the host stages the static docker bundle; dockerd serves the app.
+if [ -s /vmf-run/docker-bundle.tar.gz ]; then
+  $BB echo "vmf-init: starting in-VM dockerd (direct mode)"
+  $BB mkdir -p /data/docker
+  $BB tar -xzf /vmf-run/docker-bundle.tar.gz -C /data/docker
+  export PATH="/data/docker/bin:$PATH"
+  $BB mkdir -p /sys/fs/cgroup
+  $BB mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+  $BB mkdir -p /data/docker-data /root/.docker/cli-plugins
+  $BB ln -sf /data/docker/bin/docker-compose /root/.docker/cli-plugins/docker-compose
+  # vfs storage: /data sits on the VM's tmpfs overlay, and overlay2 on
+  # overlayfs degrades (xattr/redirect_dir fallbacks). vfs is slower
+  # but reliable here.
+  dockerd --iptables=false --ip6tables=false \
+    --data-root /data/docker-data --storage-driver=vfs \
+    >/data/dockerd.log 2>&1 &
+  i=0
+  while [ "$i" -lt 300 ]; do
+    $BB test -S /var/run/docker.sock && break
+    i=$((i + 1)); $BB sleep 0.1
+  done
+  # The socket appears before the API is ready; wait for a real answer.
+  i=0
+  while [ "$i" -lt 300 ]; do
+    docker info >/dev/null 2>&1 && break
+    i=$((i + 1)); $BB sleep 0.2
+  done
+  docker info >/dev/null 2>&1 || \
+    $BB echo "vmf-init: dockerd did not come up; see /data/dockerd.log" >&2
+fi
 # Everything the init itself runs comes from /vmf or shell builtins:
 # distroless bases carry no coreutils and PATH may not reach /bin.
 eval "set -- $(/vmf/busybox cat /vmf-run/argv.sh)"
