@@ -62,9 +62,10 @@ cleanup() {
 
 hostfwd=""
 while IFS= read -r line; do
-  # 2 fields (legacy): "hport gport" tcp; 3 fields: "proto hport gport".
+  # 2 fields (legacy): "hport gport" tcp; 3 fields: "proto hport gport";
+  # 4 fields: "proto bind hport gport" (bind "" or 0.0.0.0 = all).
   vmf_fwd_parse "$line" || continue
-  hostfwd="$hostfwd,hostfwd=$VMF_FWD_PROTO::$VMF_FWD_HOST-:$VMF_FWD_GUEST"
+  hostfwd="$hostfwd,hostfwd=$VMF_FWD_PROTO:$VMF_FWD_BIND:$VMF_FWD_HOST-:$VMF_FWD_GUEST"
 done < "$VMF_RUNDIR/hostfwd"
 
 serial=(-serial "file:$VMF_CONSOLE")

@@ -305,13 +305,15 @@ fi
 primary_tag="${SVC_TAGS[$primary]}"
 [[ -n "$primary_tag" ]] || primary_tag="${SVC_IMAGES[$primary]}"
 ports_args=()
-while IFS=$'\t' read -r h proto; do
+while IFS=$'\t' read -r h proto bind; do
+  spec="$h:$h"
+  [[ "$bind" != "0.0.0.0" && -n "$bind" ]] && spec="$bind:$h:$h"
   if [[ "$proto" == "udp" ]]; then
-    ports_args+=(-p "$h:$h/udp")
+    ports_args+=(-p "$spec/udp")
   else
-    ports_args+=(-p "$h:$h")
+    ports_args+=(-p "$spec")
   fi
-done < <("${JQ[@]}" -r '.services[] | .ports[]? | [(.host|tostring), .proto] | @tsv' "$plan_tmp/plan.json")
+done < <("${JQ[@]}" -r '.services[] | .ports[]? | [(.host|tostring), .proto, (.bind // "0.0.0.0")] | @tsv' "$plan_tmp/plan.json")
 # Intent-refined instances: extra VM ports are offsets of the service's
 # first declared port; qemu publishes hostfwd only at boot, so they
 # must ride the boot-time -p list (firecracker's poller would cover

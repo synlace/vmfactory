@@ -6,7 +6,7 @@
 #   vmf_tools <pkgs...>       → TOOL=() when all present, else nix prefix + -c
 #   vmf_run <pkgs...> -- <cmd…>  run cmd directly, nix shell pkgs if missing
 # Forward-line parser (the "proto host guest" contract):
-#   vmf_fwd_parse <line>  → VMF_FWD_PROTO VMF_FWD_HOST VMF_FWD_GUEST
+#   vmf_fwd_parse <line>  → VMF_FWD_PROTO VMF_FWD_BIND VMF_FWD_HOST VMF_FWD_GUEST
 #                           (2-field lines are legacy tcp; rc 1 on junk)
 # Source with: . "$(dirname "${BASH_SOURCE[0]}")/vmf_lib.sh"
 
@@ -51,15 +51,20 @@ vmf_run() {
 }
 
 vmf_fwd_parse() {
-  # "host guest" (legacy tcp) or "proto host guest" → VMF_FWD_*
+  # "host guest" (legacy tcp), "proto host guest", or
+  # "proto bind host guest" → VMF_FWD_* (bind "" means all interfaces).
   VMF_FWD_PROTO=tcp
+  VMF_FWD_BIND=""
   VMF_FWD_HOST=""
   VMF_FWD_GUEST=""
   local -a f
   read -r -a f <<<"$1"
   case ${#f[@]} in
+    4) VMF_FWD_PROTO="${f[0]}"; VMF_FWD_BIND="${f[1]}"
+       VMF_FWD_HOST="${f[2]}"; VMF_FWD_GUEST="${f[3]}" ;;
     3) VMF_FWD_PROTO="${f[0]}"; VMF_FWD_HOST="${f[1]}"; VMF_FWD_GUEST="${f[2]}" ;;
     2) VMF_FWD_HOST="${f[0]}"; VMF_FWD_GUEST="${f[1]}" ;;
     *) return 1 ;;
   esac
+  [[ "$VMF_FWD_BIND" == "0.0.0.0" ]] && VMF_FWD_BIND=""
 }

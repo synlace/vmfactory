@@ -787,10 +787,12 @@ for p in "${ports[@]:-}"; do
   if [[ "$spec" == */udp ]]; then proto=udp; spec="${spec%/udp}"
   elif [[ "$spec" == */tcp ]]; then spec="${spec%/tcp}"; fi
   hport="${spec%%:*}"; gport="${spec##*:}"
+  bind=""
+  case "$spec" in *:*:*) bind="${spec%%:*}"; hport="${spec#*:}"; hport="${hport%%:*}" ;; esac
   rport=$(pick_host_port "$name" "$hport")
   [[ "$rport" != "$hport" ]] && \
-    echo "note: host port $hport unavailable; '$name' port $gport published on 127.0.0.1:$rport" >&2
-  printf '%s %s %s\n' "$proto" "$rport" "$gport" >> "$rundir/hostfwd"
+    echo "note: host port $hport unavailable; '$name' port $gport published on ${bind:-127.0.0.1}:$rport" >&2
+  printf '%s %s %s %s\n' "$proto" "${bind:-0.0.0.0}" "$rport" "$gport" >> "$rundir/hostfwd"
 done
 
 # Verify stage (qemu/firecracker, detached runs): run the plan's checks

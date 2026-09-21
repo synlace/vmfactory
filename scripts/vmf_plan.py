@@ -486,12 +486,21 @@ def translate(compose_path, src, root):
                     sys.stderr.write("warning: port '%s' for %s: unknown proto; skipped\n" % (pv, name))
                     continue
             parts = pv.split(":")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[-1].isdigit():
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
                 # compose "HOST:CONTAINER": the VM side listens on HOST and a
                 # socat forward bridges HOST -> the container port; the
                 # slirp hostfwd maps host:HOST -> vm:HOST.
                 ports.append({"host": int(parts[0]),
-                              "cport": int(parts[-1]), "proto": proto})
+                              "cport": int(parts[1]), "proto": proto})
+            elif (len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()
+                  and (parts[0] == "" or _is_ipv4(parts[0]))):
+                # compose "[ADDR:]HOST:CONTAINER": an empty or 0.0.0.0
+                # address binds all host interfaces, an IPv4 literal binds
+                # that one ("127.0.0.1:4280:80" -> localhost only).
+                bind = parts[0] or "0.0.0.0"
+                ports.append({"host": int(parts[1]),
+                              "cport": int(parts[2]), "proto": proto,
+                              "bind": bind})
             else:
                 sys.stderr.write("warning: port '%s' for %s is guest-only or an unsupported form; not published\n" % (pv, name))
         e["ports"] = ports
@@ -930,6 +939,17 @@ def _human_size(n):
         if n >= div:
             return "%.1f %s" % (n / div, unit)
     return "%d B" % n
+
+
+def _is_ipv4(text):
+    # Dotted quad with decimal octets 0..255; no socket import needed.
+    parts = text.split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or not 0 <= int(p) <= 255:
+            return False
+    return True
 
 
 def _iso_evidence(path):

@@ -20,17 +20,25 @@ def run_bash(script):
 
 class FwdParse(unittest.TestCase):
     def _fields(self, line):
-        proc = run_bash('vmf_fwd_parse %s; echo "$VMF_FWD_PROTO|$VMF_FWD_HOST|$VMF_FWD_GUEST"'
+        proc = run_bash('vmf_fwd_parse %s; echo "$VMF_FWD_PROTO|$VMF_FWD_BIND|$VMF_FWD_HOST|$VMF_FWD_GUEST"'
                         % ("'%s'" % line if line else "''"))
         return proc
 
     def test_two_field_legacy_tcp(self):
         out = self._fields("8080 80").stdout.strip()
-        self.assertEqual(out, "tcp|8080|80")
+        self.assertEqual(out, "tcp||8080|80")
 
     def test_three_field_proto(self):
         out = self._fields("udp 53 53").stdout.strip()
-        self.assertEqual(out, "udp|53|53")
+        self.assertEqual(out, "udp||53|53")
+
+    def test_four_field_bind(self):
+        out = self._fields("tcp 127.0.0.1 4280 80").stdout.strip()
+        self.assertEqual(out, "tcp|127.0.0.1|4280|80")
+
+    def test_four_field_bind_all_collapses(self):
+        out = self._fields("tcp 0.0.0.0 4280 80").stdout.strip()
+        self.assertEqual(out, "tcp||4280|80")
 
     def test_blank_is_rc1(self):
         proc = self._fields("")
