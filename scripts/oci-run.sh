@@ -395,6 +395,42 @@ done
 # multiple -e flags into one entry.
 mkdir -p "$rundir"
 printf '%s\0' "${envs[@]:-}" > "$rundir/envs-nul" 2>/dev/null || : > "$rundir/envs-nul"
+# Image-intent mode: --intent on a plain image (no repo, no command).
+# The intent becomes a direct-mode setup plan (install + argv) via the
+# draft -> context7 -> finalize flow; the gate reviews it. The VM is
+# the sandbox; the plan rides the per-run inputs like the repo gap-fill.
+if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; then
+  [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
+  mkdir -p "$rundir"
+  if python3 "$(cd "$(dirname "$0")" && pwd)/plan-image.py" "$image" "$intent" \
+      "$rundir/intent-direct.json"; then
+    intent_plan="$rundir/intent-direct.json"
+    mapfile -t cmd_args < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1]))['command']]" "$intent_plan")
+    while IFS=$'\t' read -r k v; do
+      [[ -n "$k" ]] && envs+=("$k=$v")
+    done < <(python3 - "$intent_plan" <<'PY'
+import json, sys
+for k, v in json.load(open(sys.argv[1])).get("env", {}).items():
+    print("%s\t%s" % (k, v))
+PY
+)
+    if [[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('needs_docker',False))" "$intent_plan")" == "True" ]]; then
+      VMF_WANT_DOCKER=1
+    fi
+    VMF_INSTALL_CMD="$(python3 -c "import json,sys;print('\n'.join(json.load(open(sys.argv[1])).get('install',[])))" "$intent_plan")"
+    export VMF_INSTALL_CMD
+    # Plan sizing: raise the VM memory when the plan asks for more and
+    # the user gave no explicit --memory (an explicit flag always wins).
+    pmb="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('memory_mb',0))" "$intent_plan")"
+    if [[ -n "$pmb" && "$pmb" -gt 0 && -z "${mem:-}" ]]; then
+      mem="$pmb"
+    fi
+    echo "intent: plan applied to $image (${#cmd_args[@]}-arg command)"
+  else
+    echo "error: intent planning failed" >&2
+    exit 2
+  fi
+fi
 VMF_ENVS_FILE="$rundir/envs-nul" python3 - "$cfg_blob" "$rundir" ${cmd_args[@]+"${cmd_args[@]}"} <<'PYEOF' >/dev/null
 import json, os, shlex, sys
 

@@ -290,6 +290,20 @@ bit counter in its populate path), so docker archives over 2GiB are
 split into <2GiB parts on the host and the guest concatenates them
 into `docker load`.
 
+## Intent on a plain image
+
+`--intent` also works without a repo:
+`vmf run ubuntu --intent "Latest version of kilocode CLI"`. The same
+draft -> context7 -> finalize flow produces a setup plan (install
+commands, argv, env, `needs_docker`, `memory_mb`) for the FIXED base
+image; the gate reviews it (package names and installer URLs visible,
+grounding provenance printed); the plan caches by image+phrase and
+sizes the VM memory when the app needs more than 1024 MB. The VM then
+boots, runs the install non-interactively (DEBIAN_FRONTEND, stdin
+closed), and execs the app — interactive CLIs paint their TUI on the
+console in foreground runs, or use `-d` + `vmf ssh`. "Latest" resolves
+at install time inside the VM; the image is digest-pinned as usual.
+
 The compose file is found at the repo root or in a unique subdirectory
 (two levels deep). The translation is deterministic (no LLM on the
 happy path): services, image|build (context, dockerfile, args), ports

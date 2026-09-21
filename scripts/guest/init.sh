@@ -71,7 +71,10 @@ if [ -s /vmf-run/repo.tar.gz ]; then
 fi
 if [ -s /vmf-run/install.sh ]; then
   $BB echo "vmf-init: running install.sh"
-  if sh /vmf-run/install.sh >/tmp/install.log 2>&1; then
+  # Non-interactive and stdin-free: base-image packages (tzdata) must
+  # not open debconf dialogs, and the app must never read the console.
+  if DEBIAN_FRONTEND=noninteractive sh /vmf-run/install.sh \
+      </dev/null >/tmp/install.log 2>&1; then
     $BB echo "vmf-init: install.sh ok"
   else
     $BB echo "vmf-init: install.sh FAILED; last lines:" >&2
