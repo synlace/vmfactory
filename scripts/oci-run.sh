@@ -90,6 +90,9 @@ cmd_args=()
 # Needed by the compose handoff, which runs before the later defaults.
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
+# The verify stage re-execs this script with the original argv to boot
+# the revised plan; capture before the parse loop consumes it.
+orig_args=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -691,6 +694,48 @@ for p in "${ports[@]:-}"; do
   printf '%s %s %s\n' "$proto" "$rport" "$gport" >> "$rundir/hostfwd"
 done
 
+# Verify stage (qemu/firecracker, detached runs): run the plan's checks
+# against the booted VM, print the verdict, and on failure feed the
+# evidence to one bounded plan revision, then reboot with the revised
+# plan. Compose-mode runs carry no plan.json in the rundir, so their
+# verdict arrives with the orchestrator slice.
+vmf_verify_stage() {
+  [[ "$detach" -eq 1 && "$ssh" -eq 1 ]] || return 0
+  [[ "${VMF_VERIFY:-1}" == "1" ]] || return 0
+  local vplan=""
+  for f in "$rundir/intent-direct.json" "$rundir/direct.json"; do
+    [[ -f "$f" ]] && { vplan="$f"; break; }
+  done
+  [[ -n "$vplan" ]] || return 0
+  local turn="${VMF_VERIFY_TURN:-1}" vrc=0
+  python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
+    --hostfwd "$rundir/hostfwd" \
+    --evidence-out "$rundir/verify-evidence.json" || vrc=$?
+  if [[ "$vrc" -ne 1 || "$turn" -ge "${VMF_VERIFY_TURNS:-2}" ]]; then
+    return 0
+  fi
+  if [[ -z "$intent" ]]; then
+    echo "verify: checks failed; auto-revision needs an --intent run (phrase)"
+    return 0
+  fi
+  echo "verify: revising the plan from check evidence..."
+  local revised="$rundir/verify-revised.json"
+  rm -f "$revised"
+  if ! VMF_RUN_YES=1 python3 "$SCRIPTS_DIR/vmf_verify.py" revise "$vplan" \
+      "$revised" --image "$image" --phrase "$intent"; then
+    echo "verify: revision not applied; the failed verdict stands"
+    return 0
+  fi
+  echo "verify: turn $((turn + 1)): rebooting with the revised plan..."
+  # A CHILD process, not exec: the rundir name embeds the shell PID
+  # ($$), and exec keeps the PID — the old VM's teardown would then
+  # delete this run's rundir mid-boot. A child gets a fresh PID, a
+  # fresh rundir, and the old teardown race disappears.
+  VMF_VERIFY_TURN=$((turn + 1)) VMF_RUN_YES=1 bash "$0" \
+    ${orig_args[@]+"${orig_args[@]}"}
+  exit $?
+}
+
 if [[ "$ENGINE" == "qemu" ]]; then
   ensure_microvm_assets
   for v in "${volumes[@]:-}"; do
@@ -709,6 +754,7 @@ if [[ "$ENGINE" == "qemu" ]]; then
   if [[ "$detach" -eq 1 ]]; then
     echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
     echo "ssh: just ssh $name   stop: just stop $name"
+    vmf_verify_stage
   fi
   exit 0
 fi
@@ -798,6 +844,7 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   if [[ "$detach" -eq 1 ]]; then
     echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
     echo "ssh: just ssh $name   stop: just stop $name"
+    vmf_verify_stage
   fi
   exit 0
 fi

@@ -202,10 +202,10 @@ def gapfill(root, plan_out):
                          "(no README/Dockerfile/manifests)\n")
         sys.exit(1)
     # Prompt version: part of the cache key, so improved prompts
-    # invalidate stale cached plans. v5 adds the ports field to direct
-    # plans (qemu publishes hostfwd only at boot; ports must be known
-    # at plan time).
-    PROMPT_V = "5"
+    # invalidate stale cached plans. v6 adds the checks field to direct
+    # plans (the verify runner needs the model's own definition of
+    # success; tcp checks derive from declared ports either way).
+    PROMPT_V = "6"
     key = hashlib.sha256((PROMPT_V + "\n" + bundle).encode()).hexdigest()[:12]
     gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated", key)
     cache = os.path.join(gen, "compose.yaml")
@@ -270,6 +270,8 @@ def gapfill(root, plan_out):
         ' "install": ["<shell commands run once at boot in the VM>"],\n'
         ' "command": ["<argv that starts the app>"],\n'
         ' "ports": [<guest tcp ports the app listens on, e.g. 8080>],\n'
+        ' "checks": [{"probe": {"port": 8080, "path": "/", '
+        '"expect_status": 200, "expect_contains": "<optional text>"}}],\n'
         ' "env": {"K": "V"},\n'
         ' "needs_docker": <true when the app itself shells out to docker>,\n'
         ' "services": [<docker shape, only for docker: {"name", "image" or '
@@ -289,7 +291,11 @@ def gapfill(root, plan_out):
         "1:1. If the app itself needs a docker daemon at runtime "
         "(sandbox builders, container-based tools), set needs_docker=true "
         "with mode=direct (vmf starts dockerd in the VM); if the app IS "
-        "container-native, prefer mode=docker instead.\n"
+        "container-native, prefer mode=docker instead. Declare success "
+        "checks for direct mode: one probe per HTTP-serving port whose "
+        "status (and, when a specific content proves it, body text) says "
+        "the app works; tcp checks for declared ports are added "
+        "automatically. At most 4 checks.\n"
         + grounded +
         "Evidence:\n" + bundle[:32768])
 
@@ -331,6 +337,7 @@ def gapfill(root, plan_out):
                                 "install": [str(x) for x in (pj.get("install") or [])][:20],
                                 "command": [str(x) for x in cmd][:16],
                                 "ports": _clamp_ports(pj.get("ports")),
+                                "checks": _clamp_checks(pj.get("checks")),
                                 "env": {str(k): str(v) for k, v in (pj.get("env") or {}).items()},
                                 "needs_docker": bool(pj.get("needs_docker")),
                                 "notes": pj.get("notes", "")}, indent=2)
@@ -1146,6 +1153,50 @@ def _clamp_ports(raw):
     return ports
 
 
+def _clamp_checks(raw):
+    # Model-declared success checks for direct plans. Bounded vocabulary:
+    # probe and exec only — tcp checks are derived from declared ports
+    # (a declared fact, never a model opinion), and log/rfb arrive later
+    # with their runners. Junk is dropped, not guessed.
+    out, dropped = [], 0
+    for c in (raw or [])[:6]:
+        if isinstance(c, dict) and isinstance(c.get("probe"), dict):
+            p = c["probe"]
+            try:
+                port = int(p.get("port"))
+            except (TypeError, ValueError):
+                dropped += 1
+                continue
+            if not (1 <= port <= 65535):
+                dropped += 1
+                continue
+            e = {"probe": {"port": port}}
+            path = p.get("path")
+            if isinstance(path, str) and path.startswith("/"):
+                e["probe"]["path"] = path[:200]
+            st = p.get("expect_status")
+            if isinstance(st, int) and 100 <= st <= 599:
+                e["probe"]["expect_status"] = st
+            ec = p.get("expect_contains")
+            if isinstance(ec, str) and ec:
+                e["probe"]["expect_contains"] = ec[:200]
+            if e not in out:
+                out.append(e)
+        elif isinstance(c, dict) and isinstance(c.get("exec"), dict):
+            cmd = c["exec"].get("cmd")
+            if isinstance(cmd, str) and cmd.strip():
+                e = {"exec": {"cmd": cmd.strip()[:300]}}
+                if e not in out:
+                    out.append(e)
+            else:
+                dropped += 1
+        elif isinstance(c, dict) and c:
+            dropped += 1
+    if dropped:
+        sys.stderr.write("note: %d check(s) dropped (probe|exec only)\n" % dropped)
+    return out
+
+
 def proposal_head(text):
     j = json.loads(text)
     lines = ["  install:"]
@@ -1153,6 +1204,16 @@ def proposal_head(text):
     lines.append("  command: %s" % j["command"])
     if j.get("ports"):
         lines.append("  ports: %s" % " ".join(str(p) for p in j["ports"]))
+    for c in j.get("checks") or []:
+        if "probe" in c:
+            p = c["probe"]
+            d = "http %d%s -> %s" % (p["port"], p.get("path", "/"),
+                                     p.get("expect_status", 200))
+            if p.get("expect_contains"):
+                d += " (%s)" % p["expect_contains"]
+            lines.append("  check: %s" % d)
+        elif "exec" in c:
+            lines.append("  check: exec %s" % c["exec"]["cmd"])
     lines.append("  env: %s" % (j["env"] or "-"))
     lines.append("  needs_docker: %s" % j["needs_docker"])
     lines.append("  notes: %s" % (j["notes"] or "-"))
@@ -1165,6 +1226,19 @@ def _norm_phrase(phrase):
     return " ".join(phrase.split()).casefold()
 
 
+def intent_cache_dir(image, phrase):
+    # The verify-revision loop recomputes this path to write a revised
+    # plan back; the formula is the intent cache key itself.
+    # v5 adds the checks field to direct plans (the verify runner needs
+    # the model's own definition of success; tcp checks derive from
+    # declared ports either way).
+    key = hashlib.sha256(("image-intent-v5\n%s\n%s"
+                          % (image, _norm_phrase(phrase)))
+                         .encode()).hexdigest()[:12]
+    return os.path.join(os.path.expanduser("~"), ".vmf", "generated",
+                        "img-" + key)
+
+
 def intent_cmd(image, phrase, out):
     # --intent on a plain image: the phrase becomes a direct-mode setup
     # plan (install + argv) through the three-phase flow. The base
@@ -1173,11 +1247,7 @@ def intent_cmd(image, phrase, out):
     # hit replays without any LLM call.
     # Exit codes: 0 planned · 1 bad output · 2 not approved · 3 unreachable
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    key = hashlib.sha256(("image-intent-v4\n%s\n%s"
-                          % (image, _norm_phrase(phrase)))
-                         .encode()).hexdigest()[:12]
-    gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated",
-                       "img-" + key)
+    gen = intent_cache_dir(image, phrase)
     dcache = os.path.join(gen, "direct.json")
     if os.path.isfile(dcache):
         sys.stderr.write("intent: cache hit %s\n" % dcache)
@@ -1210,12 +1280,18 @@ def intent_cmd(image, phrase, out):
         "apk). Include every prerequisite (e.g. 'pip install uv' before "
         "'uv sync'; curl/repos before npm). List every guest TCP port the "
         "app will listen on (from the intent phrase or the app's default "
-        "config); the host publishes each one 1:1. Size the VM: modern "
+        "config); the host publishes each one 1:1. Declare success "
+        "checks: one probe per HTTP-serving port whose status (and, when "
+        "a specific content proves it, body text) says the app works; "
+        "tcp checks for declared ports are added automatically. At most "
+        "4 checks. Size the VM: modern "
         "CLIs and TUIs often need more than the 1024 MB default. Reply "
         "with ONE JSON object:\n"
         '{"install": ["<shell commands run once at boot>"], '
         '"command": ["<argv that starts the app>"], '
         '"ports": [<guest tcp port, e.g. 1337>], '
+        '"checks": [{"probe": {"port": 1337, "path": "/", '
+        '"expect_status": 200, "expect_contains": "<optional text>"}}], '
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int vm ram, 1024-8192>, '
         '"notes": "<max 12 words>"}\n'
@@ -1253,6 +1329,7 @@ def intent_cmd(image, phrase, out):
             return 1
         payload = {"install": install, "command": cmd,
                    "ports": _clamp_ports(plan.get("ports")),
+                   "checks": _clamp_checks(plan.get("checks")),
                    "env": {str(k): str(v)
                            for k, v in (plan.get("env") or {}).items()},
                    "needs_docker": bool(plan.get("needs_docker")),

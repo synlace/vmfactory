@@ -13,7 +13,9 @@ schemas/           spec JSON schema
 specs/*.yaml       one box per spec
 docker/            Dockerfiles consumed via provision.dockerfile
 roles/             shared Ansible roles (platform first: common, docker, pipx)
-scripts/           generate.py, validate.py, boot.sh, enter.sh, vmf_lib.py
+scripts/           generate.py, validate.py, boot.sh, enter.sh, vmf_lib.py,
+                   vmf_plan.py (the plan pipeline), vmf_llm.py (the LLM seam),
+                   vmf_verify.py (the verify runner)
 build/             generated output (gitignored)
 ```
 
@@ -349,6 +351,38 @@ boots, runs the install non-interactively (DEBIAN_FRONTEND, stdin
 closed), and execs the app — interactive CLIs paint their TUI on the
 console in foreground runs, or use `-d` + `vmf ssh`. "Latest" resolves
 at install time inside the VM; the image is digest-pinned as usual.
+The plan also declares success checks (a probe per HTTP-serving port);
+the verify stage below runs them after boot.
+
+## Verify: checks, verdict, self-healing revision
+
+Detached runs with an intent (direct plan) verify themselves after
+boot. Every declared guest port gets a deterministic tcp check — a
+declared fact, never a model opinion. The plan may also declare probe
+checks (HTTP status, and body text when the content proves success)
+and exec checks (a command that exits 0 inside the guest). log and rfb
+checks print `SKIP` until their runners arrive.
+
+The runner polls until each check passes or the deadline expires
+(120s; `VMF_VERIFY_SECS`), then prints a verdict line:
+`verdict: 6/6 checks pass`. This closes the "up but broken" gap: a VM
+that boots and publishes ports but serves the wrong content fails its
+verdict with evidence (expected vs actual status, body head, exit
+codes).
+
+A failed verdict triggers one bounded revision: the evidence feeds the
+model, the revised plan validates against the same bounded vocabulary
+(idempotent install, clamped ports, probe/exec checks only), and the
+gate applies it — auto-applied on detached runs, prompted on a
+terminal, and a declined gate keeps the failed verdict. Applying
+reboots the VM with the revised plan and verifies again (one turn;
+`VMF_VERIFY_TURNS` caps the loop). The revised plan writes back into
+the intent cache, so the same image+phrase replays the fix instead of
+the failure.
+
+Detached runs are the verify scope: foreground runs hold the console,
+and compose-mode runs carry no plan in the rundir, so their verdict
+arrives with the orchestrator slice. `VMF_VERIFY=0` skips the stage.
 
 `--intent` also refines a resolved plan when the run has one project
 (or a cached gap-fill plan): the phrase is unbounded free text, and it

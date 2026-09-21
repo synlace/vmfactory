@@ -104,13 +104,18 @@ class IntentCmd(unittest.TestCase):
         self.assertEqual(plan["ports"], [1337])
         self.assertEqual(plan["memory_mb"], 2048)
         self.assertEqual(plan["base_image"], "")
-        # cache exists under the redirected HOME
-        import hashlib
-        norm = " ".join("install the kilo cli".split()).casefold()
-        key = hashlib.sha256(("image-intent-v4\nubuntu\n%s" % norm)
-                             .encode()).hexdigest()[:12]
-        self.assertTrue(os.path.isfile(os.path.join(
-            home, ".vmf", "generated", "img-" + key, "direct.json")))
+        # cache exists under the redirected HOME (the key formula lives
+        # in vmf_plan.intent_cache_dir; the verify-revision loop shares
+        # it). The helper reads HOME, so point it at the sandbox first.
+        real_home = os.environ["HOME"]
+        os.environ["HOME"] = home
+        try:
+            cached = os.path.join(
+                vmf_plan.intent_cache_dir("ubuntu", "install the kilo cli"),
+                "direct.json")
+        finally:
+            os.environ["HOME"] = real_home
+        self.assertTrue(os.path.isfile(cached))
         # second run: cache hit, stub not called again
         n = int(open(calls).read())
         proc2 = self._plan(home, "ubuntu", "install the kilo cli", out,
