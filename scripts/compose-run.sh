@@ -34,7 +34,13 @@ export VMF_SCRIPTS_DIR="$SCRIPT_DIR"
 # shellcheck source=vmf_lib.sh
 . "$SCRIPT_DIR/vmf_lib.sh"
 
-tag_for() { printf 'localhost/vmf-compose/%s-%s:%s' "$VMF_COMPOSE_SLUG" "$1" "$VMF_COMPOSE_RUNID"; }
+# OCI reference components must be lowercase with single separators
+# ("OpenStock" from a repo name is not a valid tag fragment).
+ref_component() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9._-]/-/g' -e 's/[-._][-._]*/-/g' -e 's/^[-._]*//' -e 's/[-._]*$//'
+}
+tag_for() { printf 'localhost/vmf-compose/%s-%s:%s' "$(ref_component "$VMF_COMPOSE_SLUG")" "$(ref_component "$1")" "$VMF_COMPOSE_RUNID"; }
 
 vmf_tool buildah krunvm buildah
 BUILD_BIN=("${TOOL[@]}")
