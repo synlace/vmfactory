@@ -389,14 +389,14 @@ def revise_cmd(args):
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int>, "notes": "<max 12 words>"}'
         % (json.dumps(plan, indent=2), json.dumps(evidence, indent=2)))
-    rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=330,
-                                  env={"VMF_LLM_TIMEOUT": "300"})
+    rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=200,
+                                  env={"VMF_LLM_TIMEOUT": "180"})
     if rc != 0:
         # One retry: a stalled stream (curl 28 with a partial body) is a
         # provider hiccup, not a missing model — the evidence is worth
         # one more attempt before the verdict stands.
-        rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=330,
-                                      env={"VMF_LLM_TIMEOUT": "300"})
+        rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=200,
+                                      env={"VMF_LLM_TIMEOUT": "180"})
     if rc != 0:
         sys.stderr.write(err or "")
         sys.stderr.write("error: verify revision needs a reachable model\n")
