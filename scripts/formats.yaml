@@ -1,0 +1,35 @@
+# formats.yaml — evidence-based VM profiles.
+#
+# The profile ladder: evidence first (ISO volume label, OVF
+# declarations), then this table, then the model — which may only
+# SELECT a row here, never invent values. `unknown-disk` and
+# `default-linux` are stated defaults, not guesses; the profile line
+# always names its source (evidence | default).
+#
+# Override any of these at run time: --ram, --disk, --cpus, --firmware,
+# --display.
+windows-install:
+  ram: 6144
+  disk: 64G
+  firmware: uefi
+  display: webvnc
+linux-live:
+  ram: 2048
+  disk: 8G
+  display: webvnc
+default-linux:
+  ram: 2048
+  disk: 8G
+  display: webvnc
+unknown-disk:
+  ram: 1024
+  disk: as-is
+  display: none
+image-default:
+  ram: 1024
+  disk: 4G
+  display: none
+box-default:
+  ram: 1024
+  disk: 10G
+  display: none

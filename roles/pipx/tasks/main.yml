@@ -1,0 +1,12 @@
+- name: Install pipx
+  ansible.builtin.package:
+    name: "{{ vmf_packages }}"
+    state: present
+
+- name: System-wide pipx environment
+  ansible.builtin.copy:
+    dest: /etc/profile.d/vmf-pipx.sh
+    mode: "0644"
+    content: |
+      export PIPX_HOME=/opt/pipx
+      export PIPX_BIN_DIR=/usr/local/bin

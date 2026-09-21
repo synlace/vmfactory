@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# vmf — the microVM factory CLI. Context-aware dispatcher over the vmf
+# scripts. Contexts live in ~/.vmf/contexts/<name>.conf; the current one
+# is named by ~/.vmf/context (or $VMF_CONTEXT). Every verb runs locally
+# today; provider contexts are config-first and fail with a clear error
+# until the cloud backend exists.
+#
+# Verbs:
+#   run IMAGE [cmd...]     docker-style microVM run (see: vmf run --help)
+#   ssh NAME [cmd...]      shell or one-shot command in a running VM/box
+#   stop NAME              stop + tear down a VM/box
+#   ps [--json]            running/known microVMs
+#   logs NAME [-f] [N]     console log of a microVM
+#   pin ls [--json]        digest pins (TOFU)
+#   context ...            context add/use/ls/current/remove
+#   login URL              provider auth (not implemented yet)
+set -euo pipefail
+
+VMF_HOME="${VMF_HOME:-$HOME/.vmf}"
+# Resolve symlinks so an installed `vmf` (e.g. ~/.local/bin/vmf) finds
+# the scripts next to the real binary.
+vmf_src="${BASH_SOURCE[0]}"
+while [[ -L "$vmf_src" ]]; do
+  vmf_src="$(readlink "$vmf_src")"
+done
+VMF_SCRIPTS="$(cd "$(dirname "$vmf_src")/../scripts" && pwd)"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: vmf <command> [args]
+
+  run IMAGE [cmd...]    run an OCI image as a disposable microVM
+  ssh NAME [cmd...]     shell or one-shot command in a running VM or box
+  stop NAME             stop and tear down a VM or box
+  ps [--json]           list microVMs (engine, state, ssh port, ports)
+  logs NAME [-f] [N]    console log of a microVM
+  url NAME [PORT]       reach addresses for published ports
+  pin ls [--json]       digest pins (TOFU)
+  context ls|use|current|add|remove   manage contexts
+  login URL             provider auth (not implemented yet)
+
+Contexts: ~/.vmf/context names the active context; --context env
+VMF_CONTEXT overrides. Local contexts set their own engine
+(qemu|krunvm) and state directory; provider contexts fail with a clear
+error until a backend exists.
+EOF
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  context) exec "$VMF_SCRIPTS/context.sh" "$@" ;;
+esac
+
+# Resolve the active context.
+ctx="${VMF_CONTEXT:-}"
+if [[ -z "$ctx" && -f "$VMF_HOME/context" ]]; then
+  ctx="$(cat "$VMF_HOME/context")"
+fi
+ctx="${ctx:-default}"
+ctxconf="$VMF_HOME/contexts/$ctx.conf"
+
+if [[ -f "$ctxconf" ]]; then
+  # shellcheck source=/dev/null
+  source "$ctxconf"
+  TYPE="${TYPE:-local}"
+  if [[ "$TYPE" != "local" ]]; then
+    echo "error: context '$ctx' is a provider context; provider backends are not implemented yet" >&2
+    exit 3
+  fi
+  case "${ENGINE:-}" in
+    ""|qemu|krunvm|firecracker) export VMF_ENGINE="${VMF_ENGINE:-$ENGINE}" ;;
+    *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
+  esac
+  if [[ "$ctx" != "default" ]]; then
+    # Context-scoped state; the default context keeps the global runs
+    # directory for compatibility with the justfile flows.
+    export VMF_RUNS="${VMF_RUNS:-$VMF_HOME/contexts/$ctx/runs}"
+  fi
+elif [[ "$ctx" != "default" ]]; then
+  echo "error: no context '$ctx'; create one: vmf context add $ctx" >&2
+  exit 3
+fi
+
+case "$cmd" in
+  run) exec "$VMF_SCRIPTS/oci-run.sh" "$@" ;;
+  ssh) exec "$VMF_SCRIPTS/ssh.sh" "$@" ;;
+  stop) exec "$VMF_SCRIPTS/stop.sh" "$@" ;;
+  ps) exec "$VMF_SCRIPTS/ps.sh" "$@" ;;
+  logs) exec "$VMF_SCRIPTS/logs.sh" "$@" ;;
+  url) exec "$VMF_SCRIPTS/url.sh" "$@" ;;
+  pin) exec "$VMF_SCRIPTS/pin.sh" "$@" ;;
+  login) echo "error: provider login is not implemented yet (local only for now)" >&2; exit 3 ;;
+  *) echo "error: unknown command '$cmd'" >&2; usage; exit 2 ;;
+esac

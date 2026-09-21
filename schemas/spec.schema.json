@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "vmfactory VM spec",
+  "required": ["spec_version", "name", "base", "network"],
+  "additionalProperties": false,
+  "properties": {
+    "spec_version": {
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,30}$",
+      "description": "Box name; drives MAC, hostname, build dir, and tap allocation"
+    },
+    "base": {
+      "type": "string",
+      "description": "Key into images.yaml; must resolve to a pinned image"
+    },
+    "cpu": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64,
+      "default": 2
+    },
+    "memory_gb": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 128,
+      "default": 4
+    },
+    "disk_gb": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 500,
+      "default": 10
+    },
+    "network": {
+      "type": "object",
+      "required": ["ip"],
+      "additionalProperties": false,
+      "properties": {
+        "ip": {
+          "type": "string",
+          "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}$"
+        },
+        "gateway": {
+          "type": "string",
+          "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}$"
+        },
+        "domain": {
+          "type": "string"
+        }
+      }
+    },
+    "roles": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "Ansible roles from roles/, applied in order before provision steps"
+    },
+    "provision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dockerfile": {
+          "type": "string",
+          "description": "Path to a Dockerfile; its RUN/COPY/ENV subset is translated into the image build"
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["src", "dest"],
+        "additionalProperties": false,
+        "properties": {
+          "src": {
+            "type": "string",
+            "description": "Path resolved against the repo root"
+          },
+          "dest": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Absolute destination path inside the image"
+          },
+          "owner": {
+            "type": "string",
+            "default": "root"
+          },
+          "group": {
+            "type": "string",
+            "default": "root"
+          },
+          "mode": {
+            "type": "string",
+            "pattern": "^[0-7]{3,4}$",
+            "default": "0644"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Integrity pin, checked at validate time"
+          }
+        }
+      }
+    }
+  }
+}
