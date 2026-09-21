@@ -8,7 +8,7 @@
 # and ssh with a full PTY work.
 #
 # Env: VMF_IMAGE_REF VMF_NAME VMF_RUNDIR VMF_CONF VMF_ASSETS VMF_CONSOLE
-#      VMF_DETACH VMF_KEEP VMF_CPUS VMF_MEM VMF_HOSTFWD (file: "host guest" lines)
+#      VMF_DETACH VMF_KEEP VMF_CPUS VMF_MEM (hostfwd file: $VMF_RUNDIR/hostfwd)
 #
 # Teardown ownership: VMF_RUNDIR is unique per run, so its removal can
 # never race a replace-run's writes. The shared state conf is deleted
@@ -16,6 +16,8 @@
 # replace-run rewrites the conf for the new VM, and when this subshell
 # wakes up the PID no longer matches, so it leaves the new state alone.
 set -euo pipefail
+# shellcheck source=vmf_lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vmf_lib.sh"
 
 : "${VMF_IMAGE_REF:?}" "${VMF_NAME:?}" "${VMF_RUNDIR:?}" "${VMF_ASSETS:?}" "${VMF_CONSOLE:?}"
 VMF_CONF="${VMF_CONF:-$VMF_RUNDIR.conf}"
@@ -60,15 +62,9 @@ cleanup() {
 
 hostfwd=""
 while IFS= read -r line; do
-  [[ -n "$line" ]] || continue
   # 2 fields (legacy): "hport gport" tcp; 3 fields: "proto hport gport".
-  read -r f1 f2 f3 _ <<<"$line"
-  if [[ -z "${f3:-}" ]]; then
-    proto="tcp"; hport="$f1"; gport="$f2"
-  else
-    proto="$f1"; hport="$f2"; gport="$f3"
-  fi
-  hostfwd="$hostfwd,hostfwd=$proto::$hport-:$gport"
+  vmf_fwd_parse "$line" || continue
+  hostfwd="$hostfwd,hostfwd=$VMF_FWD_PROTO::$VMF_FWD_HOST-:$VMF_FWD_GUEST"
 done < "$VMF_RUNDIR/hostfwd"
 
 serial=(-serial "file:$VMF_CONSOLE")

@@ -1,6 +1,11 @@
 lab := "strix"
 uvrun := "env -u VIRTUAL_ENV uv run"
 
+# Recipe arguments arrive as positional parameters ($0 = recipe name):
+# "$@" forwards them verbatim, so quoted values survive
+# (--intent "Run 3 instances").
+set positional-arguments
+
 default:
     @just --list
 
@@ -68,23 +73,24 @@ boot lab=lab:
     sh scripts/boot.sh {{ lab }}
 
 # Run an OCI image as an ephemeral microVM (docker-style flags); ssh in
-# with `just ssh <name>` afterwards
+# with `just ssh <name>` afterwards. "$@" + positional-arguments keeps
+# quoting intact (--intent "Run 3 instances" reaches oci-run as one arg).
 run *args:
-    sh scripts/oci-run.sh {{ args }}
+    exec sh scripts/oci-run.sh "$@"
 
 # SSH into a running box (qemu) or microVM (dropbear); pass a command to
 # run it remotely instead. Docker-style leading flags are accepted/ignored.
 ssh *args:
-    sh scripts/ssh.sh {{ args }}
+    exec sh scripts/ssh.sh "$@"
 
 # SSH into a running box or microVM (alias for ssh)
 enter *args:
-    sh scripts/ssh.sh {{ args }}
+    exec sh scripts/ssh.sh "$@"
 
 # Run a command inside a running box or microVM (same router as ssh);
 # docker-style leading flags accepted and ignored
 exec *args:
-    sh scripts/ssh.sh {{ args }}
+    exec sh scripts/ssh.sh "$@"
 
 # Print the dedicated IP of a box, declared in the spec
 ip lab=lab:

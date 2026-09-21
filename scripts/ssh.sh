@@ -11,6 +11,8 @@
 # ignored: ssh supports interactive PTY natively, the flags exist only for
 # docker-habit compatibility.
 set -euo pipefail
+# shellcheck source=vmf_lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vmf_lib.sh"
 
 # Docker-habit flags are ignored; other value-less flags (e.g. ssh's own
 # -tt, -v) pass through to ssh.
@@ -76,11 +78,8 @@ if [[ "$ENGINE" == "qemu" || "$ENGINE" == "firecracker" ]]; then
     exit 1
   fi
 else
-  if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-    krun() { buildah unshare -- krunvm "$@"; }
-  else
-    krun() { nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm "$@"; }
-  fi
+  vmf_tools krunvm buildah
+  krun() { "${TOOL[@]}" buildah unshare -- krunvm "$@"; }
   if ! krun list | grep -qx -- "$name"; then
     echo "error: microVM '$name' is not running (stale state file); start it again" >&2
     exit 1

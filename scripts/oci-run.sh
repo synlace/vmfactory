@@ -15,6 +15,9 @@
 # entrypoint, so `just ssh <name> <cmd>` reaches the running microVM.
 # `--no-ssh` skips the derive step and boots the pinned bytes as-is.
 set -euo pipefail
+SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=vmf_lib.sh
+. "$SCRIPTS_DIR/vmf_lib.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -53,6 +56,10 @@ Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
   -e K=V          environment for the guest process (repeatable)
   --name NAME     microVM name (default: derived from the image)
   --cpus N        vCPUs
+  --as KIND       resolve input-kind ambiguity explicitly; every run
+                  prints the classified kind as its first line
+                  (git-url dir image image-tar compose-file dockerfile
+                   iso ova disk box tarball bundle)
   -i, -t          accepted and ignored (microVMs have no PTY)
   IMAGE           OCI reference (registry/repo[:tag]); digest-pinned
   COMMAND...      optional command to run inside (default: image entrypoint)
@@ -68,6 +75,7 @@ runtime=""
 yes_flag=0
 project_hint=""
 intent=""
+input_as=""
 name=""
 cpus=""
 mem=""
@@ -103,9 +111,10 @@ while [[ $# -gt 0 ]]; do
     --expose) [[ $# -ge 2 ]] || usage; expose="$2"; shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
-    --name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
-    --cpus) [[ $# -ge 2 ]] || usage; cpus="$2"; shift 2 ;;
-    -h|--help) usage ;;
+--name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
+  --cpus) [[ $# -ge 2 ]] || usage; cpus="$2"; shift 2 ;;
+  --as) [[ $# -ge 2 ]] || usage; input_as="$2"; shift 2 ;;
+  -h|--help) usage ;;
     --) shift; cmd_args+=("$@"); break ;;
     -*) echo "error: unknown flag $1" >&2; exit 2 ;;
     *) if [[ -z "$image" ]]; then image="$1"; shift; else cmd_args+=("$1"); shift; fi ;;
@@ -128,6 +137,35 @@ fi
 # etc. No OCI registry lives at these hosts, so the mapping is safe.
 if [[ "$image" =~ ^(github\.com|gitlab\.com|bitbucket\.org)/[^/]+/[^/]+$ ]]; then
   image="https://$image"
+fi
+# Classifier: state what vmf thinks the input is — the first line of
+# every run. Cheap facts only (path magic, URL shape); never a guess.
+# Skipped on the compose/direct handoff passes (VMF_MODE/VMF_COMPOSE_SRC
+# set by the first pass).
+export VMF_SCRIPTS_DIR="${VMF_SCRIPTS_DIR:-$SCRIPTS_DIR}"
+if [[ -z "${VMF_MODE:-}" && -z "${VMF_COMPOSE_SRC:-}" ]]; then
+  kind=$(python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" classify "$image" \
+    ${input_as:+"--as" "$input_as"}) || exit $?
+  # Compose runs take no command: positionals after the input are a
+  # mangled flag (lost quotes) or a misuse — say so instead of
+  # silently dropping them (checked before the clone, so nothing runs).
+  if [[ "$kind" != "image" && ${#cmd_args[@]} -gt 0 ]]; then
+    echo "error: unexpected arguments after the input: ${cmd_args[*]}" >&2
+    echo "       multi-word values need quoting, e.g. --intent \"Run 3 instances\"" >&2
+    exit 2
+  fi
+  case "$kind" in
+    git-url|dir|image) ;;
+    *) echo "error: '$kind' runs are planned but not built yet (supported: git-url, dir, image)" >&2; exit 3 ;;
+  esac
+  # Evidence profile for plain images: states the default instead of
+  # implying it. User flags (--memory) always win. Skipped when an
+  # --intent plan may size the VM itself (memory_mb).
+  if [[ "$kind" == "image" && -z "$mem" && -z "$intent" ]]; then
+    prof=$(python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" profile "$kind" "$image") || prof=""
+    mem="${prof##* }"
+    [[ "$mem" =~ ^[0-9]+$ ]] || mem=1024
+  fi
 fi
 # Compose mode: a git URL or a directory containing a compose file.
 # The pipeline lives in compose-run.sh; it hands back to this script
@@ -164,11 +202,7 @@ if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   repo_src="$RUNS_DIR/.compose-src.$$"
   rm -rf "$repo_src"
   mkdir -p "$repo_src"
-  if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
-  else
-    nix shell nixpkgs#git -c git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
-  fi
+  vmf_run git -- git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
   export VMF_COMPOSE_SRC="$repo_src" VMF_COMPOSE_URL="$clone_url"
   name="${name:-$(basename "${clone_url%%.git}")}"
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
@@ -189,7 +223,8 @@ if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
   export VMF_RUN_DETACH="${detach:-0}" VMF_RUN_KEEP="${keep:-0}"
   export VMF_RUN_MEM="${mem:-1024}" VMF_RUN_NETMODE="${netmode:-open}"
-  export VMF_RUN_TIMEOUT_SECS="${timeout_secs:-0}" VMF_RUN_CPUS="${cpus:-2}"
+  export VMF_RUN_TIMEOUT_SPEC="$timeout_spec" VMF_RUN_DISKCAP="$diskcap"
+  export VMF_RUN_CPUS="${cpus:-2}" VMF_RUN_SSH="$ssh"
   export VMF_RUN_ENGINE="$ENGINE" VMF_RUN_EXPOSE="$expose_mode"
   exec bash "$(cd "$(dirname "$0")" && pwd)/compose-run.sh"
 fi
@@ -205,14 +240,13 @@ case "$image" in
   *) image="docker.io/library/$image" ;;
 esac
 
-if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-  krun() { buildah unshare -- krunvm "$@"; }
-else
-  krun() { nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm "$@"; }
-fi
+# Both engines are needed: buildah wraps, krunvm runs. vmf_tools wants
+# every package present before using the host binaries.
+vmf_tools krunvm buildah
+krun() { "${TOOL[@]}" buildah unshare -- krunvm "$@"; }
 
 if [[ -z "$name" ]]; then
-  name="$(basename "${image%%:*}")"
+  name="${VMF_NAME:-$(basename "${image%%:*}")}"
 fi
 
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
@@ -220,7 +254,7 @@ SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 BUNDLE_DIR="${VMF_SSH_BUNDLE:-$HOME/.local/share/vmf/ssh-bundle}"
 DERIVE_DIR="${VMF_DERIVE:-$HOME/.vmf/derive}"
 # Flag (--engine) wins over env; default qemu.
-ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
+ENGINE="${ENGINE:-${VMF_RUN_ENGINE:-${VMF_ENGINE:-qemu}}}"
 case "$ENGINE" in
   qemu|krunvm|firecracker) ;;
   *) echo "error: engine '$ENGINE' is planned but not built yet (qemu|krunvm available)" >&2; exit 3 ;;
@@ -230,6 +264,20 @@ MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
 # P0 guardrails: parse network mode, run timeout, and disk cap. The
 # sandbox flags are opt-in today; the repo-run feature (P3) forces
 # restricted + timeout for un-audited code.
+# Handoff defaults: the first oci-run pass parsed the run flags and
+# exported them as VMF_RUN_*; this pass prefers its own flags, then
+# the handoff env, then built-ins. This replaces the old compose-run
+# flag re-encoding round-trip (and its silent losses: --timeout,
+# --disk-cap, --engine, --no-ssh on compose/direct handoffs).
+if [[ -z "$netmode" ]]; then netmode="${VMF_RUN_NETMODE:-}"; fi
+if [[ -z "$mem" ]]; then mem="${VMF_RUN_MEM:-}"; fi
+if [[ -z "$cpus" ]]; then cpus="${VMF_RUN_CPUS:-}"; fi
+if [[ "${VMF_RUN_DETACH:-0}" == "1" ]]; then detach=1; fi
+if [[ "${VMF_RUN_KEEP:-0}" == "1" ]]; then keep=1; fi
+if [[ "${VMF_RUN_SSH:-1}" == "0" ]]; then ssh=0; fi
+if [[ -z "$timeout_spec" ]]; then timeout_spec="${VMF_RUN_TIMEOUT_SPEC:-}"; fi
+if [[ -z "$diskcap" ]]; then diskcap="${VMF_RUN_DISKCAP:-}"; fi
+expose_mode="${VMF_RUN_EXPOSE:-$expose_mode}"
 case "$netmode" in
   ""|open|restricted|off) ;;
   *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
@@ -316,13 +364,8 @@ ensure_microvm_assets() {
   # ships only the bzImage. Extract once per kernel marker.
   if [[ ! -f "$MICROVM_DIR/vmlinux" ]]; then
     echo "extracting vmlinux (firecracker ELF kernel)..."
-    if command -v zstd >/dev/null 2>&1; then
-      python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
-        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
-    else
-      nix shell nixpkgs#zstd -c python3 "$(cd "$(dirname "$0")" && pwd)/extract-vmlinux.py" \
-        "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
-    fi
+    vmf_run zstd -- python3 "$SCRIPTS_DIR/extract-vmlinux.py" \
+      "$MICROVM_DIR/vmlinuz" "$MICROVM_DIR/vmlinux"
   fi
   local h stage
   h=$(cat "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$BUNDLE_DIR/busybox" | sha256sum | cut -c1-8)
@@ -334,12 +377,8 @@ ensure_microvm_assets() {
     ln -s busybox "$stage/bin/sh"
     cp "$(cd "$(dirname "$0")" && pwd)/guest/initramfs-init.sh" "$stage/init"
     chmod 755 "$stage/init"
-    if command -v cpio >/dev/null 2>&1; then
-      (cd "$stage" && find . | cpio -o -H newc | gzip -1) > "$MICROVM_DIR/initramfs.cpio.gz"
-    else
-      nix shell nixpkgs#cpio nixpkgs#gzip -c sh -c "cd '$stage' && find . | cpio -o -H newc | gzip -1" \
-        > "$MICROVM_DIR/initramfs.cpio.gz"
-    fi
+    vmf_run cpio gzip -- sh -c "cd '$stage' && find . | cpio -o -H newc | gzip -1" \
+      > "$MICROVM_DIR/initramfs.cpio.gz"
     rm -rf "$stage"
     printf '%s\n' "$h" > "$MICROVM_DIR/initramfs-marker"
   fi
@@ -349,11 +388,8 @@ ensure_microvm_assets() {
 # Digest pin: TOFU on first run; drift is a hard error afterwards.
 pins="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 mkdir -p "$(dirname "$pins")"
-if command -v skopeo >/dev/null 2>&1; then
-  SKOPEO=(skopeo)
-else
-  SKOPEO=(nix shell nixpkgs#skopeo -c skopeo)
-fi
+vmf_tool skopeo
+SKOPEO=("${TOOL[@]}")
 digest=""
 ref="$image"
 if [[ "$is_local_tag" -eq 1 ]]; then
@@ -402,7 +438,7 @@ printf '%s\0' "${envs[@]:-}" > "$rundir/envs-nul" 2>/dev/null || : > "$rundir/en
 if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; then
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
   mkdir -p "$rundir"
-  if python3 "$(cd "$(dirname "$0")" && pwd)/plan-image.py" "$image" "$intent" \
+  if python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" intent "$image" "$intent" \
       "$rundir/intent-direct.json"; then
     intent_plan="$rundir/intent-direct.json"
     mapfile -t cmd_args < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1]))['command']]" "$intent_plan")
@@ -414,6 +450,12 @@ for k, v in json.load(open(sys.argv[1])).get("env", {}).items():
     print("%s\t%s" % (k, v))
 PY
 )
+    # Direct plans declare the guest tcp ports the app listens on; the
+    # host publishes each 1:1. qemu forwards only at boot, so they ride
+    # the -p list.
+    while IFS= read -r gp; do
+      [[ -n "$gp" ]] && ports+=("$gp:$gp")
+    done < <(python3 -c "import json,sys;[print(x) for x in json.load(open(sys.argv[1])).get('ports',[])]" "$intent_plan")
     if [[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('needs_docker',False))" "$intent_plan")" == "True" ]]; then
       VMF_WANT_DOCKER=1
     fi
@@ -537,11 +579,8 @@ if [[ "$ssh" -eq 1 ]]; then
     "$(cd "$(dirname "$0")" && pwd)/derive.sh" | sha256sum | cut -c1-8)
   DERIVED_TAG="v$(printf '%s' "$ref" | cksum | cut -d' ' -f1 | cut -c1-10)-$content"
   DERIVED="vmf-ssh:$DERIVED_TAG"
-  if command -v buildah >/dev/null 2>&1; then
-    BUILD_BIN=(buildah)
-  else
-    BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
-  fi
+  vmf_tool buildah krunvm buildah
+  BUILD_BIN=("${TOOL[@]}")
   VMF_REF="$ref" VMF_DERIVED="$DERIVED" VMF_TAG="$DERIVED_TAG" \
   VMF_BUNDLE="$BUNDLE_DIR" VMF_INIT="$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
   VMF_DERIVE_DIR="$DERIVE_DIR" \
@@ -659,11 +698,8 @@ if [[ "$ENGINE" == "qemu" ]]; then
   done
   rm -f "$RUNS_DIR/$name.log"
   echo "creating microVM '$name' from $create_ref (qemu engine)..."
-  if command -v buildah >/dev/null 2>&1; then
-    BUILD_BIN=(buildah)
-  else
-    BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
-  fi
+  vmf_tool buildah krunvm buildah
+  BUILD_BIN=("${TOOL[@]}")
   VMF_IMAGE_REF="$create_ref" VMF_NAME="$name" VMF_RUNDIR="$rundir" \
   VMF_CONF="$RUNS_DIR/$name.conf" VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$RUNS_DIR/$name.log" \
   VMF_NET_MODE="${netmode:-open}" VMF_TIMEOUT_SECS="$timeout_secs" \
@@ -680,13 +716,12 @@ fi
 if [[ "$ENGINE" == "firecracker" ]]; then
   ensure_microvm_assets
   # Firecracker toolchain (binary + slirp4netns + mksquashfs + mke2fs).
-  if command -v firecracker >/dev/null 2>&1 && command -v slirp4netns >/dev/null 2>&1 \
-     && command -v mksquashfs >/dev/null 2>&1 && command -v mke2fs >/dev/null 2>&1; then
-    FC=(firecracker)
-  else
+  FC_PKGS=(firecracker slirp4netns squashfsTools e2fsprogs iproute2 netcat)
+  vmf_tools "${FC_PKGS[@]}"
+  if [[ ${#TOOL[@]} -gt 0 ]]; then
     echo "fetching firecracker toolchain via nix shell..."
-    FC=(nix shell nixpkgs#firecracker nixpkgs#slirp4netns nixpkgs#squashfsTools nixpkgs#e2fsprogs nixpkgs#iproute2 nixpkgs#netcat -c)
   fi
+  FC=("${TOOL[@]}")
   if [[ "$netmode" == "restricted" ]]; then
     echo "warning: --net restricted is not wired for firecracker yet; using open" >&2
     netmode="open"
@@ -700,16 +735,8 @@ if [[ "$ENGINE" == "firecracker" ]]; then
     # The squashfs must be owned by the host user; mksquashfs runs inside
     # the buildah unshare but the result is readable by everyone.
     squash_stage=$(mktemp -d)
-    if command -v buildah >/dev/null 2>&1; then
-      BUILD_BIN=(buildah)
-    else
-      BUILD_BIN=(nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah)
-    fi
-    if command -v mksquashfs >/dev/null 2>&1; then
-      SQ=(mksquashfs)
-    else
-      SQ=(nix shell nixpkgs#squashfsTools -c mksquashfs)
-    fi
+    vmf_tool buildah krunvm buildah
+    BUILD_BIN=("${TOOL[@]}")
     VMF_IMAGE_REF="$create_ref" VMF_OUT="$squash_stage/rootfs.squashfs" \
       "${BUILD_BIN[@]}" unshare -- bash -c '
       set -euo pipefail
@@ -746,11 +773,7 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   [[ -f "$rundir/docker-bundle.tar.gz" ]] && \
     input_extra=$(($input_extra + $(stat -c%s "$rundir/docker-bundle.tar.gz") / 1024 / 1024 + 16))
   input_size=$(( 16 + input_extra ))M
-  if command -v mke2fs >/dev/null 2>&1; then
-    mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$rundir/inputs.ext4" "$input_size"
-  else
-    nix shell nixpkgs#e2fsprogs -c mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$rundir/inputs.ext4" "$input_size"
-  fi
+  vmf_run e2fsprogs -- mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$rundir/inputs.ext4" "$input_size"
   rm -rf "$stage"
   rm -f "$RUNS_DIR/$name.log"
   echo "creating microVM '$name' from $create_ref (firecracker engine)..."

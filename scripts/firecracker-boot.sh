@@ -19,6 +19,8 @@
 # Env: VMF_NAME VMF_RUNDIR VMF_ASSETS_SQUASHFS VMF_KERNEL VMF_INITRAMFS
 #      VMF_CONSOLE VMF_CPUS VMF_MEM VMF_TIMEOUT_SECS VMF_NET_MODE
 set -euo pipefail
+# shellcheck source=vmf_lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vmf_lib.sh"
 
 : "${VMF_NAME:?}" "${VMF_RUNDIR:?}" "${VMF_ASSETS_SQUASHFS:?}" "${VMF_KERNEL:?}" "${VMF_INITRAMFS:?}" "${VMF_CONSOLE:?}"
 VMF_TIMEOUT_SECS="${VMF_TIMEOUT_SECS:-0}"
@@ -155,17 +157,11 @@ net_boot() {
   done
   [[ -s "$VMF_RUNDIR/slirp-ready" ]] || { echo "vmf-fc: slirp4netns not ready" >&2; kill "$slirp_pid" 2>/dev/null || true; return 1; }
   while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
     # 2 fields (legacy): "hport gport" tcp; 3 fields: "proto hport gport".
-    read -r f1 f2 f3 _ <<<"$line"
-    if [[ -z "${f3:-}" ]]; then
-      proto="tcp"; hport="$f1"; gport="$f2"
-    else
-      proto="$f1"; hport="$f2"; gport="$f3"
-    fi
+    vmf_fwd_parse "$line" || continue
     resp=$(printf '{"execute":"add_hostfwd","arguments":{"proto":"%s","host_addr":"127.0.0.1","host_port":%s,"guest_addr":"10.0.2.15","guest_port":%s}}' \
-      "$proto" "$hport" "$gport" | timeout 5 nc -U "$VMF_RUNDIR/slirp-api.sock" || true)
-    [[ "$resp" == *'"return"'* ]] || { echo "vmf-fc: hostfwd $proto $hport failed: $resp" >&2; }
+      "$VMF_FWD_PROTO" "$VMF_FWD_HOST" "$VMF_FWD_GUEST" | timeout 5 nc -U "$VMF_RUNDIR/slirp-api.sock" || true)
+    [[ "$resp" == *'"return"'* ]] || { echo "vmf-fc: hostfwd $VMF_FWD_PROTO $VMF_FWD_HOST failed: $resp" >&2; }
   done < "$VMF_RUNDIR/hostfwd"
   wait "$nspid" || true
   kill "$slirp_pid" 2>/dev/null || true

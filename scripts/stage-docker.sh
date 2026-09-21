@@ -6,6 +6,8 @@
 # Output: $VMF_DOCKER_BUNDLE (default ~/.local/share/vmf/docker-bundle)
 # with bin/{dockerd,docker,...} and bin/docker-compose.
 set -euo pipefail
+# shellcheck source=vmf_lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vmf_lib.sh"
 out="${VMF_DOCKER_BUNDLE:-$HOME/.local/share/vmf/docker-bundle}"
 pins_dir="$out"
 mkdir -p "$out"
@@ -28,16 +30,8 @@ fetch_pinned() { # url dest pinfile
   else
     echo "fetching (TOFU: recording sha256): $url"
   fi
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest.tmp"
-  else
-    nix shell nixpkgs#curl -c curl -fsSL "$url" -o "$dest.tmp"
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    got="$(sha256sum "$dest.tmp" | cut -d' ' -f1)"
-  else
-    got="$(nix shell nixpkgs#coreutils -c sha256sum "$dest.tmp" | cut -d' ' -f1)"
-  fi
+  vmf_run curl -- curl -fsSL "$url" -o "$dest.tmp"
+  got="$(vmf_run coreutils -- sha256sum "$dest.tmp" | cut -d' ' -f1)"
   if [[ -f "$pin" && "$got" != "$want" ]]; then
     echo "error: digest drift for $url: pinned $want got $got" >&2
     rm -f "$dest.tmp"

@@ -5,6 +5,7 @@ __pycache__/
 files/
 .gitignore.swp
 *.swp
+tests/fixtures/*/calls
 
 # real credentials never live in the repo
 .env

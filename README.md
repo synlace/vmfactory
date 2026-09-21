@@ -236,6 +236,48 @@ and a plain local directory path runs the same pipeline. A URL with
 extra path segments selects the project inside the repo
 (`github.com/org/repo/apps/upper`; the clone URL stays the repo root).
 
+### Input classification (first line of every run)
+
+Every run names what vmf thinks the input is, from cheap facts only —
+URL shape, file magic (ISO 9660 / qcow2 / tar members), directory
+layout. No clone, no registry, no model:
+
+```
+input: git-url https://github.com/gchq/cyberchef
+input: image alpine (assumed)
+input: iso /path/win11.iso (6.2 GB, iso "CCCOMA_X64FRE_EN-US_DV9")
+input: ambiguous './nginx' (no such path; matches image ref pattern)
+       resolve: --as dir|image          ← exit 2, never a silent guess
+```
+
+Kinds: git-url, dir, image, image-tar, compose-file, dockerfile, iso,
+ova, disk, box, tarball, bundle. Only git-url, dir, and image are
+runnable today; the rest refuse with exit 3 ("planned but not built
+yet") instead of degrading. `--as KIND` resolves ambiguity explicitly.
+An unknown file is a hard error with the supported list — the
+classifier never silently downgrades to qemu defaults.
+
+### Evidence profiles
+
+Kinds with requirements (iso, ova, disk, image) resolve a VM profile
+through a three-tier ladder: evidence first (Windows `install.wim`
+label, OVF-declared RAM/vCPU), then `scripts/formats.yaml` (the
+user-tunable table), then — only when both miss — a stated default.
+The model may select a table row; it never invents values:
+
+```
+profile: windows-install (ram 6144, disk 64G, firmware uefi, display webvnc)
+         [evidence: iso label "CCCOMA_X64FRE_EN-US_DV9", 6.2 GB]
+profile: default-linux (ram 2048, disk 8G, display webvnc)
+         [default (unrecognized iso "MYSTERY_42"); override: --ram/--disk]
+```
+
+The plan pipeline lives in `scripts/vmf_plan.py` (plan / variant /
+refine / flatten / ports / classify / profile) with file contracts in
+`schemas/plan.schema.json` and `schemas/refines.schema.json`; tests in
+`tests/` run without qemu or a model
+(`uv run --with pyyaml --with jsonschema python -m unittest discover tests`).
+
 Multi-project repos (one compose per lab) never guess: every candidate
 compose file under the root or the first two directory levels gets a
 menu (name, services, ports) and `vmf` refuses to boot until you pick
@@ -253,10 +295,14 @@ Dockerfile) runs through the gap-filler. It collects deterministic
 evidence (README, Dockerfiles, manifest.yaml, systemd units, package
 files), asks `VMF_GAPFILL_MODEL` for a strict-JSON plan, renders the
 plan itself (the model never writes YAML or files), and shows the
-proposal. Booting requires the interactive `y` prompt or `--yes`.
-Approved plans cache under `~/.vmf/generated/<input-hash>/` — the
-same repo replays without a model call. Without a key the gap-filler
-fails with a clear message; nothing is ever generated silently.
+proposal. The gate is a loop, not a binary: `a` boots the plan, `n`
+aborts, and free text is a refinement — the model revises the plan
+(capped at 3 turns) and the diff shows what changed. Refined plans
+replace the cache for that input; `--yes` skips the loop for
+scripting. Approved plans cache under `~/.vmf/generated/<input-hash>/`
+— the same repo replays without a model call. Without a key the
+gap-filler fails with a clear message; nothing is ever generated
+silently.
 
 Spec'ing is grounded: the gap-filler runs in three phases. A draft
 call states the plan and names the topics whose CURRENT facts matter;
@@ -305,14 +351,20 @@ console in foreground runs, or use `-d` + `vmf ssh`. "Latest" resolves
 at install time inside the VM; the image is digest-pinned as usual.
 
 `--intent` also refines a resolved plan when the run has one project
-(or a cached gap-fill plan): the phrase becomes a bounded, validated
-overlay — e.g. "Run 5 instances" scales a service to N replicas. The
-base plan and its cache stay untouched; the flatten step applies the
-overlay deterministically: numbered instances (`cyberchef-2`...),
-distinct static IPs, VM ports offset per instance (8080-8084), and
-the extra ports ride the boot-time hostfwd on both engines. Anything
-outside the vocabulary (unknown service, count outside 2-12) is
-ignored. The refinement prints one line before the boot.
+(or a cached gap-fill plan): the phrase is unbounded free text, and it
+resolves into a bounded, validated overlay — replicas ("Run 5
+instances" scales a service to N), per-service env (`"set env
+GREETING=hello on cyberchef"`), and per-service command overrides.
+The base plan and its cache stay untouched; the flatten step applies
+the overlay deterministically: numbered instances (`cyberchef-2`...),
+distinct static IPs, VM ports offset per instance (8080-8084), merged
+environment, and the extra ports ride the boot-time hostfwd on both
+engines. Anything outside the vocabulary (unknown service, count
+outside 2-12) is ignored. An intent that maps to nothing observable
+prints `intent: no refinement matched` — never a silent guess.
+Interactive runs get the a / n / free-text overlay gate (same loop as
+the proposal gates); detached and `--yes` runs apply the validated
+overlay as-is.
 
 The compose file is found at the repo root or in a unique subdirectory
 (two levels deep). The translation is deterministic (no LLM on the
@@ -369,6 +421,11 @@ and the host publishes them 1:1 (`--expose all`, the default).
 
 ## Conventions
 
+- Scripts share `scripts/vmf_lib.sh`: `vmf_tool`/`vmf_tools`/`vmf_run`
+  own the "command missing → nix shell fallback" idiom (never copy it
+  per call site), and `vmf_fwd_parse` owns the
+  "proto host guest" forward-line contract (2-field lines are legacy
+  tcp).
 - Roles build the platform (common, docker, pipx); Dockerfiles add tools.
 - The build user comes from the base pin (`user:`); password `vmf-build`
   (cloud-init, packer ssh, and `just enter` all use it).

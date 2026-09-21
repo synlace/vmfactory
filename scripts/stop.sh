@@ -4,6 +4,8 @@
 set -euo pipefail
 name="${1:?usage: stop.sh <name>}"
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
+# shellcheck source=vmf_lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vmf_lib.sh"
 
 if [[ -f "$RUNS_DIR/$name.conf" ]]; then
   # shellcheck source=/dev/null
@@ -18,17 +20,13 @@ if [[ -f "$RUNS_DIR/$name.conf" ]]; then
       done
     fi
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-    if command -v buildah >/dev/null 2>&1; then B=buildah; else B="nix shell nixpkgs#buildah -c buildah"; fi
-    [[ -n "${CTR:-}" ]] && $B unshare -- buildah rm "$CTR" >/dev/null 2>&1 || true
+    vmf_tool buildah
+    [[ -n "${CTR:-}" ]] && "${TOOL[@]}" unshare -- buildah rm "$CTR" >/dev/null 2>&1 || true
     # firecracker: the slirp4netns process exits with the netns owner
   else
     pkill -f "krunvm start $name --" 2>/dev/null || true
     sleep 0.5
-    if command -v krunvm >/dev/null 2>&1 && command -v buildah >/dev/null 2>&1; then
-      buildah unshare -- krunvm delete "$name" >/dev/null 2>&1 || true
-    else
-      nix shell nixpkgs#krunvm nixpkgs#buildah -c buildah unshare -- krunvm delete "$name" >/dev/null 2>&1 || true
-    fi
+    vmf_run krunvm buildah -- buildah unshare -- krunvm delete "$name" >/dev/null 2>&1 || true
   fi
   rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name".[0-9]* \
          "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name.log"

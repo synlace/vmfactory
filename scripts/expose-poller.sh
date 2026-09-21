@@ -15,6 +15,8 @@
 # this poller seeds its table from them and handles only auto-discovered
 # ports. Exits when the VM process dies or ssh keeps failing.
 set -uo pipefail
+# shellcheck source=vmf_lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vmf_lib.sh"
 : "${VMF_NAME:?}" "${VMF_RUNDIR:?}" "${VMF_CONF:?}"
 SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 table="$VMF_RUNDIR/ports-live.txt"
@@ -35,14 +37,11 @@ done
 covered="$VMF_RUNDIR/.expose-covered"
 : > "$covered"
 while IFS= read -r line; do
-  [[ -n "$line" ]] || continue
-  read -r f1 f2 f3 _ <<<"$line"
-  if [[ -z "${f3:-}" ]]; then proto="tcp"; hport="$f1"; gport="$f2"
-  else proto="$f1"; hport="$f2"; gport="$f3"; fi
-  [[ "$gport" == "22" ]] && target="ssh" || target="-"
-  printf '%s\n' "$proto $gport" >> "$covered"
-  grep -qE "^$proto $hport " "$table" 2>/dev/null && continue
-  printf '%s %s %s %s published\n' "$proto" "$hport" "$gport" "$target" >> "$table"
+  vmf_fwd_parse "$line" || continue
+  [[ "$VMF_FWD_GUEST" == "22" ]] && target="ssh" || target="-"
+  printf '%s\n' "$VMF_FWD_PROTO $VMF_FWD_GUEST" >> "$covered"
+  grep -qE "^$VMF_FWD_PROTO $VMF_FWD_HOST " "$table" 2>/dev/null && continue
+  printf '%s %s %s %s published\n' "$VMF_FWD_PROTO" "$VMF_FWD_HOST" "$VMF_FWD_GUEST" "$target" >> "$table"
 done < "$VMF_RUNDIR/hostfwd"
 
 ssh_opts=(-i "$SSH_DIR/id_ed25519"
