@@ -8,7 +8,7 @@
 # buildah store; rebuilt only when that tag is absent (e.g. digest drift
 # after a deliberate pin refresh).
 set -euo pipefail
-: "${VMF_REF:?}" "${VMF_DERIVED:?}" "${VMF_TAG:?}" "${VMF_BUNDLE:?}" "${VMF_INIT:?}" "${VMF_DERIVE_DIR:?}"
+: "${VMF_REF:?}" "${VMF_DERIVED:?}" "${VMF_TAG:?}" "${VMF_BUNDLE:?}" "${VMF_INIT:?}" "${VMF_EXPOSE:?}" "${VMF_DERIVE_DIR:?}"
 
 if buildah inspect --type image "$VMF_DERIVED" >/dev/null 2>&1; then
   echo "derive cache hit: $VMF_DERIVED"
@@ -24,6 +24,12 @@ cp "$VMF_BUNDLE/dropbear" "$rootfs/vmf/dropbear"
 cp "$VMF_BUNDLE/dropbearkey" "$rootfs/vmf/dropbearkey"
 cp "$VMF_BUNDLE/busybox" "$rootfs/vmf/busybox"
 cp "$VMF_INIT" "$rootfs/vmf/init.sh"
+[ -f "$VMF_EXPOSE" ] && cp "$VMF_EXPOSE" "$rootfs/vmf/expose.sh"
+if [ -f "$VMF_BUNDLE/socat" ]; then
+  cp "$VMF_BUNDLE/socat" "$rootfs/vmf/socat"
+  chmod 755 "$rootfs/vmf/socat"
+fi
+chmod 755 "$rootfs/vmf/init.sh" "$rootfs/vmf/expose.sh" 2>/dev/null || true
 ln -sf busybox "$rootfs/vmf/sh"
 chmod 755 "$rootfs/vmf/dropbear" "$rootfs/vmf/busybox" "$rootfs/vmf/init.sh"
 

@@ -353,5 +353,22 @@ class Cli(unittest.TestCase):
         self.assertIn("no compose file", proc.stderr)
 
 
+class ClampMemory(unittest.TestCase):
+    def test_default_and_bounds(self):
+        self.assertEqual(vmf_plan._clamp_memory(None, False), 1024)
+        self.assertEqual(vmf_plan._clamp_memory(2048, False), 2048)
+        self.assertEqual(vmf_plan._clamp_memory(99999, False), 8192)
+
+    def test_needs_docker_floor(self):
+        # dockerd + containerd + the app share the VM; the plan floor
+        # is deterministic, not a model opinion.
+        self.assertEqual(vmf_plan._clamp_memory(1024, True), 2048)
+        self.assertEqual(vmf_plan._clamp_memory(4096, True), 4096)
+
+    def test_junk_degrades_to_default(self):
+        self.assertEqual(vmf_plan._clamp_memory("4G", False), 1024)
+        self.assertEqual(vmf_plan._clamp_memory("junk", True), 2048)
+
+
 if __name__ == "__main__":
     unittest.main()

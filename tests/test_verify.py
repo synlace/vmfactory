@@ -202,6 +202,7 @@ class RunFlow(unittest.TestCase):
         a.plan = self.write_plan(plan)
         a.name = "vm-test"
         a.hostfwd = None
+        a.console = None
         a.deadline = deadline
         a.evidence_out = evidence_out
         return a
@@ -249,6 +250,58 @@ class RunFlow(unittest.TestCase):
                 os.environ["VMF_VERIFY_SSH"] = self.old_ssh
         self.assertEqual(rc, 2)
         self.assertIn("ssh never came up", out.getvalue())
+
+    def test_oom_console_becomes_evidence(self):
+        console = os.path.join(self.tmp, "console.log")
+        open(console, "w").write(
+            "noise\nOut of memory: Killed process 278 (python) "
+            "total-vm:12363848kB, anon-rss:3763792kB, file-rss:0kB\nnoise")
+        os.environ["VMF_VERIFY_SSH"] = "exit 255"
+        try:
+            ev_path = os.path.join(self.tmp, "ev.json")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                a = self.args({"ports": [1337], "memory_mb": 4096},
+                              deadline=2, evidence_out=ev_path)
+                a.console = console
+                rc = vmf_verify.run_cmd(a)
+        finally:
+            if self.old_ssh is None:
+                os.environ["VMF_VERIFY_SSH"] = "true"
+            else:
+                os.environ["VMF_VERIFY_SSH"] = self.old_ssh
+        self.assertEqual(rc, 1)
+        self.assertIn("python was OOM-killed (anon-rss 3.6GB); "
+                      "plan memory_mb was 4096",
+                      out.getvalue())
+        ev = json.load(open(ev_path))
+        self.assertEqual(ev[0]["check"], "app-alive")
+        self.assertEqual(ev[0]["actual"].split()[0], "python")
+        self.assertIn("3.6GB", ev[0]["actual"])
+
+    def test_oom_evidence_parser(self):
+        self.assertIsNone(vmf_verify.oom_evidence(None, {}))
+        self.assertIsNone(vmf_verify.oom_evidence(
+            os.path.join(self.tmp, "missing.log"), {}))
+        console = os.path.join(self.tmp, "c.log")
+        open(console, "w").write("no oom here")
+        self.assertIsNone(vmf_verify.oom_evidence(console, {}))
+
+    def test_crash_evidence_parser(self):
+        console = os.path.join(self.tmp, "crash.log")
+        open(console, "w").write(
+            "vmf-init: install.sh ok\n"
+            "usage: serve.py [-h] [--run RUN] [--port PORT]\n"
+            "serve.py: error: unrecognized arguments: --host 0.0.0.0\n"
+            "reboot: Power down")
+        ev = vmf_verify.crash_evidence(console)
+        self.assertEqual(ev["check"], "app-alive")
+        self.assertIn("unrecognized arguments", ev["actual"])
+        self.assertIsNone(vmf_verify.crash_evidence(
+            os.path.join(self.tmp, "missing.log")))
+        clean = os.path.join(self.tmp, "clean.log")
+        open(clean, "w").write("app started fine\n")
+        self.assertIsNone(vmf_verify.crash_evidence(clean))
 
     def test_no_runnable_checks(self):
         out = io.StringIO()
@@ -364,6 +417,64 @@ class ReviseFlow(unittest.TestCase):
             rc = vmf_verify.revise_cmd(a)
         self.assertEqual(rc, 1)
         self.assertIn("no failure evidence", err.getvalue())
+
+
+class OomFloor(unittest.TestCase):
+    def test_parses_measured_rss(self):
+        ev = [{"check": "app-alive", "expected": "running",
+               "actual": "python was OOM-killed (anon-rss 3.6GB); "
+                         "plan memory_mb was 4096"}]
+        self.assertEqual(vmf_verify.oom_floor_mb(ev), 5120)
+
+    def test_no_oom_no_floor(self):
+        self.assertEqual(vmf_verify.oom_floor_mb(
+            [{"check": "probe:80", "actual": "status 500"}]), 0)
+        self.assertEqual(vmf_verify.oom_floor_mb([]), 0)
+
+    def test_floor_wins_over_model(self):
+        os.environ["VMF_RUN_YES"] = "1"
+        plan = self._plan = None
+        tmp = tempfile.mkdtemp()
+        old_home, old_scripts = os.environ["HOME"], \
+            os.environ.get("VMF_SCRIPTS_DIR")
+        old_yes = os.environ.pop("VMF_RUN_YES", None)
+        os.environ["HOME"] = tmp
+        os.environ["VMF_SCRIPTS_DIR"] = os.path.join(FIXTURES, "verify-stub")
+        os.environ["VMF_RUN_YES"] = "1"
+        try:
+            plan_path = os.path.join(tmp, "direct.json")
+            json.dump({"base_image": "", "install": ["x"],
+                       "command": ["serve"], "ports": [8009], "env": {},
+                       "needs_docker": False, "memory_mb": 4096},
+                      open(plan_path, "w"))
+            ev_path = os.path.join(tmp, "ev.json")
+            json.dump([{"check": "app-alive", "expected": "running",
+                        "actual": "python was OOM-killed (anon-rss 3.6GB); "
+                                  "plan memory_mb was 4096"}],
+                      open(ev_path, "w"))
+            out = os.path.join(tmp, "out.json")
+
+            class A:
+                pass
+            a = A()
+            a.plan, a.out, a.evidence = plan_path, out, ev_path
+            a.image, a.phrase, a.cache = None, None, None
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = vmf_verify.revise_cmd(a)
+            self.assertEqual(rc, 0)
+            revised = json.load(open(out))
+            self.assertEqual(revised["memory_mb"], 5120)
+            self.assertIn("memory floor 5120", err.getvalue())
+        finally:
+            os.environ["HOME"] = old_home
+            if old_scripts is None:
+                os.environ.pop("VMF_SCRIPTS_DIR", None)
+            else:
+                os.environ["VMF_SCRIPTS_DIR"] = old_scripts
+            if old_yes is not None:
+                os.environ["VMF_RUN_YES"] = old_yes
+            shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

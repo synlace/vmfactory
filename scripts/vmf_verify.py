@@ -8,6 +8,9 @@
 #   run <plan.json> --name N --hostfwd F [--deadline S] [--evidence-out P]
 #       Runs every runnable check until it passes or the deadline
 #       expires. Exit 0 all pass · 1 failures · 2 ssh never came up.
+#       The deadline default (180s) must outlast the app's own boot:
+#       an OOM kill lands inside the window, becomes evidence, and
+#       drives the memory revision (measured RSS + 1024 MB headroom).
 #       log/rfb checks are skipped with a note (their runners arrive
 #       with webvnc and the compose-log plumbing).
 #   revise <plan.json> <out.json> --image I --phrase P [--cache DIR]
@@ -23,6 +26,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -94,11 +98,29 @@ def check_tcp(port, fwd, _spec):
     hp = fwd.get(port, port)
     try:
         s = socket.create_connection(("127.0.0.1", hp), timeout=2)
-        s.close()
-        return True, None
     except OSError as e:
         return False, {"check": "tcp:%d" % port, "expected": "connect",
                        "actual": str(e)}
+    # slirp accepts the host connection before the guest one, so a bare
+    # connect proves only the publish. The guest refusing (dead app,
+    # loopback bind) arrives as RST/EOF right after: read briefly and
+    # fail on it. A silent open socket means the guest accepted.
+    try:
+        s.settimeout(1.5)
+        data = s.recv(16)
+        if data == b"":
+            s.close()
+            return False, {"check": "tcp:%d" % port, "expected": "connect",
+                           "actual": "connection closed by guest "
+                                     "(nothing listens on the guest side)"}
+    except ConnectionResetError:
+        s.close()
+        return False, {"check": "tcp:%d" % port, "expected": "connect",
+                       "actual": "connection reset by guest"}
+    except OSError:
+        pass
+    s.close()
+    return True, None
 
 
 def check_probe(spec, fwd, _name):
@@ -143,6 +165,62 @@ def check_exec(cmd, name, spec):
                                               ((out + err).strip()[:200]))}
 
 
+CRASH_PATTERNS = (
+    r"error: unrecognized arguments: .*",
+    r"Traceback \(most recent call last\)",
+    r"SyntaxError: .*", r"ModuleNotFoundError: .*",
+    r"Address already in use", r"permission denied",
+    r"command not found: .*", r"not found: .*",
+)
+
+
+def crash_evidence(console):
+    # A guest app that dies at boot leaves its error in the console log
+    # before the power-down. The exact line is evidence: it tells the
+    # revision what the app actually rejected (e.g. serve.py's usage
+    # names the flags it accepts).
+    if not console or not os.path.isfile(console):
+        return None
+    try:
+        text = open(console, errors="replace").read()
+    except OSError:
+        return None
+    last = None
+    for line in text.splitlines():
+        line = line.strip()
+        for pat in CRASH_PATTERNS:
+            m = re.search(pat, line)
+            if m:
+                last = line[:200]
+                break
+    if not last:
+        return None
+    return {"check": "app-alive", "expected": "app running",
+            "actual": "app exited during boot: %s" % last}
+
+
+def oom_evidence(console, plan):
+    # A dead app leaves a kernel OOM report in the console log. Extract
+    # the victim and the resident size; the revision needs both to size
+    # the VM honestly (measured need, not a guess).
+    if not console or not os.path.isfile(console):
+        return None
+    try:
+        text = open(console, errors="replace").read()
+    except OSError:
+        return None
+    m = re.search(
+        r"Out of memory: Killed process \d+ \((\S+)\).*?"
+        r"anon-rss:(\d+)kB", text, re.S)
+    if not m:
+        return None
+    return {"check": "app-alive",
+            "expected": "running within the verify deadline",
+            "actual": "%s was OOM-killed (anon-rss %.1fGB); plan memory_mb was %d"
+                      % (m.group(1), int(m.group(2)) / 1048576.0,
+                         plan.get("memory_mb", 1024))}
+
+
 def wait_ssh(name, deadline):
     # Readiness gate: the guest starts sshd before the install runs, so
     # ssh-up alone is not success — but a VM that never answers ssh is
@@ -154,6 +232,17 @@ def wait_ssh(name, deadline):
             return True
         time.sleep(POLL)
     return False
+
+
+def write_evidence(path, evidence):
+    # The VM's teardown may remove the rundir mid-verify (--rm runs);
+    # recreate the parent so the evidence always lands.
+    d = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    open(path, "w").write(json.dumps(evidence, indent=2))
 
 
 def run_cmd(args):
@@ -171,10 +260,20 @@ def run_cmd(args):
     deadline = time.time() + args.deadline
     print("verify: %d checks, deadline %ds" % (len(runnable), args.deadline))
     if not wait_ssh(args.name, deadline):
+        ev = oom_evidence(args.console, plan)
+        if not ev:
+            ev = crash_evidence(args.console)
+        if ev:
+            evidence = [ev]
+            if args.evidence_out:
+                write_evidence(args.evidence_out, evidence)
+            print("verdict: %s" % ev["actual"])
+            return 1
         print("verify: ssh never came up; no verdict possible")
         return 2
     results = [False] * len(runnable)
     failed = {}
+    last_progress = time.time()
     while time.time() < deadline:
         for i, (kind, port, spec) in enumerate(runnable):
             if results[i]:
@@ -197,13 +296,25 @@ def run_cmd(args):
                 failed[label] = ev
         if all(results):
             break
+        if time.time() - last_progress >= 30:
+            waiting = ", ".join(spec_key(k, p, s)
+                                for (k, p, s), r in zip(runnable, results)
+                                if not r)
+            print("verify: waiting (%ds/%ds): %s"
+                  % (int(deadline - time.time()), args.deadline, waiting))
+            last_progress = time.time()
         time.sleep(POLL)
     evidence = list(failed.values())
+    ev = oom_evidence(args.console, plan)
+    if not ev:
+        ev = crash_evidence(args.console)
+    if ev:
+        evidence.append(ev)
+        print("verify: %s (see console log)" % ev["actual"])
     passed = sum(results)
     if evidence:
-        out = json.dumps(evidence, indent=2)
         if args.evidence_out:
-            open(args.evidence_out, "w").write(out)
+            write_evidence(args.evidence_out, evidence)
     skipped_note = " (%d skipped)" % len(skipped) if skipped else ""
     if passed == len(runnable):
         print("verdict: %d/%d checks pass%s"
@@ -222,6 +333,21 @@ def spec_key(kind, port, spec):
         p = spec["probe"]
         return "probe:%d%s" % (p["port"], p.get("path", "/"))
     return "exec:%s" % spec["exec"]["cmd"][:40]
+
+
+def oom_floor_mb(evidence):
+    # Deterministic memory enforcement: when the evidence records an
+    # OOM kill, the revised VM needs the measured resident size plus
+    # 1024 MB of headroom (the model proposes app fixes; the driver
+    # owns this arithmetic). Rounded up to whole GB, capped by the
+    # _clamp_memory ceiling.
+    for ev in evidence or []:
+        m = re.search(r"anon-rss (\d+\.?\d*)GB",
+                      str(ev.get("actual", "")))
+        if m:
+            rss_gb = int(float(m.group(1)) + 0.999)
+            return (rss_gb + 1) * 1024
+    return 0
 
 
 def revise_cmd(args):
@@ -243,7 +369,10 @@ def revise_cmd(args):
         "image family; the install commands run on a FRESH VM from the "
         "same base image, so make them complete and idempotent; keep "
         "ports unless the evidence proves they are wrong; declare every "
-        "guest tcp port the revised app listens on. Do not weaken a "
+        "guest tcp port the revised app listens on. When the evidence "
+        "shows the app was OOM-killed, raise memory_mb to fit the "
+        "measured resident size plus 1024 MB of headroom (at most 8192). "
+        "Do not weaken a "
         "check to match the observed failure unless the evidence proves "
         "the check itself was wrong; prefer fixing the app config. "
         "Reply with ONE JSON object, same shape:\n"
@@ -253,7 +382,8 @@ def revise_cmd(args):
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int>, "notes": "<max 12 words>"}'
         % (json.dumps(plan, indent=2), json.dumps(evidence, indent=2)))
-    rc, o, err = vmf_llm.llm_call("intent", prompt)
+    rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=300,
+                                  env={"VMF_LLM_TIMEOUT": "240"})
     if rc != 0:
         sys.stderr.write(err or "")
         sys.stderr.write("error: verify revision needs a reachable model\n")
@@ -277,9 +407,19 @@ def revise_cmd(args):
                "env": {str(k): str(v)
                        for k, v in (j.get("env") or {}).items()},
                "needs_docker": bool(j.get("needs_docker")),
-               "memory_mb": int(j.get("memory_mb")
-                                or plan.get("memory_mb") or 1024),
+               "memory_mb": vmf_plan._clamp_memory(
+                   j.get("memory_mb") or plan.get("memory_mb"),
+                   j.get("needs_docker", plan.get("needs_docker"))),
                "notes": j.get("notes", "")}
+    floor = oom_floor_mb(evidence)
+    if floor and revised["memory_mb"] < floor:
+        sys.stderr.write("verify: memory floor %d MB from the measured "
+                         "RSS (plan proposed %d)\n"
+                         % (floor, revised["memory_mb"]))
+        revised["memory_mb"] = floor
+        revised["memory_mb"] = vmf_plan._clamp_memory(
+            revised["memory_mb"], revised["needs_docker"])
+        revised["notes"] = (revised["notes"] or "")[:60]
     note = vmf_plan._diff_note(plan, revised)
     text = json.dumps(revised, indent=2)
     sys.stderr.write("verify: revised proposal\n%s\n%s\n"
@@ -288,11 +428,15 @@ def revise_cmd(args):
         sys.stderr.write("verify: revision declined; the failed "
                          "verdict stands\n")
         return 2
+    d = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(d, exist_ok=True)
     open(args.out, "w").write(text)
-    if args.image and args.phrase:
-        # Self-healing cache: the same (image, phrase) replays the
-        # revised plan instead of the one that failed its checks.
-        gen = args.cache or vmf_plan.intent_cache_dir(args.image, args.phrase)
+    # Self-healing cache: the same (image, phrase) or the same gap-fill
+    # cache replays the revised plan instead of the one that failed.
+    gen = args.cache
+    if not gen and args.image and args.phrase:
+        gen = vmf_plan.intent_cache_dir(args.image, args.phrase)
+    if gen:
         try:
             os.makedirs(gen, exist_ok=True)
             open(os.path.join(gen, "direct.json"), "w").write(text)
@@ -318,13 +462,14 @@ def main(argv):
     r.add_argument("plan")
     r.add_argument("--name", required=True)
     r.add_argument("--hostfwd")
+    r.add_argument("--console")
     r.add_argument("--deadline", type=int,
-                   default=int(os.environ.get("VMF_VERIFY_SECS", "120")))
+                   default=int(os.environ.get("VMF_VERIFY_SECS", "300")))
     r.add_argument("--evidence-out")
     v = sub.add_parser("revise")
     v.add_argument("plan")
     v.add_argument("out")
-    v.add_argument("evidence", nargs="?", default="-")
+    v.add_argument("--evidence", default="-")
     v.add_argument("--image")
     v.add_argument("--phrase")
     v.add_argument("--cache")

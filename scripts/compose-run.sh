@@ -80,16 +80,37 @@ if [[ -f "$plan_tmp/direct.json" ]]; then
   done < <("${JQ[@]}" -r '(.env // {}) | to_entries[] | [(.key|tostring), (.value|tostring)] | @tsv' \
     "$plan_tmp/direct.json")
   gneed_docker=$("${JQ[@]}" -r '.needs_docker // false' "$plan_tmp/direct.json")
+  # Plan sizing: the gap-fill plan sizes the VM (memory_mb; the clamp
+  # floor is 2048 when needs_docker). The user's explicit --memory
+  # always wins — pass 1 exports VMF_RUN_MEM_EXPLICIT for it.
+  if [[ "${VMF_RUN_MEM_EXPLICIT:-0}" != "1" ]]; then
+    gmem=$("${JQ[@]}" -r '.memory_mb // 0' "$plan_tmp/direct.json")
+    if [[ "$gmem" =~ ^[0-9]+$ && "$gmem" -gt 0 ]]; then
+      export VMF_RUN_MEM="$gmem"
+    fi
+  fi
+  # The verify stage reads the plan here (plan_tmp does not survive
+  # into the rundir) and writes a revised plan back to the gap-fill
+  # cache (the key is content-derived; the sidecar carries it).
+  docker_env=()
+  # jq prints the literal string "false"; a bare ${var:+} expansion
+  # would stage dockerd for needs_docker=false and starve the app.
+  [[ "$gneed_docker" == "true" ]] && docker_env=(VMF_WANT_DOCKER=1)
+  verify_env=()
+  [[ -f "$plan_tmp/direct.json" ]] && verify_env+=(VMF_VERIFY_PLAN="$plan_tmp/direct.json")
+  [[ -f "$plan_tmp/direct.json.cache" ]] && \
+    verify_env+=(VMF_VERIFY_CACHE="$(cat "$plan_tmp/direct.json.cache")")
   # Direct plans carry guest tcp ports (PROMPT_V 5); the host publishes
   # each 1:1 via the boot-time -p list (qemu has no dynamic hostfwd).
   gports_args=()
   while IFS= read -r gp; do
     [[ -n "$gp" ]] && gports_args+=(-p "$gp:$gp")
   done < <("${JQ[@]}" -r '.ports[]?' "$plan_tmp/direct.json")
-  echo "gap-fill direct: base=$base command=${gcmd[*]} ports=${gports_args[*]:-none} needs_docker=$gneed_docker"
+  echo "gap-fill direct: base=$base command=${gcmd[*]} ports=${gports_args[*]:-none} needs_docker=$gneed_docker mem=${VMF_RUN_MEM:-1024}"
   exec env -u VMF_MODE -u VMF_COMPOSE_SRC \
     VMF_REPO_DIR="$VMF_COMPOSE_SRC" VMF_INSTALL_CMD="$ginst" \
-    ${gneed_docker:+VMF_WANT_DOCKER=1} \
+    ${docker_env[@]+"${docker_env[@]}"} \
+    ${verify_env[@]+"${verify_env[@]}"} \
     "$SCRIPT_DIR/oci-run.sh" \
     ${genv_args[@]+"${genv_args[@]}"} \
     ${gports_args[@]+"${gports_args[@]}"} \

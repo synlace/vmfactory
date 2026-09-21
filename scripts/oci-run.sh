@@ -90,9 +90,16 @@ cmd_args=()
 # Needed by the compose handoff, which runs before the later defaults.
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 ENGINE="${ENGINE:-${VMF_ENGINE:-qemu}}"
-# The verify stage re-execs this script with the original argv to boot
-# the revised plan; capture before the parse loop consumes it.
-orig_args=("$@")
+# The verify stage re-runs this script with the ORIGINAL argv to boot
+# the revised plan. The argv must survive the exec chain (pass 1 execs
+# compose-run, which execs pass 3 as a new process): plain shell
+# variables do not survive `exec env`, and re-capturing per pass would
+# replay pass 3's own argv (the resolved image + command) instead of
+# the user's input. Base64 of NUL-separated args carries it losslessly;
+# exported only on the first pass.
+if [[ -z "${VMF_ORIG_ARGS_B64:-}" ]]; then
+  export VMF_ORIG_ARGS_B64=$(printf '%s\0' "$@" | base64 -w0)
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -124,6 +131,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$image" ]] || usage
+# Explicit-memory marker: from the RAW flag, before the handoff
+# defaults turn the inherited VMF_RUN_MEM into a fake "--memory".
+if [[ -n "${mem:-}" ]]; then export VMF_RUN_MEM_EXPLICIT=1; fi
 # Port exposure mode: "all" auto-publishes every port the guest finds
 # (compose-declared plus EXPOSEd container ports, TCP+UDP); "declared"
 # publishes only explicit -p / compose-declared ports; "none" publishes
@@ -141,6 +151,24 @@ fi
 if [[ "$image" =~ ^(github\.com|gitlab\.com|bitbucket\.org)/[^/]+/[^/]+$ ]]; then
   image="https://$image"
 fi
+# Handoff defaults: the first oci-run pass parsed the run flags and
+# exported them as VMF_RUN_*; this pass prefers its own flags, then
+# the handoff env, then built-ins. Applied BEFORE the classifier so
+# the evidence-profile default never overrides a plan-sized
+# VMF_RUN_MEM on the gap-fill pass-2 handoff.
+if [[ -z "$netmode" ]]; then netmode="${VMF_RUN_NETMODE:-}"; fi
+if [[ -z "$mem" ]]; then mem="${VMF_RUN_MEM:-}"; fi
+if [[ -z "$cpus" ]]; then cpus="${VMF_RUN_CPUS:-}"; fi
+if [[ "${VMF_RUN_DETACH:-0}" == "1" ]]; then detach=1; fi
+if [[ "${VMF_RUN_KEEP:-0}" == "1" ]]; then keep=1; fi
+if [[ "${VMF_RUN_SSH:-1}" == "0" ]]; then ssh=0; fi
+if [[ -z "$timeout_spec" ]]; then timeout_spec="${VMF_RUN_TIMEOUT_SPEC:-}"; fi
+if [[ -z "$diskcap" ]]; then diskcap="${VMF_RUN_DISKCAP:-}"; fi
+expose_mode="${VMF_RUN_EXPOSE:-$expose_mode}"
+case "$netmode" in
+  ""|open|restricted|off) ;;
+  *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
+esac
 # Classifier: state what vmf thinks the input is — the first line of
 # every run. Cheap facts only (path magic, URL shape); never a guess.
 # Skipped on the compose/direct handoff passes (VMF_MODE/VMF_COMPOSE_SRC
@@ -267,24 +295,9 @@ MICROVM_DIR="${VMF_MICROVM:-$HOME/.local/share/vmf/microvm}"
 # P0 guardrails: parse network mode, run timeout, and disk cap. The
 # sandbox flags are opt-in today; the repo-run feature (P3) forces
 # restricted + timeout for un-audited code.
-# Handoff defaults: the first oci-run pass parsed the run flags and
-# exported them as VMF_RUN_*; this pass prefers its own flags, then
-# the handoff env, then built-ins. This replaces the old compose-run
-# flag re-encoding round-trip (and its silent losses: --timeout,
-# --disk-cap, --engine, --no-ssh on compose/direct handoffs).
-if [[ -z "$netmode" ]]; then netmode="${VMF_RUN_NETMODE:-}"; fi
-if [[ -z "$mem" ]]; then mem="${VMF_RUN_MEM:-}"; fi
-if [[ -z "$cpus" ]]; then cpus="${VMF_RUN_CPUS:-}"; fi
-if [[ "${VMF_RUN_DETACH:-0}" == "1" ]]; then detach=1; fi
-if [[ "${VMF_RUN_KEEP:-0}" == "1" ]]; then keep=1; fi
-if [[ "${VMF_RUN_SSH:-1}" == "0" ]]; then ssh=0; fi
-if [[ -z "$timeout_spec" ]]; then timeout_spec="${VMF_RUN_TIMEOUT_SPEC:-}"; fi
-if [[ -z "$diskcap" ]]; then diskcap="${VMF_RUN_DISKCAP:-}"; fi
-expose_mode="${VMF_RUN_EXPOSE:-$expose_mode}"
-case "$netmode" in
-  ""|open|restricted|off) ;;
-  *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
-esac
+# The VMF_RUN_* handoff defaults are applied further up (before the
+# classifier): the profile default must not override a plan-sized
+# VMF_RUN_MEM on the gap-fill pass-2 handoff.
 timeout_secs=0
 if [[ -n "$timeout_spec" ]]; then
   timeout_secs=$(python3 - "$timeout_spec" <<'PY'
@@ -560,13 +573,17 @@ else
 fi
 
 # Static ssh bundle: build once from nixpkgs (musl-static, libc-free).
-if [[ "$ssh" -eq 1 ]] && [[ ! -x "$BUNDLE_DIR/dropbear" || ! -x "$BUNDLE_DIR/busybox" ]]; then
-  echo "building static ssh bundle (dropbear + busybox, one-time)..."
-  mapfile -t outs < <(nix build nixpkgs#pkgsStatic.dropbear nixpkgs#pkgsStatic.busybox --print-out-paths)
+# socat joins it for the guest loopback bridge (a guest app bound to
+# 127.0.0.1 is unreachable through slirp hostfwd; the bridge exposes it
+# on the VM address the forward actually targets).
+if [[ "$ssh" -eq 1 ]] && [[ ! -x "$BUNDLE_DIR/dropbear" || ! -x "$BUNDLE_DIR/busybox" || ! -x "$BUNDLE_DIR/socat" ]]; then
+  echo "building static ssh bundle (dropbear + busybox + socat, one-time)..."
+  mapfile -t outs < <(nix build nixpkgs#pkgsStatic.dropbear nixpkgs#pkgsStatic.busybox nixpkgs#pkgsStatic.socat --print-out-paths)
   mkdir -p "$BUNDLE_DIR"
   cp "${outs[0]}/bin/dropbear" "$BUNDLE_DIR/dropbear"
   cp "${outs[0]}/bin/dropbearkey" "$BUNDLE_DIR/dropbearkey"
   cp "${outs[1]}/bin/busybox" "$BUNDLE_DIR/busybox"
+  [[ -x "${outs[2]}/bin/socat" ]] && cp "${outs[2]}/bin/socat" "$BUNDLE_DIR/socat"
 fi
 
 # Derive the ssh-enabled image from the pinned bytes: add one layer with
@@ -575,17 +592,21 @@ DERIVED_TAG=""
 if [[ "$ssh" -eq 1 ]]; then
   # Content-addressed tag: base digest + bundle/init content. Any change
   # to the guest payload busts the derive cache.
-  content=$(cat "$BUNDLE_DIR/dropbear" "$BUNDLE_DIR/dropbearkey" "$BUNDLE_DIR/busybox" \
-    "$BUNDLE_DIR/sshd" "$BUNDLE_DIR/ssh-keygen" "$BUNDLE_DIR/sshd-session" \
-    "$BUNDLE_DIR/sshd-auth" "$BUNDLE_DIR/moduli" \
+  bundle_hash_files=("$BUNDLE_DIR/dropbear" "$BUNDLE_DIR/dropbearkey" \
+    "$BUNDLE_DIR/busybox" "$BUNDLE_DIR/sshd" "$BUNDLE_DIR/ssh-keygen" \
+    "$BUNDLE_DIR/sshd-session" "$BUNDLE_DIR/sshd-auth" "$BUNDLE_DIR/moduli" \
     "$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
-    "$(cd "$(dirname "$0")" && pwd)/derive.sh" | sha256sum | cut -c1-8)
+    "$(cd "$(dirname "$0")" && pwd)/guest/expose.sh" \
+    "$(cd "$(dirname "$0")" && pwd)/derive.sh")
+  [[ -f "$BUNDLE_DIR/socat" ]] && bundle_hash_files+=("$BUNDLE_DIR/socat")
+  content=$(cat "${bundle_hash_files[@]}" | sha256sum | cut -c1-8)
   DERIVED_TAG="v$(printf '%s' "$ref" | cksum | cut -d' ' -f1 | cut -c1-10)-$content"
   DERIVED="vmf-ssh:$DERIVED_TAG"
   vmf_tool buildah krunvm buildah
   BUILD_BIN=("${TOOL[@]}")
   VMF_REF="$ref" VMF_DERIVED="$DERIVED" VMF_TAG="$DERIVED_TAG" \
   VMF_BUNDLE="$BUNDLE_DIR" VMF_INIT="$(cd "$(dirname "$0")" && pwd)/guest/init.sh" \
+  VMF_EXPOSE="$(cd "$(dirname "$0")" && pwd)/guest/expose.sh" \
   VMF_DERIVE_DIR="$DERIVE_DIR" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/derive.sh"
   mkdir -p "$rundir/auth"
@@ -703,26 +724,38 @@ vmf_verify_stage() {
   [[ "$detach" -eq 1 && "$ssh" -eq 1 ]] || return 0
   [[ "${VMF_VERIFY:-1}" == "1" ]] || return 0
   local vplan=""
-  for f in "$rundir/intent-direct.json" "$rundir/direct.json"; do
-    [[ -f "$f" ]] && { vplan="$f"; break; }
+  for f in "${VMF_VERIFY_PLAN:-}" "$rundir/intent-direct.json" \
+           "$rundir/direct.json"; do
+    [[ -n "$f" && -f "$f" ]] && { vplan="$f"; break; }
   done
   [[ -n "$vplan" ]] || return 0
   local turn="${VMF_VERIFY_TURN:-1}" vrc=0
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
-    --hostfwd "$rundir/hostfwd" \
+    --hostfwd "$rundir/hostfwd" --console "$RUNS_DIR/$name.log" \
     --evidence-out "$rundir/verify-evidence.json" || vrc=$?
   if [[ "$vrc" -ne 1 || "$turn" -ge "${VMF_VERIFY_TURNS:-2}" ]]; then
     return 0
   fi
-  if [[ -z "$intent" ]]; then
+  # The revision needs a cache target: intent runs recompute the cache
+  # from image+phrase; gap-fill runs carry it in VMF_VERIFY_CACHE
+  # (content-derived key, sidecar from the gap-filler).
+  local cache_args=()
+  if [[ -n "${VMF_VERIFY_CACHE:-}" ]]; then
+    cache_args=(--cache "$VMF_VERIFY_CACHE")
+  elif [[ -n "$intent" ]]; then
+    cache_args=(--image "$image" --phrase "$intent")
+  else
     echo "verify: checks failed; auto-revision needs an --intent run (phrase)"
     return 0
   fi
   echo "verify: revising the plan from check evidence..."
-  local revised="$rundir/verify-revised.json"
+  # Stable path: the VM's teardown removes the rundir (--rm) while the
+  # loop still runs; $RUNS_DIR survives the whole stage.
+  local revised="$RUNS_DIR/$name.verify-revised.json"
   rm -f "$revised"
   if ! VMF_RUN_YES=1 python3 "$SCRIPTS_DIR/vmf_verify.py" revise "$vplan" \
-      "$revised" --image "$image" --phrase "$intent"; then
+      "$revised" --evidence "$rundir/verify-evidence.json" \
+      ${cache_args[@]+"${cache_args[@]}"}; then
     echo "verify: revision not applied; the failed verdict stands"
     return 0
   fi
@@ -730,9 +763,17 @@ vmf_verify_stage() {
   # A CHILD process, not exec: the rundir name embeds the shell PID
   # ($$), and exec keeps the PID — the old VM's teardown would then
   # delete this run's rundir mid-boot. A child gets a fresh PID, a
-  # fresh rundir, and the old teardown race disappears.
+  # fresh rundir, and the old teardown race disappears. The child
+  # replays the FIRST pass's argv (decoded from VMF_ORIG_ARGS_B64), so
+  # the revised plan is re-planned from the user's original input.
+  child_args=()
+  if [[ -n "${VMF_ORIG_ARGS_B64:-}" ]]; then
+    while IFS= read -r -d '' a; do
+      child_args+=("$a")
+    done < <(printf '%s' "$VMF_ORIG_ARGS_B64" | base64 -d)
+  fi
   VMF_VERIFY_TURN=$((turn + 1)) VMF_RUN_YES=1 bash "$0" \
-    ${orig_args[@]+"${orig_args[@]}"}
+    ${child_args[@]+"${child_args[@]}"}
   exit $?
 }
 

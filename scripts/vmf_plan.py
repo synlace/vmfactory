@@ -202,10 +202,10 @@ def gapfill(root, plan_out):
                          "(no README/Dockerfile/manifests)\n")
         sys.exit(1)
     # Prompt version: part of the cache key, so improved prompts
-    # invalidate stale cached plans. v6 adds the checks field to direct
-    # plans (the verify runner needs the model's own definition of
-    # success; tcp checks derive from declared ports either way).
-    PROMPT_V = "6"
+    # invalidate stale cached plans. v7 adds the memory_mb field to
+    # direct plans (an under-sized VM OOM-kills the app: dockerd,
+    # containerd and the app share one 1024 MB VM otherwise).
+    PROMPT_V = "7"
     key = hashlib.sha256((PROMPT_V + "\n" + bundle).encode()).hexdigest()[:12]
     gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated", key)
     cache = os.path.join(gen, "compose.yaml")
@@ -219,6 +219,11 @@ def gapfill(root, plan_out):
         shutil.copy(cache, os.path.join(root, "compose.yaml"))
         return
     dcache = os.path.join(gen, "direct.json")
+    # Sidecar for the verify-revision loop: the gap-fill cache key is
+    # content-derived (repo evidence hash), so compose-run carries the
+    # cache dir to oci-run instead of recomputing it.
+    sidecar = os.path.join(os.path.dirname(plan_out), "direct.json.cache")
+    open(sidecar, "w").write(gen + "\n")
     if runtime in ("auto", "direct") and os.path.isfile(dcache):
         sys.stderr.write("gap-filler: cache hit %s (direct)\n" % dcache)
         shutil.copy(dcache, os.path.join(os.path.dirname(plan_out), "direct.json"))
@@ -274,6 +279,7 @@ def gapfill(root, plan_out):
         '"expect_status": 200, "expect_contains": "<optional text>"}}],\n'
         ' "env": {"K": "V"},\n'
         ' "needs_docker": <true when the app itself shells out to docker>,\n'
+        ' "memory_mb": <int vm ram, 1024-8192>,\n'
         ' "services": [<docker shape, only for docker: {"name", "image" or '
         '"build": {"context", "dockerfile", "args"}, "command", "ports", '
         '"env"}>],\n'
@@ -295,7 +301,10 @@ def gapfill(root, plan_out):
         "checks for direct mode: one probe per HTTP-serving port whose "
         "status (and, when a specific content proves it, body text) says "
         "the app works; tcp checks for declared ports are added "
-        "automatically. At most 4 checks.\n"
+        "automatically. At most 4 checks. Size the VM: modern CLIs and "
+        "TUIs often need more than the 1024 MB default, and "
+        "needs_docker=true needs at least 2048 (dockerd, containerd and "
+        "the app share the VM).\n"
         + grounded +
         "Evidence:\n" + bundle[:32768])
 
@@ -340,6 +349,8 @@ def gapfill(root, plan_out):
                                 "checks": _clamp_checks(pj.get("checks")),
                                 "env": {str(k): str(v) for k, v in (pj.get("env") or {}).items()},
                                 "needs_docker": bool(pj.get("needs_docker")),
+                                "memory_mb": _clamp_memory(pj.get("memory_mb"),
+                                                           pj.get("needs_docker")),
                                 "notes": pj.get("notes", "")}, indent=2)
             proposal = ("gap-filler: proposal (%s)\nmode: direct\nbase: %s\ninstall:\n%s\ncommand: %s\n"
                         % ((pj.get("notes") or "-")[:60], base,
@@ -1153,6 +1164,24 @@ def _clamp_ports(raw):
     return ports
 
 
+def _clamp_memory(raw, needs_docker):
+    # Direct-plan VM sizing. needs_docker=true brings dockerd +
+    # containerd + the app into one VM (measured: ~150 MB of daemons
+    # before the app runs), so the floor is 2048; without docker the
+    # default stays 1024. Junk degrades to the default, never a guess.
+    try:
+        mb = int(raw)
+    except (TypeError, ValueError):
+        mb = 0
+    if mb < 1024:
+        mb = 1024
+    if mb > 8192:
+        mb = 8192
+    if needs_docker and mb < 2048:
+        mb = 2048
+    return mb
+
+
 def _clamp_checks(raw):
     # Model-declared success checks for direct plans. Bounded vocabulary:
     # probe and exec only — tcp checks are derived from declared ports
@@ -1285,7 +1314,9 @@ def intent_cmd(image, phrase, out):
         "a specific content proves it, body text) says the app works; "
         "tcp checks for declared ports are added automatically. At most "
         "4 checks. Size the VM: modern "
-        "CLIs and TUIs often need more than the 1024 MB default. Reply "
+        "CLIs and TUIs often need more than the 1024 MB default, and "
+        "needs_docker=true needs at least 2048 (dockerd, containerd and "
+        "the app share the VM). Reply "
         "with ONE JSON object:\n"
         '{"install": ["<shell commands run once at boot>"], '
         '"command": ["<argv that starts the app>"], '
@@ -1333,7 +1364,8 @@ def intent_cmd(image, phrase, out):
                    "env": {str(k): str(v)
                            for k, v in (plan.get("env") or {}).items()},
                    "needs_docker": bool(plan.get("needs_docker")),
-                   "memory_mb": int(plan.get("memory_mb") or 1024)}
+                   "memory_mb": _clamp_memory(plan.get("memory_mb"),
+                                              plan.get("needs_docker"))}
         plan_text = json.dumps({"base_image": "",  # caller's image; unset
                                 **payload, "notes": plan.get("notes", "")},
                                indent=2)

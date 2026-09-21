@@ -64,7 +64,7 @@ print(json.dumps({
 PY
 )
 
-resp=$(curl -sS --max-time 60 "$base/chat/completions" \
+resp=$(curl -sS --max-time "${VMF_LLM_TIMEOUT:-60}" "$base/chat/completions" \
   -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
   -d "$body" 2>&1) || { echo "llm.sh: request failed: $resp" >&2; exit 3; }
 

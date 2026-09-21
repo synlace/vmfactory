@@ -34,17 +34,24 @@ def _scripts():
     return os.environ.get("VMF_SCRIPTS_DIR") or os.path.dirname(os.path.abspath(__file__))
 
 
-def run(cmd, timeout=90):
+def run(cmd, timeout=90, env=None):
+    # env REPLACES the environment at the subprocess level; callers pass
+    # overrides, so merge them over the inherited environment here.
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        full_env.update(env)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=full_env)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 99, "", "timeout"
 
 
-def llm_call(role, prompt, timeout=90):
-    return run(["bash", os.path.join(_scripts(), "llm.sh"), "--role", role, prompt],
-               timeout)
+def llm_call(role, prompt, timeout=90, env=None):
+    return run(["bash", os.path.join(_scripts(), "llm.sh"), "--role", role,
+                prompt], timeout, env)
 
 
 def c7_search(topic, timeout=30):

@@ -195,7 +195,13 @@ class RefineLoop(unittest.TestCase):
         out = os.path.join(self.tmp, "direct.json")
         plan = json.load(open(out))
         self.assertEqual(plan["command"], ["app", "--port", "9000"])
-        self.assertIn("diff vs previous: command, notes changed", err.getvalue())
+        # needs_docker=true floors the plan memory at 2048 (dockerd,
+        # containerd and the app share the VM)
+        self.assertEqual(plan["memory_mb"], 2048)
+        self.assertTrue(plan["needs_docker"])
+        self.assertIn(
+            "diff vs previous: command, memory_mb, needs_docker, notes changed",
+            err.getvalue())
         import glob as _glob
         metas = _glob.glob(os.path.join(self.tmp, ".vmf", "generated",
                                         "*", "direct.json.meta.json"))
