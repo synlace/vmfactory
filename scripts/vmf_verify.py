@@ -166,9 +166,11 @@ def check_exec(cmd, name, spec):
 
 
 CRASH_PATTERNS = (
-    r"error: unrecognized arguments: .*",
+    r"install\.sh FAILED", r"error: unrecognized arguments: .*",
     r"Traceback \(most recent call last\)",
+    r"TypeError: ", r"ReferenceError: ",
     r"SyntaxError: .*", r"ModuleNotFoundError: .*",
+    r"Cannot find module", r"npm error", r"ELIFECYCLE",
     r"Address already in use", r"permission denied",
     r"command not found: .*", r"not found: .*",
     r"user \S+ does not exist", r"No such file or directory",
