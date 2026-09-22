@@ -229,11 +229,16 @@ while IFS=$'\t' read -r name kind rest; do
         [[ -n "$k" ]] || continue
         printf 'ARG %s\nENV %s="%s"\n' "$k" "$k" "$v" >> "$plan_tmp/synth-$name.block"
       done < "$plan_tmp/synth-$name.tsv"
-      "${AWK[@]}" -v bf="$plan_tmp/synth-$name.block" '
-        NR==FNR { if (tolower($0) ~ /^[[:space:]]*from[[:space:]]/) last = FNR; next }
-        { print; if (FNR == last) { while ((getline l < bf) > 0) print l } }
-      ' "$plan_tmp/synth-$name.block" "$dockerfile" > "$dockerfile.tmp" \
-        && mv "$dockerfile.tmp" "$dockerfile"
+      # Last FROM line of the dockerfile (the app stage), then splice the
+      # ARG/ENV block after it.
+      last_from=$("${AWK[@]}" 'tolower($0) ~ /^[[:space:]]*from[[:space:]]/ { last = NR }
+        END { print last + 0 }' "$dockerfile")
+      if [[ "${last_from:-0}" -gt 0 ]]; then
+        "${AWK[@]}" -v bf="$plan_tmp/synth-$name.block" -v at="$last_from" '
+          { print; if (FNR == at) { while ((getline l < bf) > 0) print l } }
+        ' "$dockerfile" > "$dockerfile.tmp" && mv "$dockerfile.tmp" "$dockerfile"
+        echo "compose: build env injected at FROM line $last_from"
+      fi
     fi
     build_args=()
     "${BUILD_BIN[@]}" build -t "$tag" -f "$dockerfile" \
