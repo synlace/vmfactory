@@ -426,8 +426,14 @@ def main(argv):
     log.write("\n===== promotion (%s) =====\n" % base)
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
     proc.wait()
+    # The detached runner returns before its verify chain finishes: the
+    # verdict marker (and the rendered target) land minutes later. Wait
+    # for the marker instead of defaulting to pass on a missing verdict.
     vpath = verdict_path(base)
-    status = "pass"
+    deadline = time.time() + int(os.environ.get("VMF_PROMOTION_WAIT", "420"))
+    while not os.path.isfile(vpath) and time.time() < deadline:
+        time.sleep(2)
+    status = "fail (no verdict)"
     if os.path.isfile(vpath):
         with open(vpath) as f:
             status = f.read().strip() or "pass"
