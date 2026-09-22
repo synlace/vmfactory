@@ -338,6 +338,9 @@ def main(argv):
 
     # Promotion: boot the canonical name from the winner's data drive.
     stop_vm(winner)
+    # Let the reaped VMs release their host ports before the canonical
+    # boot claims them (otherwise pick_host_port bumps the app port).
+    time.sleep(3)
     cmd, env = runner_cmd(w["kind"], base, src, w["image"])
     env["VMF_NAME"] = base
     log = open(w["lp"], "a")
