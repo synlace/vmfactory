@@ -963,6 +963,7 @@ sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
     cache_args=(--image "$image" --phrase "$intent")
   else
     echo "verify: checks failed; auto-revision needs an --intent run (phrase)"
+    _verdict fail
     return 0
   fi
   echo "verify: revising the plan from check evidence..."

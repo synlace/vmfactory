@@ -430,7 +430,7 @@ def main(argv):
     # verdict marker (and the rendered target) land minutes later. Wait
     # for the marker instead of defaulting to pass on a missing verdict.
     vpath = verdict_path(base)
-    deadline = time.time() + int(os.environ.get("VMF_PROMOTION_WAIT", "420"))
+    deadline = time.time() + int(os.environ.get("VMF_PROMOTION_WAIT", "900"))
     while not os.path.isfile(vpath) and time.time() < deadline:
         time.sleep(2)
     status = "fail (no verdict)"
