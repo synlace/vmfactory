@@ -364,6 +364,7 @@ def main(argv):
     for k in keep:
         if k["cand"] != winner and k["cand"] in running_state:
             r = running_state[k["cand"]]
+            say("reap: stopping %s (%s)" % (k["cand"], k["kind"]))
             try:
                 r["proc"].terminate()
                 r["log"].close()
@@ -379,12 +380,14 @@ def main(argv):
             stop_vm(k["cand"])
 
     # Promotion: boot the canonical name from the winner's data drive.
+    say("promotion: stopping %s" % winner)
     stop_vm(winner)
     # Let the reaped VMs release their host ports before the canonical
     # boot claims them: wait until the winner's first port is actually
     # free (qemu teardown can lag the stop), then a short settle.
     if w.get("ports"):
         deadline = time.time() + 20
+        waited = False
         while time.time() < deadline:
             s = socket.socket()
             try:
@@ -392,11 +395,15 @@ def main(argv):
                 s.close()
                 break
             except OSError:
+                if not waited:
+                    waited = True
+                    say("promotion: waiting for port %d to free" % w["ports"][0])
                 s.close()
                 time.sleep(1)
     time.sleep(2)
     cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"])
     env["VMF_NAME"] = base
+    say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s.log)" % (base, base))
     log = open(w["lp"], "a")
     log.write("\n===== promotion (%s) =====\n" % base)
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
