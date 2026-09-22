@@ -28,7 +28,12 @@ done
 name="$1"; shift
 
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
-vm_conf="$RUNS_DIR/$name.conf"
+# Name, id, or id-prefix → instance conf (legacy flat layout included).
+if ! vmf_instance_dir "$name"; then
+  echo "error: ${VMF_INST_ERR:-no running microVM '$name'}; start one with: just run --keep <image>" >&2
+  exit 1
+fi
+vm_conf="$VMF_INST_CONF"
 
 # Box liveness = its QEMU monitor socket answering "info status". A
 # pgrep on "-name $name" would also match a microVM of the same name,

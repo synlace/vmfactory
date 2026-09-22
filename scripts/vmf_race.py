@@ -62,6 +62,22 @@ def say(msg):
     sys.stderr.flush()
 
 
+def verdict_path(name):
+    # Id-layout instance dir first (RUNS/<id>/verdict, name = symlink),
+    # then the legacy flat marker (RUNS/<name>.verdict).
+    p = os.path.join(RUNS, name, "verdict")
+    if os.path.isfile(p):
+        return p
+    return os.path.join(RUNS, "%s.verdict" % name)
+
+
+def conf_path(name):
+    d = os.path.join(RUNS, name)
+    if os.path.isfile(os.path.join(d, "conf")):
+        return os.path.join(d, "conf")
+    return os.path.join(RUNS, "%s.conf" % name)
+
+
 def load_approaches(src):
     enum = os.path.join(RUNS, ".race-enum.json")
     rc = subprocess.run(
@@ -173,6 +189,7 @@ def runner_cmd(kind, name, src, image, ports=None):
     # race from re-entering. --yes/--ssh ride the runner args.
     env = dict(os.environ)
     env["VMF_RACE_CHILD"] = "1"
+    env["VMF_APPROACH"] = kind
     env["VMF_NAME"] = name
     env["VMF_RUN_YES"] = "1"
     env["VMF_RUN_DETACH"] = "1"
@@ -270,7 +287,8 @@ def main(argv):
     # Reruns reuse candidate names: stale verdict markers would poison
     # the poll (and the crown).
     for k in keep:
-        for p in (os.path.join(RUNS, "%s.verdict" % k["cand"]),):
+        for p in (os.path.join(RUNS, "%s.verdict" % k["cand"]),
+                  os.path.join(RUNS, k["cand"], "verdict")):
             try:
                 os.unlink(p)
             except OSError:
@@ -295,7 +313,7 @@ def main(argv):
         # Poll verdicts and dead runners.
         for cand in list(running):
             r = running[cand]
-            vpath = os.path.join(RUNS, "%s.verdict" % cand)
+            vpath = verdict_path(cand)
             rc = r["proc"].poll()
             if os.path.isfile(vpath):
                 with open(vpath) as f:
@@ -403,18 +421,28 @@ def main(argv):
     time.sleep(2)
     cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"])
     env["VMF_NAME"] = base
-    say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s.log)" % (base, base))
+    say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)" % (base, base))
     log = open(w["lp"], "a")
     log.write("\n===== promotion (%s) =====\n" % base)
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
     proc.wait()
-    vpath = os.path.join(RUNS, "%s.verdict" % base)
+    vpath = verdict_path(base)
     status = "pass"
     if os.path.isfile(vpath):
         with open(vpath) as f:
             status = f.read().strip() or "pass"
     log.close()
     say("promotion %s: %s" % (base, status))
+    # The rendered deliverable from the promoted instance's conf: the
+    # bump (or the future per-VM IP) is visible at the end of the run.
+    try:
+        with open(conf_path(base)) as f:
+            for line in f:
+                if line.startswith("TARGET="):
+                    say("target: %s" % line.split("=", 1)[1].strip())
+                    break
+    except OSError:
+        pass
     return 0 if status == "pass" else 1
 
 

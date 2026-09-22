@@ -92,8 +92,8 @@ too_young() { # path
 }
 
 # A VM conf is running when its qemu/fc pid answers kill -0.
-vm_running() { # name
-  local conf="$RUNS_DIR/$1.conf"
+vm_running() { # conf path
+  local conf="$1"
   [[ -f "$conf" ]] || return 1
   local pid engine rundir f
   # shellcheck source=/dev/null
@@ -110,15 +110,28 @@ vm_running() { # name
   return 1
 }
 
-# rundirs: <name>.<pid> directories under RUNS_DIR; orphans have no conf.
-# Returns: name<TAB>kind<TAB>path
+# rundirs: instance dirs (<12-hex id>/conf) and legacy <name>.conf.
+# Returns: name<TAB>kind<TAB>path  — kind running|stopped|replaced|orphan;
+# "replaced" = an id dir whose name symlink now points elsewhere (docker
+# ps Exited rows: old instances keep their evidence until cleaned).
 scan_vms() {
-  local conf name engine path p running
+  local conf name id engine path p running holder
+  for conf in "$RUNS_DIR"/*/conf; do
+    [[ -f "$conf" ]] || continue
+    id=$(basename "$(dirname "$conf")")
+    [[ "$id" =~ ^[0-9a-f]{12}$ ]] || continue
+    name=$(grep -oE '^NAME=.*' "$conf" | cut -d= -f2-)
+    running=stopped
+    if vm_running "$conf"; then running=running; fi
+    holder=$(readlink "$RUNS_DIR/$name" 2>/dev/null || true)
+    [[ "$holder" == "$id" || "$running" == "running" ]] || running=replaced
+    printf '%s\t%s\t%s\n' "$name" "$running" "$(dirname "$conf")"
+  done
   for conf in "$RUNS_DIR"/*.conf; do
     [[ -f "$conf" ]] || continue
     name=$(basename "$conf" .conf)
     running=stopped
-    if vm_running "$name"; then running=running; fi
+    if vm_running "$conf"; then running=running; fi
     printf '%s\t%s\t%s\n' "$name" "$running" "$conf"
   done
   for path in "$RUNS_DIR"/*.*; do
@@ -131,25 +144,24 @@ scan_vms() {
   done
 }
 
-# Aggregate per name: one line per VM (a stopped VM's rundirs and an
-# orphan's many rundirs collapse to a single row with a count).
+# Aggregate per name: running rows pass through; other rows collapse to
+# one line per name with the REAL paths kept for the removal step.
 scan_vms_agg() {
   scan_vms | awk -F'\t' -v OFS='\t' '
     $2 == "running" { print; next }
-    { paths[$1] = paths[$1] "\t" $3; cnt[$1]++; kind[$1] = $2; size[$1]++ }
+    { kind[$1] = $2; paths[$1] = paths[$1] "\t" $3; cnt[$1]++ }
     END {
       for (n in cnt)
-        if (cnt[n] > 1) print n, kind[n], n " (" cnt[n] " rundirs)"
-        else print n, kind[n], n
+        print n, kind[n] " (" cnt[n] ")", paths[$1]
     }'
 }
 
 drive_in_use() { # drive basename -> owner name if a running VM holds it
   local conf name pid drive
-  for conf in "$RUNS_DIR"/*.conf; do
+  for conf in "$RUNS_DIR"/*/conf "$RUNS_DIR"/*.conf; do
     [[ -f "$conf" ]] || continue
-    name=$(basename "$conf" .conf)
-    vm_running "$name" || continue
+    name=$(conf_name "$conf")
+    vm_running "$conf" || continue
     pid=${VM_PID:-}
     [[ -n "$pid" ]] || continue
     drive=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
@@ -157,6 +169,13 @@ drive_in_use() { # drive basename -> owner name if a running VM holds it
     [[ "$drive" == "$1" ]] && { printf '%s' "$name"; return 0; }
   done
   return 1
+}
+
+conf_name() { # conf path -> display name (NAME field, or the basename)
+  local n
+  n=$(grep -oE '^NAME=.*' "$1" 2>/dev/null | cut -d= -f2-)
+  [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+  basename "$1" .conf
 }
 
 drive_map() { # drive basename -> owner name
@@ -168,10 +187,10 @@ drive_map() { # drive basename -> owner name
     printf '%s' "${BASH_REMATCH[1]}"
   else
     local conf best=""
-    for conf in "$RUNS_DIR"/*.conf; do
+    for conf in "$RUNS_DIR"/*/conf "$RUNS_DIR"/*.conf; do
       [[ -f "$conf" ]] || continue
       grep -q -- "$name" "$conf" 2>/dev/null || continue
-      best=$(basename "$conf" .conf)
+      best=$(conf_name "$conf")
     done
     printf '%s' "$best"
   fi
@@ -183,25 +202,32 @@ sz_vms=0 sz_drives=0 sz_plans=0 sz_race=0
 running_list=""
 
 inv_vms() {
-  local name kind label d sz
-  while IFS=$'\t' read -r name kind label; do
+  local name kind paths path d sz
+  while IFS=$'\t' read -r name kind rest; do
+    paths="$rest"
     if [[ "$kind" == "running" ]]; then
       running_list="$running_list $name"
       continue
     fi
-    sz=0
-    # conf + every artifact that starts "<name>." (rundirs, console log)
-    for d in "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name".*; do
-      [[ -e "$d" ]] && sz=$(( sz + $(du -sb "$d" 2>/dev/null | cut -f1) ))
+    for path in $paths; do
+      sz=0
+      if [[ -d "$path" ]]; then
+        sz=$(du -sb "$path" 2>/dev/null | cut -f1)
+      else
+        # Legacy flat row: the conf plus every "<name>.*" artifact.
+        for d in "$path" "$RUNS_DIR/$name".*; do
+          [[ -e "$d" ]] && sz=$(( sz + $(du -sb "$d" 2>/dev/null | cut -f1) ))
+        done
+      fi
+      if too_young "$path" 2>/dev/null; then
+        printf '  %-20s %-9s %10s (kept: younger than --keep-age)\n' \
+          "$name" "$kind" "$(fmt_size "$sz")"
+        continue
+      fi
+      printf '  %-20s %-9s %10s\n' "$name" "$kind" "$(fmt_size "$sz")"
+      ACT_VMS+=("$path")
+      sz_vms=$(( sz_vms + sz ))
     done
-    if too_young "$RUNS_DIR/$name.conf" 2>/dev/null; then
-      printf '  %-20s %-9s %10s (kept: younger than --keep-age)\n' \
-        "$name" "$kind" "$(fmt_size "$sz")"
-      continue
-    fi
-    printf '  %-20s %-9s %10s\n' "$name" "$kind" "$(fmt_size "$sz")"
-    ACT_VMS+=("$name")
-    sz_vms=$(( sz_vms + sz ))
   done < <(scan_vms_agg | sort)
   [[ -n "$running_list" ]] && \
     printf '  kept (running):%s\n' "$running_list"
@@ -306,10 +332,21 @@ for g in vms drives plans race; do
   n=0
   case "$g" in
     vms)
-      for name in "${ACT_VMS[@]:-}"; do
-        [[ -n "$name" ]] || continue
-        rm -f "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name.log"
-        rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name".* 2>/dev/null
+      for path in "${ACT_VMS[@]:-}"; do
+        [[ -n "$path" ]] || continue
+        if [[ -d "$path" ]]; then
+          # Id-layout instance: the dir plus the name symlink ONLY when
+          # it still points here (a newer instance may hold the name).
+          id=$(basename "$path")
+          name=$(conf_name "$path/conf" 2>/dev/null || true)
+          rm -rf "$path"
+          [[ -n "$name" && "$(readlink "$RUNS_DIR/$name" 2>/dev/null)" == "$id" ]] \
+            && rm -f "$RUNS_DIR/$name"
+        else
+          name=$(basename "$path" .conf)
+          rm -f "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name.log"
+          rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name".* 2>/dev/null
+        fi
         # The VM's host key line in the shared known_hosts.
         if [[ -f "$SSH_DIR/known_hosts" ]]; then
           sed -i "/[ ,[]$name[ ,\]]/d" "$SSH_DIR/known_hosts" 2>/dev/null

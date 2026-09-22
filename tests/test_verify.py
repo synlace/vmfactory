@@ -205,6 +205,7 @@ class RunFlow(unittest.TestCase):
         a.console = None
         a.deadline = deadline
         a.evidence_out = evidence_out
+        a.target_out = None
         return a
 
     def test_all_pass(self):
@@ -479,6 +480,32 @@ class OomFloor(unittest.TestCase):
             if old_yes is not None:
                 os.environ["VMF_RUN_YES"] = old_yes
             shutil.rmtree(tmp)
+
+
+class TargetRender(unittest.TestCase):
+    """render_target: the published deliverable from passing checks."""
+
+    def test_probe_uses_published_port_and_path(self):
+        runnable = [("probe", 8080,
+                     {"probe": {"port": 8080, "path": "/app"}})]
+        url = vmf_verify.render_target(runnable, {8080: 36485})
+        self.assertEqual(url, "http://127.0.0.1:36485/app")
+
+    def test_tcp_only_renders_tcp(self):
+        runnable = [("tcp", 80, {"tcp": {"port": 80}})]
+        self.assertEqual(vmf_verify.render_target(runnable, {}),
+                         "tcp://127.0.0.1:80")
+
+    def test_probe_preferred_over_tcp(self):
+        runnable = [("tcp", 22, {"tcp": {"port": 22}}),
+                    ("probe", 8080,
+                     {"probe": {"port": 8080, "path": "/"}})]
+        self.assertEqual(
+            vmf_verify.render_target(runnable, {8080: 8080}),
+            "http://127.0.0.1:8080/")
+
+    def test_empty_runnable_renders_none(self):
+        self.assertIsNone(vmf_verify.render_target([], {}))
 
 
 if __name__ == "__main__":

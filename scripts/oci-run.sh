@@ -349,7 +349,16 @@ fi
 # shared paths (the old race emptied /vmf-run mid-boot and killed init).
 
 runid=$$
-rundir="$RUNS_DIR/$name.$runid"
+# Instance id: a stable opaque key (docker-container-id style). All of
+# this run's state lives in ~/.vmf/runs/<id>/; the name is a symlink
+# that hands over to a newer instance on re-promotion. The id is never
+# re-used, so replaced instances keep their evidence until cleaned.
+inst_id=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')
+while [[ -e "$RUNS_DIR/$inst_id" ]]; do
+  inst_id=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')
+done
+inst_dir="$RUNS_DIR/$inst_id"
+rundir="$inst_dir/rundir"
 
 # Kernel + initramfs for the microVM engines. The kernel is a stock
 # nixpkgs build with every needed driver forced built-in (no modules):
@@ -492,12 +501,16 @@ if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; the
     # persists: a failed session keeps its plan VM and resumes on the
     # next run instead of paying from zero.
     agent_vm="${name}-planagent"
-    agent_transcript="$RUNS_DIR/$agent_vm.transcript.json"
+    agent_rundir=""
+    agent_transcript=""
+    if vmf_instance_dir "$agent_vm"; then
+      agent_rundir=$(grep -oE '^RUNDIR=.*' "$VMF_INST_CONF" 2>/dev/null \
+        | cut -d= -f2- || true)
+      agent_transcript="$VMF_INST_DIR/transcript.json"
+    fi
     echo "intent: agent session on plan VM '$agent_vm'"
-    agent_rundir=$(grep -oE '^RUNDIR=.*' "$RUNS_DIR/$agent_vm.conf" \
-      2>/dev/null | cut -d= -f2- || true)
     agent_alive=0
-    if [[ -n "$agent_rundir" && -f "$agent_transcript" ]] && \
+    if [[ -n "$agent_rundir" && -n "$agent_transcript" && -f "$agent_transcript" ]] && \
         bash "$SCRIPTS_DIR/ssh.sh" "$agent_vm" -- echo ok >/dev/null 2>&1; then
       agent_alive=1
       echo "intent: resuming plan VM '$agent_vm' (prior session kept)"
@@ -508,9 +521,13 @@ if [[ -n "$intent" && -z "${VMF_COMPOSE_SRC:-}" && ${#cmd_args[@]} -eq 0 ]]; the
           ${timeout_spec:+--timeout "$timeout_spec"} \
           ${diskcap:+--disk-cap "$diskcap"} \
           -- /vmf/busybox sleep 100000 ) >>"$RUNS_DIR/$agent_vm.log" 2>&1 || true
-      agent_rundir=$(grep -oE '^RUNDIR=.*' "$RUNS_DIR/$agent_vm.conf" \
-        2>/dev/null | cut -d= -f2- || true)
-      rm -f "$agent_transcript"
+      agent_rundir=""
+      if vmf_instance_dir "$agent_vm"; then
+        agent_rundir=$(grep -oE '^RUNDIR=.*' "$VMF_INST_CONF" 2>/dev/null \
+          | cut -d= -f2- || true)
+        agent_transcript="$VMF_INST_DIR/transcript.json"
+      fi
+      rm -f "${agent_transcript:-/nonexistent}" 2>/dev/null || true
     fi
     if python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$agent_vm" \
         --image "$image" --phrase "$intent" \
@@ -721,15 +738,26 @@ if [[ "$ENGINE" == "qemu" ]]; then
   pkill -f "qemu-system.*-name $name " 2>/dev/null || true
 elif [[ "$ENGINE" == "firecracker" ]]; then
   oldpid=""
-  [[ -f "$RUNS_DIR/$name.conf" ]] && oldpid=$(grep -oE '^PID=[0-9]+' "$RUNS_DIR/$name.conf" | cut -d= -f2 || true)
+  oldpid=""
+  if vmf_instance_dir "$name"; then
+    [[ -f "$VMF_INST_CONF" ]] && oldpid=$(grep -oE '^PID=[0-9]+' "$VMF_INST_CONF" | cut -d= -f2 || true)
+  fi
   [[ -n "$oldpid" ]] && kill "$oldpid" 2>/dev/null || true
 else
   pkill -f "krunvm start ${name} --" 2>/dev/null || true
 fi
 sleep 0.5
 
-# State for `just ssh <name>`.
-cat > "$RUNS_DIR/$name.conf" <<EOF
+# State for `just ssh <name>` and `just ps`: one conf per instance,
+# inside the id-keyed dir. SRC records the user input, APPROACH the
+# install approach (race winner or direct), TARGET the rendered
+# deliverable the verify stage fills in after a pass.
+mkdir -p "$inst_dir"
+cat > "$inst_dir/conf" <<EOF
+ID=$inst_id
+NAME=$name
+SRC=$image
+APPROACH=${VMF_APPROACH:-image}
 PORT=$ssh_port
 IMAGE=$image
 PIN=${digest:-}
@@ -738,6 +766,8 @@ ENGINE=$ENGINE
 RUNDIR=$rundir
 RUN=$runid
 EOF
+# The name resolves to the current holder; a replace-run hands it over.
+ln -sfn "$inst_id" "$RUNS_DIR/$name"
 
 # Per-run guest inputs shared into the VM (hostname for the kernel UTS,
 # engine marker for the guest init's power-off behavior, port forwards
@@ -836,14 +866,27 @@ vmf_verify_stage() {
   [[ -n "$vplan" ]] || return 0
   local turn="${VMF_VERIFY_TURN:-1}" vrc=0
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
-    --hostfwd "$rundir/hostfwd" --console "$RUNS_DIR/$name.log" \
-    --evidence-out "$rundir/verify-evidence.json" || vrc=$?
+    --hostfwd "$rundir/hostfwd" --console "$inst_dir/log" \
+    --evidence-out "$rundir/verify-evidence.json" \
+    --target-out "$rundir/target" || vrc=$?
   # Verdict marker for the race coordinator: the final state of this
   # stage per VM. Recursions overwrite; the last writer wins.
-  _verdict() { printf '%s\n' "$1" > "$RUNS_DIR/$name.verdict"; }
+  _verdict() { printf '%s\n' "$1" > "$inst_dir/verdict"; }
   if [[ "$vrc" -eq 0 ]]; then
     _verdict pass
-    rm -f "$RUNS_DIR/$name.transcript.json"
+    # The rendered deliverable rides the conf; `just ps` and the race
+    # promotion print it, and the bump never stays silent again.
+    if [[ -f "$rundir/target" ]]; then
+      local tgt
+      tgt=$(head -1 "$rundir/target")
+      if grep -q '^TARGET=' "$inst_dir/conf" 2>/dev/null; then
+        sed -i "s|^TARGET=.*|TARGET=$tgt|" "$inst_dir/conf"
+      else
+        printf 'TARGET=%s\n' "$tgt" >> "$inst_dir/conf"
+      fi
+      echo "target: $tgt"
+    fi
+    rm -f "$inst_dir/transcript.json"
     return 0
   fi
   if [[ "$vrc" -eq 2 ]]; then
@@ -882,15 +925,15 @@ PY
   if bash "$SCRIPTS_DIR/ssh.sh" "$name" -- echo ok >/dev/null 2>&1; then
     if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]] && \
         python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$name" \
-        --rundir "$rundir" --out "$RUNS_DIR/$name.repaired.json" \
+        --rundir "$rundir" --out "$inst_dir/repaired.json" \
         --repair --context "$rundir/verify-evidence.json" \
-        --resume "$RUNS_DIR/$name.transcript.json" \
+        --resume "$inst_dir/transcript.json" \
         --image "$image" --phrase "$intent"; then
       if python3 -c 'import json,sys
 a, b = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
 sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
-          "$vplan" "$RUNS_DIR/$name.repaired.json"; then
-        cp "$RUNS_DIR/$name.repaired.json" "$vplan" 2>/dev/null || true
+          "$vplan" "$inst_dir/repaired.json"; then
+        cp "$inst_dir/repaired.json" "$vplan" 2>/dev/null || true
         echo "verify: repaired in place; re-checking..."
         VMF_VERIFY_TURN=$((turn + 1)) vmf_verify_stage
         return
@@ -956,18 +999,18 @@ if [[ "$ENGINE" == "qemu" ]]; then
   for v in "${volumes[@]:-}"; do
     [[ -n "$v" ]] && echo "warning: -v not supported by the qemu engine yet; ignored: $v" >&2
   done
-  rm -f "$RUNS_DIR/$name.log"
+  rm -f "$inst_dir/log"
   echo "creating microVM '$name' from $create_ref (qemu engine)..."
   vmf_tool buildah krunvm buildah
   BUILD_BIN=("${TOOL[@]}")
   VMF_IMAGE_REF="$create_ref" VMF_NAME="$name" VMF_RUNDIR="$rundir" \
-  VMF_CONF="$RUNS_DIR/$name.conf" VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$RUNS_DIR/$name.log" \
+  VMF_CONF="$inst_dir/conf" VMF_ASSETS="$MICROVM_DIR" VMF_CONSOLE="$inst_dir/log" \
   VMF_NET_MODE="${netmode:-open}" VMF_TIMEOUT_SECS="$timeout_secs" \
   VMF_DISK_BLOCKS="$disk_blocks" \
   VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
   "${BUILD_BIN[@]}" unshare -- bash "$(cd "$(dirname "$0")" && pwd)/qemu-boot.sh"
   if [[ "$detach" -eq 1 ]]; then
-    echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
+    echo "microVM '$name' detached; console log: $inst_dir/log"
     echo "ssh: just ssh $name   stop: just stop $name"
     vmf_verify_stage
   fi
@@ -1036,7 +1079,7 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   input_size=$(( 16 + input_extra ))M
   vmf_run e2fsprogs -- mke2fs -q -F -t ext4 -b 4096 -d "$stage" "$rundir/inputs.ext4" "$input_size"
   rm -rf "$stage"
-  rm -f "$RUNS_DIR/$name.log"
+  rm -f "$inst_dir/log"
   echo "creating microVM '$name' from $create_ref (firecracker engine)..."
   # Host-side expose poller: reads the guest's discovered port table
   # over ssh and adds slirp hostfwd entries for new ports through the
@@ -1044,7 +1087,7 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   # user-net hostfwd is fixed at boot). It starts before the boot and
   # waits for the VM to come up on its own.
   if [[ "$ssh" -eq 1 && "${netmode:-open}" != "off" ]]; then
-    VMF_NAME="$name" VMF_RUNDIR="$rundir" VMF_CONF="$RUNS_DIR/$name.conf" \
+    VMF_NAME="$name" VMF_RUNDIR="$rundir" VMF_CONF="$inst_dir/conf" \
       nohup bash "$(cd "$(dirname "$0")" && pwd)/expose-poller.sh" \
       >>"$rundir/expose-host.log" 2>&1 &
     disown
@@ -1052,12 +1095,12 @@ if [[ "$ENGINE" == "firecracker" ]]; then
   FCB=("${FC[@]}")
   VMF_NAME="$name" VMF_RUNDIR="$rundir" VMF_ASSETS_SQUASHFS="$squash" \
   VMF_KERNEL="$MICROVM_DIR/vmlinux" VMF_INITRAMFS="$MICROVM_DIR/initramfs.cpio.gz" \
-  VMF_CONF="$RUNS_DIR/$name.conf" VMF_CONSOLE="$RUNS_DIR/$name.log" \
+  VMF_CONF="$inst_dir/conf" VMF_CONSOLE="$inst_dir/log" \
   VMF_NET_MODE="${netmode:-open}" VMF_TIMEOUT_SECS="$timeout_secs" \
   VMF_DETACH="$detach" VMF_KEEP="$keep" VMF_CPUS="${cpus:-2}" VMF_MEM="${mem:-1024}" \
   "${FCB[@]}" bash "$(cd "$(dirname "$0")" && pwd)/firecracker-boot.sh"
   if [[ "$detach" -eq 1 ]]; then
-    echo "microVM '$name' detached; console log: $RUNS_DIR/$name.log"
+    echo "microVM '$name' detached; console log: $inst_dir/log"
     echo "ssh: just ssh $name   stop: just stop $name"
     vmf_verify_stage
   fi
@@ -1075,8 +1118,8 @@ krun create "$create_ref" "${create_args[@]}"
 cleanup() {
   if [[ "$keep" -eq 0 ]]; then
     krun delete "$name" >/dev/null 2>&1 || true
-    rm -rf "$rundir" "$RUNS_DIR/$name.log"
-    grep -q "^RUN=$runid$" "$RUNS_DIR/$name.conf" 2>/dev/null && rm -f "$RUNS_DIR/$name.conf"
+    rm -rf "$rundir" "$inst_dir/log"
+    if grep -q "^RUN=$runid$" "$inst_dir/conf" 2>/dev/null; then rm -rf "$inst_dir"; [[ "$(readlink "$RUNS_DIR/$name" 2>/dev/null)" == "$inst_id" ]] && rm -f "$RUNS_DIR/$name"; fi
   else
     echo "note: kept microVM '$name' (krunvm delete $name to remove)"
   fi
@@ -1088,7 +1131,7 @@ if [[ "$detach" -eq 1 ]]; then
   # entrypoint exits, the subshell tears the VM down (--rm) exactly like
   # the foreground path would.
   trap - EXIT
-  console_log="$RUNS_DIR/$name.log"
+  console_log="$inst_dir/log"
   if [[ "$ssh" -eq 1 ]]; then
     start_cmd=(krun start "$name" -- /vmf/init.sh)
   else
@@ -1100,7 +1143,7 @@ if [[ "$detach" -eq 1 ]]; then
     if [[ "$keep" -eq 0 ]]; then
       krun delete "$name" >/dev/null 2>&1 || true
       rm -rf "$rundir" "$console_log"
-      grep -q "^RUN=$runid$" "$RUNS_DIR/$name.conf" 2>/dev/null && rm -f "$RUNS_DIR/$name.conf"
+      if grep -q "^RUN=$runid$" "$inst_dir/conf" 2>/dev/null; then rm -rf "$inst_dir"; [[ "$(readlink "$RUNS_DIR/$name" 2>/dev/null)" == "$inst_id" ]] && rm -f "$RUNS_DIR/$name"; fi
     fi
   ) >/dev/null 2>&1 &
   disown

@@ -138,6 +138,12 @@ clean *args:
     #!/bin/sh
     exec bash scripts/vmf_clean.sh "$@"
 
+# Docker-ps view of VM instances: id, ref, approach, status, target.
+# --all shows race candidates; --json for scripts.
+ps *args:
+    #!/bin/sh
+    exec python3 scripts/vmf_ps.py "$@"
+
 # Remove generated build output for a box
 clean-lab lab:
     rm -rf build/{{ lab }}

@@ -364,11 +364,35 @@ def run_cmd(args):
     if passed == len(runnable):
         print("verdict: %d/%d checks pass%s"
               % (passed, len(runnable), skipped_note))
+        if args.target_out:
+            url = render_target(runnable, fwd)
+            if url:
+                try:
+                    open(args.target_out, "w").write(url + "\n")
+                except OSError:
+                    pass
         return 0
     print("verdict: %d/%d checks pass%s; %d failed"
           % (passed, len(runnable), skipped_note,
              len(runnable) - passed))
     return 1
+
+
+def render_target(runnable, fwd):
+    # The user-facing deliverable: the first web surface with its
+    # PUBLISHED host port (the bump is visible, never a surprise).
+    for kind, _port, spec in runnable:
+        if kind != "probe":
+            continue
+        p = spec["probe"]
+        hp = fwd.get(p["port"], p["port"])
+        return "http://127.0.0.1:%d%s" % (hp, p.get("path", "/"))
+    for kind, _port, spec in runnable:
+        if kind != "tcp":
+            continue
+        hp = fwd.get(spec["tcp"]["port"], spec["tcp"]["port"])
+        return "tcp://127.0.0.1:%d" % hp
+    return None
 
 
 def spec_key(kind, port, spec):
@@ -539,6 +563,7 @@ def main(argv):
     r.add_argument("--deadline", type=int,
                    default=int(os.environ.get("VMF_VERIFY_SECS", "300")))
     r.add_argument("--evidence-out")
+    r.add_argument("--target-out")
     v = sub.add_parser("revise")
     v.add_argument("plan")
     v.add_argument("out")

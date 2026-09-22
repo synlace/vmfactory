@@ -70,3 +70,48 @@ vmf_fwd_parse() {
     VMF_FWD_BIND=""
   fi
 }
+
+# Resolve a VM reference to its instance directory.
+# Accepts a name (the current symlink holder), a full 12-hex id, or a
+# unique id prefix. Falls back to the legacy flat layout (<name>.conf).
+# Sets VMF_INST_DIR (empty for legacy) and VMF_INST_CONF (the conf path).
+# Returns 1 when nothing matches; VMF_INST_ERR carries the user message.
+vmf_instance_dir() {
+  local ref="$1" runs="${2:-${VMF_RUNS:-$HOME/.vmf/runs}}" m d
+  VMF_INST_DIR=""
+  VMF_INST_CONF=""
+  VMF_INST_ERR=""
+  if [[ -L "$runs/$ref" ]]; then
+    m=$(readlink "$runs/$ref")
+    if [[ -f "$runs/$m/conf" ]]; then
+      VMF_INST_DIR="$runs/$m"
+      VMF_INST_CONF="$VMF_INST_DIR/conf"
+      return 0
+    fi
+  fi
+  if [[ "$ref" =~ ^[0-9a-f]{12}$ ]] && [[ -f "$runs/$ref/conf" ]]; then
+    VMF_INST_DIR="$runs/$ref"
+    VMF_INST_CONF="$VMF_INST_DIR/conf"
+    return 0
+  fi
+  if [[ "$ref" =~ ^[0-9a-f]{2,11}$ ]]; then
+    local -a hits=()
+    for d in "$runs/$ref"*; do
+      [[ -f "$d/conf" ]] && hits+=("$d")
+    done
+    if [[ ${#hits[@]} -eq 1 ]]; then
+      VMF_INST_DIR="${hits[0]}"
+      VMF_INST_CONF="$VMF_INST_DIR/conf"
+      return 0
+    elif [[ ${#hits[@]} -gt 1 ]]; then
+      VMF_INST_ERR="'$ref' matches ${#hits[@]} VMs: $(printf '%s ' "${hits[@]##*/}")— be more specific"
+      return 1
+    fi
+  fi
+  if [[ -f "$runs/$ref.conf" ]]; then
+    VMF_INST_CONF="$runs/$ref.conf"
+    return 0
+  fi
+  VMF_INST_ERR="no VM or box '$ref'"
+  return 1
+}

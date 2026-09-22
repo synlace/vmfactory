@@ -77,5 +77,48 @@ class ToolProvisioning(unittest.TestCase):
         self.assertIn("e3b0c44298fc1c14", out)
 
 
+class InstanceResolve(unittest.TestCase):
+    """vmf_instance_dir: name symlink, full id, unique prefix, ambiguity,
+    legacy flat layout."""
+
+    def setUp(self):
+        import tempfile
+        self.runs = tempfile.mkdtemp(prefix="vmf-inst-")
+        for ident, name in (("aabb11223344", "web"),
+                            ("ccdd55667788", "web2")):
+            d = os.path.join(self.runs, ident)
+            os.makedirs(d)
+            open(os.path.join(d, "conf"), "w").write("ID=%s\nNAME=%s\n" % (ident, name))
+            os.symlink(ident, os.path.join(self.runs, name))
+
+    def _resolve(self, ref):
+        # set -e in the harness: the resolver's rc=1 must not kill the
+        # script, so capture the rc explicitly.
+        return run_bash(
+            'export VMF_RUNS=%s; rc=0; vmf_instance_dir %s || rc=$?; '
+            'printf "rc=$rc dir=${VMF_INST_DIR:-} conf=${VMF_INST_CONF:-} err=${VMF_INST_ERR:-}"'
+            % (self.runs, ref)).stdout.strip()
+
+    def test_name_via_symlink(self):
+        self.assertIn("dir=%s/aabb11223344" % self.runs, self._resolve("web"))
+
+    def test_full_id(self):
+        self.assertIn("dir=%s/ccdd55667788" % self.runs, self._resolve("ccdd55667788"))
+
+    def test_unique_prefix(self):
+        self.assertIn("dir=%s/aabb11223344" % self.runs, self._resolve("aabb"))
+
+    def test_no_match_rc1(self):
+        out = self._resolve("zzzz")
+        self.assertIn("rc=1", out)
+        self.assertIn("no VM", out)
+
+    def test_legacy_flat_conf(self):
+        open(os.path.join(self.runs, "oldvm.conf"), "w").write("PORT=1\n")
+        out = self._resolve("oldvm")
+        self.assertIn("rc=0", out)
+        self.assertIn("conf=%s/oldvm.conf" % self.runs, out)
+
+
 if __name__ == "__main__":
     unittest.main()
