@@ -377,6 +377,29 @@ class ClampMemory(unittest.TestCase):
         self.assertEqual(vmf_plan._clamp_memory(1024, True), 2048)
         self.assertEqual(vmf_plan._clamp_memory(4096, True), 4096)
 
+
+class ClampComposeFile(unittest.TestCase):
+    """The enumeration's compose_file: basename, yaml, must exist."""
+
+    def setUp(self):
+        import tempfile
+        self.src = tempfile.mkdtemp(prefix="vmf-cf-")
+        open(os.path.join(self.src, "compose.dev.yaml"), "w").write("services: {}")
+
+    def test_valid_root_file(self):
+        self.assertEqual(vmf_plan._clamp_compose_file("compose.dev.yaml", self.src),
+                         "compose.dev.yaml")
+
+    def test_rejects_missing_file(self):
+        self.assertEqual(vmf_plan._clamp_compose_file("nope.yaml", self.src), "")
+
+    def test_rejects_paths(self):
+        self.assertEqual(
+            vmf_plan._clamp_compose_file("docker/dev/compose.yaml", self.src), "")
+
+    def test_rejects_non_yaml(self):
+        self.assertEqual(vmf_plan._clamp_compose_file("package.json", self.src), "")
+
     def test_junk_degrades_to_default(self):
         self.assertEqual(vmf_plan._clamp_memory("4G", False), 1024)
         self.assertEqual(vmf_plan._clamp_memory("junk", True), 2048)

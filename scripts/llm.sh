@@ -47,25 +47,50 @@ case "${role:-}" in
   *)       model="${model:-${VMF_LLM_MODEL:-z-ai/glm-5.3-flash}}" ;;
 esac
 
+# Role-aware curl ceiling: the gapfill/agent prompts carry repo
+# evidence and doc excerpts; a 60s default times them out mid-flight
+# and the caller reports "needs a model" instead of a timeout.
+case "${role:-}" in
+  gapfill|agent) timeout_default=220 ;;
+  *)             timeout_default=60 ;;
+esac
+
 # The caller passes the user-side prompt; the system prompt is fixed and
-# terse: strict JSON, nothing else.
-body=$(python3 - "$model" "$prompt" <<'PY'
-import json, sys
-print(json.dumps({
-    "model": sys.argv[1],
+# terse: strict JSON, nothing else. Reasoning effort is per-role:
+# bounded-vocab calls stay lean (intent), plan/repair calls get depth
+# (gapfill low, agent medium). Env overrides per role; VMF_REASONING=off
+# disables everywhere.
+body=$(VMF_ROLE="$role" python3 - "$model" "$prompt" <<'PY'
+import json, os, sys
+model, prompt = sys.argv[1], sys.argv[2]
+role = os.environ.get("VMF_ROLE", "")
+effort = {"gapfill": "low", "agent": "medium"}.get(role)
+if os.environ.get("VMF_REASONING", "").strip().lower() == "off":
+    effort = None
+override = {"intent": "VMF_INTENT_REASONING",
+            "gapfill": "VMF_GAPFILL_REASONING",
+            "agent": "VMF_AGENT_REASONING"}.get(role)
+if override:
+    v = os.environ.get(override, "").strip().lower()
+    effort = None if v in ("", "off", "none") else v
+msg = {
+    "model": model,
     "messages": [
         {"role": "system", "content":
          "You are a config resolver for the vmf CLI. Reply with ONE JSON "
          "object and nothing else. Never invent values outside the "
          "allowed sets the user message gives you."},
-        {"role": "user", "content": sys.argv[2]},
+        {"role": "user", "content": prompt},
     ],
     "temperature": 0,
-}))
+}
+if effort:
+    msg["reasoning"] = {"effort": effort}
+print(json.dumps(msg))
 PY
 )
 
-resp=$(curl -sS --max-time "${VMF_LLM_TIMEOUT:-60}" "$base/chat/completions" \
+resp=$(curl -sS --max-time "${VMF_LLM_TIMEOUT:-$timeout_default}" "$base/chat/completions" \
   -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
   -d "$body" 2>&1) || { echo "llm.sh: request failed: $resp" >&2; exit 3; }
 

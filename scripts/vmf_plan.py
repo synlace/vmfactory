@@ -323,9 +323,10 @@ def gapfill(root, plan_out):
                   "\"%s\"\nRevise the plan accordingly." % feedback)
         rc, o, err = vmf_llm.llm_call("gapfill", p)
         if rc != 0:
-            sys.stderr.write(err)
-            sys.stderr.write("error: gap-filler needs a model (VMF_GAPFILL_MODEL); "
-                             "the repo has no compose file\n")
+            sys.stderr.write(err or "")
+            sys.stderr.write("error: gap-filler call failed (rc=%s); "
+                             "no compose file in the repo to plan from\n"
+                             % rc)
             sys.exit(3)
         try:
             pj = vmf_llm.parse_llm_json(o)
@@ -874,18 +875,28 @@ def plan_cmd(src_arg, out):
     # Root compose wins; otherwise every subdirectory compose is a candidate.
     # VMF_PLAN_SKIP_COMPOSE=1 (the race's source_build candidate) forces
     # the direct/gapfill path even when a compose file exists.
+    # VMF_COMPOSE_HINT_FILE (the enumeration's compose_file, e.g. a dev
+    # compose variant) outranks the standard-name scan: the model read
+    # the dev script and named the file — the substrate honors it.
     candidates = []
     if os.environ.get("VMF_PLAN_SKIP_COMPOSE", "") != "1":
-        for cand in NAMES:
-            p = os.path.join(src, cand)
-            if os.path.isfile(p):
-                name_, svcs_, ports_ = meta(p)
-                candidates.append({"dir": src, "rel": ".", "file": cand,
-                                   "name": name_, "services": svcs_,
-                                   "ports": ports_})
-                break
-        if not candidates:
-            candidates = scan(src)
+        hint = os.environ.get("VMF_COMPOSE_HINT_FILE", "").strip()
+        if hint and "/" not in hint and os.path.isfile(os.path.join(src, hint)):
+            name_, svcs_, ports_ = meta(os.path.join(src, hint))
+            candidates.append({"dir": src, "rel": ".", "file": hint,
+                               "name": name_, "services": svcs_,
+                               "ports": ports_})
+        else:
+            for cand in NAMES:
+                p = os.path.join(src, cand)
+                if os.path.isfile(p):
+                    name_, svcs_, ports_ = meta(p)
+                    candidates.append({"dir": src, "rel": ".", "file": cand,
+                                       "name": name_, "services": svcs_,
+                                       "ports": ports_})
+                    break
+            if not candidates:
+                candidates = scan(src)
 
     sel = None
     if candidates:
@@ -1793,6 +1804,18 @@ def _clamp_int_ports(raw):
     return out[:8]
 
 
+def _clamp_compose_file(raw, src):
+    # A compose file the model identified in the repo ROOT (a dev
+    # compose variant like compose.dev.yaml). Basename only; it must
+    # exist; the substrate never trusts a path with separators.
+    s = str(raw or "").strip()
+    if not s or "/" in s or "\\" in s or not s.endswith((".yaml", ".yml")):
+        return ""
+    if len(s) > 120 or not os.path.isfile(os.path.join(src, s)):
+        return ""
+    return s
+
+
 def enumerate_cmd(src, out, verbose=False):
     found, skipped, total = read_repo_files(src)
     print_reading_phase(found, skipped, src, verbose=verbose)
@@ -1807,6 +1830,8 @@ def enumerate_cmd(src, out, verbose=False):
         '"evidence": "<file: reason, max 12 words>", '
         '"cost": "fast|slow|slowest", '
         '"image": "<container ref, prebuilt_image only>", '
+        '"compose_file": "<compose file the dev script uses, '
+        'compose kind only>", '
         '"ports": [<int serving ports, when the docs state them>]}]}\n'
         "Rules: kinds from the vocabulary only; at most 4; cheapest first; "
         "evidence names a real file; for prebuilt_image the ref is exact "
@@ -1833,6 +1858,9 @@ def enumerate_cmd(src, out, verbose=False):
                 img = _clamp_image_ref(a.get("image"))
                 if img and kind == "prebuilt_image":
                     entry["image"] = img
+                cf = _clamp_compose_file(a.get("compose_file"), src)
+                if cf and kind == "compose":
+                    entry["compose_file"] = cf
                 ports = _clamp_int_ports(a.get("ports"))
                 if ports:
                     entry["ports"] = ports

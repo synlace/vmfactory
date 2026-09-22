@@ -184,7 +184,7 @@ def satisfiable(kind, src, image, ports, log):
     return True
 
 
-def runner_cmd(kind, name, src, image, ports=None):
+def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
     # Candidates re-enter oci-run as children; the marker env stops the
     # race from re-entering. --yes/--ssh ride the runner args.
     env = dict(os.environ)
@@ -198,10 +198,17 @@ def runner_cmd(kind, name, src, image, ports=None):
     # verify deadline (built for fast images) expires mid-install.
     env.setdefault("VMF_VERIFY_SECS", "420")
     env.pop("VMF_RUN_INTENT", None)
-    if kind == "source_build":
+    if kind in ("source_build", "install_script"):
+        # Repo-install kinds run the gap-fill direct flow on the real
+        # source dir; a synthetic compose would need an image the plan
+        # does not carry (the "None" registry pull).
         env["VMF_PLAN_SKIP_COMPOSE"] = "1"
         args = [src]
     elif kind == "compose":
+        # The enumeration may name the compose file the dev script uses
+        # (a dev variant like compose.dev.yaml); the plan honors it.
+        if compose_file:
+            env["VMF_COMPOSE_HINT_FILE"] = compose_file
         args = [src]
     else:
         args = [synth_dir(kind, src, image, ports)]
@@ -304,7 +311,7 @@ def main(argv):
         if (queue and len(running) < PARALLEL
                 and now - last_event >= STAGGER):
             k = queue.pop(0)
-            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"], k["ports"])
+            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"], k["ports"], k.get("compose_file"))
             log = open(k["lp"], "a")
             log.write("\n===== boot =====\n")
             proc = subprocess.Popen(cmd, env=env, stdout=log,
@@ -428,7 +435,7 @@ def main(argv):
                 s.close()
                 time.sleep(1)
     time.sleep(2)
-    cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"])
+    cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"], w.get("compose_file"))
     env["VMF_NAME"] = base
     say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)" % (base, base))
     log = open(w["lp"], "a")

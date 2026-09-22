@@ -518,6 +518,40 @@ class ProbeHost(unittest.TestCase):
         self.assertEqual(url, "http://192.168.42.15:8080/")
 
 
+class CrashEvidencePhases(unittest.TestCase):
+    """Init-phase console noise is not an app crash; the over-broad
+    patterns count only after the runtime init began."""
+
+    def _ev(self, text):
+        import tempfile
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
+        f.write(text)
+        f.close()
+        ev = vmf_verify.crash_evidence(f.name)
+        os.unlink(f.name)
+        return ev
+
+    def test_init_phase_noise_ignored(self):
+        text = ("net: ip mode; dhcp on eth0...\n"
+                "udhcpc: no lease, failing\n"
+                "net: leased address NONE\n"
+                "ifconfig: /proc/net/dev: No such file or directory\n"
+                "vmf-init: mode=direct\n"
+                "vmf-init: expose daemon started (expose=all)\n")
+        self.assertIsNone(self._ev(text))
+
+    def test_post_init_failure_found(self):
+        text = ("vmf-init: mode=direct\n"
+                "node: Cannot find module '/app/server.js'\n")
+        ev = self._ev(text)
+        self.assertIn("Cannot find module", ev["actual"])
+
+    def test_specific_patterns_anywhere(self):
+        text = ("install.sh FAILED: pnpm install\n")
+        ev = self._ev(text)
+        self.assertIn("install.sh FAILED", ev["actual"])
+
+
 class TargetRender(unittest.TestCase):
     """render_target: the published deliverable from passing checks."""
 

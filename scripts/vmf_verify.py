@@ -203,16 +203,23 @@ def check_exec(cmd, name, spec):
                                               ((out + err).strip()[:200]))}
 
 
+# Specific app-failure markers: trustworthy anywhere in the console
+# (install scripts, node stacks, nginx...).
 CRASH_PATTERNS = (
     r"install\.sh FAILED", r"error: unrecognized arguments: .*",
     r"Traceback \(most recent call last\)",
     r"TypeError: ", r"ReferenceError: ",
     r"SyntaxError: .*", r"ModuleNotFoundError: .*",
     r"Cannot find module", r"npm error", r"ELIFECYCLE",
+    r"FATAL:", r"EADDRINUSE",
+)
+# Over-broad patterns that also match the guest's own init-phase noise
+# (busybox udhcpc/ifconfig quirks): trusted only AFTER the runtime init
+# began ("vmf-init: " markers).
+CRASH_PATTERNS_LATE = (
     r"Address already in use", r"permission denied",
     r"command not found: .*", r"not found: .*",
     r"user \S+ does not exist", r"No such file or directory",
-    r"FATAL:", r"EADDRINUSE",
 )
 
 
@@ -228,9 +235,19 @@ def crash_evidence(console):
     except OSError:
         return None
     last = None
-    for line in text.splitlines():
+    lines = text.splitlines()
+    # The late patterns start only after the last runtime-init marker;
+    # initramfs-phase traces (dhcp, busybox) never count as app crashes.
+    init_idx = -1
+    for i, line in enumerate(lines):
+        if "vmf-init:" in line:
+            init_idx = i
+    for i, line in enumerate(lines):
         line = line.strip()
-        for pat in CRASH_PATTERNS:
+        pats = list(CRASH_PATTERNS)
+        if i > init_idx:
+            pats += list(CRASH_PATTERNS_LATE)
+        for pat in pats:
             m = re.search(pat, line)
             if m:
                 last = line[:200]
