@@ -23,7 +23,7 @@ GEN_DIR="${VMF_GENERATED:-$HOME/.vmf/generated}"
 PINS="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 
-GROUPS="vms drives plans race"
+GROUP_NAMES="vms drives plans race"
 yes_flag=0
 want=""
 want_pins=0
@@ -260,14 +260,14 @@ echo "clean: dry run — vms $(fmt_size "$sz_vms"), drives $(fmt_size "$sz_drive
 chosen=""
 if [[ "$yes_flag" == "1" ]]; then
   chosen="$want"
-  [[ -n "$chosen" ]] || chosen="$GROUPS"
+  [[ -n "$chosen" ]] || chosen="$GROUP_NAMES"
 else
   if [[ -t 0 ]]; then
     printf 'gate: what to remove? [a = all above, n = abort, or list: %s] ' \
-      "$(printf '%s,' "$GROUPS" | sed 's/,$//')"
+      "$(printf '%s,' "$GROUP_NAMES" | sed 's/,$//')"
     read -r ans
     case "$ans" in
-      a|A) chosen="$GROUPS" ;;
+      a|A) chosen="$GROUP_NAMES" ;;
       ""|n|N) echo "clean: abort; nothing deleted"; exit 0 ;;
       *) chosen="$ans" ;;
     esac
@@ -278,7 +278,7 @@ else
 fi
 chosen=$(printf '%s' "$chosen" | tr ',' ' ' | tr -s ' ')
 for g in $chosen; do
-  case " $GROUPS " in *" $g "*) ;; *) echo "clean: unknown group '$g'; abort"; exit 2 ;; esac
+  case " $GROUP_NAMES " in *" $g "*) ;; *) echo "clean: unknown group '$g'; abort"; exit 2 ;; esac
 done
 if [[ "$want_pins" == "1" ]]; then
   chosen="$chosen pins"
