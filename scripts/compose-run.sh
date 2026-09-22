@@ -40,6 +40,17 @@ ref_component() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
     | sed -e 's/[^a-z0-9._-]/-/g' -e 's/[-._][-._]*/-/g' -e 's/^[-._]*//' -e 's/[-._]*$//'
 }
+
+tcp_ready() { # port timeout_secs
+  local port="$1" deadline=$(( $(date +%s) + ${2:-30} ))
+  while (( $(date +%s) < deadline )); do
+    if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 tag_for() { printf 'localhost/vmf-compose/%s-%s:%s' "$(ref_component "$VMF_COMPOSE_SLUG")" "$(ref_component "$1")" "$VMF_COMPOSE_RUNID"; }
 
 vmf_tool buildah krunvm buildah
@@ -54,8 +65,12 @@ plan_tmp=$(mktemp -d)
 data_tmp="$plan_tmp/data"
 # EXIT alone does not fire on SIGTERM (timeout kills), so trap INT and
 # TERM too — a killed run must not leak a ~800 MB staging dir per
-# attempt.
-trap 'rm -rf "$plan_tmp"' EXIT INT TERM
+# attempt, or a throwaway build db.
+cleanup_compose() {
+  rm -rf "$plan_tmp"
+  [[ -z "${synth_ctr:-}" ]] || docker rm -f "$synth_ctr" >/dev/null 2>&1 || true
+}
+trap cleanup_compose EXIT INT TERM
 if [[ "${VMF_COMPOSE_KEEPPLAN:-0}" == "1" ]]; then
   # Keep the working dir for diagnosis instead of cleaning it up.
   trap 'echo "compose: kept working dir: $plan_tmp"' EXIT INT TERM
@@ -224,6 +239,58 @@ while IFS=$'\t' read -r name kind rest; do
     "${JQ[@]}" -r --arg n "$name" \
       '.services[] | select(.name==$n) | ((.synth_env // {}) | to_entries[]) | [(.key|tostring), (.value|tostring)] | @tsv' \
       "$plan_tmp/plan.json" > "$plan_tmp/synth-$name.tsv"
+    # Build-window database: an app that connects while building needs a
+    # reachable db. Start the declared db sibling as a throwaway host
+    # container, map its name to the host loopback for the build's RUN
+    # steps, and tear it down after. Runs BEFORE the block conversion so
+    # a bumped port lands in the rewritten URI. VMF_BUILD_DB_DISABLE=1
+    # skips this.
+    bh_flags=()
+    synth_ctr=""
+    if [[ "${VMF_BUILD_DB_DISABLE:-0}" != "1" && -s "$plan_tmp/synth-$name.tsv" ]]; then
+      while IFS=$'\t' read -r dsvc dport; do
+        [[ -n "$dsvc" ]] || continue
+        if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+          echo "note: no docker runtime; the build db ('$dsvc') will be " \
+               "unreachable during the build" >&2
+          continue
+        fi
+        dimg=$("${JQ[@]}" -r --arg s "$dsvc" \
+          '.services[] | select(.name==$s) | (.image // .tag // empty)' \
+          "$plan_tmp/plan.json")
+        [[ -n "$dimg" ]] || { echo "note: db sibling '$dsvc' has no image; skipping the build db" >&2; continue; }
+        while IFS=$'\t' read -r u p; do
+          synth_ctr="vmf-build-db-$name-$$"
+          echo "compose: starting build db '$dsvc' ($dimg on 127.0.0.1:ephemeral)..."
+          if docker run -d --rm --name "$synth_ctr" \
+              -e "MONGO_INITDB_ROOT_USERNAME=$u" \
+              -e "MONGO_INITDB_ROOT_PASSWORD=$p" \
+              -p 127.0.0.1::"$dport" "$dimg" >/dev/null 2>&1; then
+            hport=$(docker port "$synth_ctr" "$dport/tcp" 2>/dev/null | awk 'NR==1{print $NF}' | sed 's/.*://')
+            if tcp_ready "$hport" 60; then
+              [[ "$hport" != "$dport" ]] && \
+                sed -i -E "s/@([^:/]+):$dport/@\1:$hport/" "$plan_tmp/synth-$name.tsv"
+              bh_flags+=(--network host --add-host "$dsvc:127.0.0.1")
+              echo "compose: build db ready on 127.0.0.1:$hport ($dsvc -> 127.0.0.1)"
+            else
+              echo "note: build db '$dsvc' did not open a port in time; " \
+                   "continuing without it" >&2
+              docker rm -f "$synth_ctr" >/dev/null 2>&1 || true
+              synth_ctr=""
+            fi
+          else
+            echo "note: could not start the build db '$dsvc'; continuing " \
+                 "without it" >&2
+            synth_ctr=""
+          fi
+        done < <("${JQ[@]}" -r --arg s "$dsvc" \
+          '.services[] | select(.name==$s) | [(.env.MONGO_INITDB_ROOT_USERNAME // "root"), (.env.MONGO_INITDB_ROOT_PASSWORD // "example")] | @tsv' \
+          "$plan_tmp/plan.json")
+        break   # one db sibling per service build is enough for now
+      done < <("${JQ[@]}" -r --arg n "$name" \
+        '.services[] | select(.name==$n) | (.synth_from // {}) | to_entries[0] | [.value.service, .value.port] | @tsv' \
+        "$plan_tmp/plan.json")
+    fi
     if [[ -s "$plan_tmp/synth-$name.tsv" ]]; then
       while IFS=$'\t' read -r k v; do
         [[ -n "$k" ]] || continue
@@ -242,7 +309,10 @@ while IFS=$'\t' read -r name kind rest; do
     fi
     build_args=()
     "${BUILD_BIN[@]}" build -t "$tag" -f "$dockerfile" \
+      ${bh_flags[@]+"${bh_flags[@]}"} \
       ${build_args[@]+"${build_args[@]}"} "$ctx" >/dev/null
+    [[ -z "$synth_ctr" ]] || docker rm -f "$synth_ctr" >/dev/null 2>&1 || true
+    synth_ctr=""
     # Digest of the built image. The reader must drain the full inspect
     # output: head -1 closes the pipe early and SIGPIPEs grep (141) when
     # the output carries several sha256 matches, which pipefail turns

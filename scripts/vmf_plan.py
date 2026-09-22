@@ -445,6 +445,7 @@ def _synth_db_env(env, svcs, self_name):
     # service names the in-network host, its environment block names the
     # credentials. Only keys that are still absent are set.
     from urllib.parse import quote
+    meta = {}
 
     def _cred(svc, key):
         eraw = svc.get("environment") or {}
@@ -466,12 +467,28 @@ def _synth_db_env(env, svcs, self_name):
                 continue
             user = quote(_cred(svc, "MONGO_INITDB_ROOT_USERNAME") or "root", safe="")
             pw = quote(_cred(svc, "MONGO_INITDB_ROOT_PASSWORD") or "example", safe="")
-            uri = "mongodb://%s:%s@%s:27017/%s?authSource=admin" \
-                % (user, pw, n, self_name)
+            dbport = _declared_port(svc) or 27017
+            uri = "mongodb://%s:%s@%s:%d/%s?authSource=admin" \
+                % (user, pw, n, dbport, self_name)
             for k in ("MONGODB_URI", "MONGO_URI"):
                 if k not in env and k not in out:
                     out[k] = uri
-    return out
+                    # Build-window provenance: the compose-run build step
+                    # starts this sibling as a throwaway container and
+                    # maps its name to the host loopback for the build.
+                    meta.setdefault(k, {"service": n, "host": n,
+                                        "port": dbport})
+    return out, meta
+
+
+def _declared_port(svc):
+    # First declared host port from the raw compose service ports.
+    for pv in svc.get("ports") or []:
+        pv = str(pv)
+        h = pv.split(":")[0].split("/")[0]
+        if h.isdigit():
+            return int(h)
+    return None
 
 
 def translate(compose_path, src, root):
@@ -574,10 +591,12 @@ def translate(compose_path, src, root):
                     sys.stderr.write("warning: env_file %s not found; skipped\n" % f)
         # Build-time visibility for the synthesized vars: the app may read
         # them during the image build (Next.js page-data collection does).
-        synth_env = _synth_db_env(env, svcs, name)
+        synth_env, synth_from = _synth_db_env(env, svcs, name)
         if synth_env:
             env.update(synth_env)
             e["synth_env"] = synth_env
+            if synth_from:
+                e["synth_from"] = synth_from
             sys.stderr.write("note: %s: synthesized %s from the compose "
                              "topology\n" % (name, ", ".join(sorted(synth_env))))
         e["env"] = env
