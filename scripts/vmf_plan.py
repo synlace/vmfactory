@@ -441,46 +441,162 @@ def norm_image(img):
     return "docker.io/library/" + img
 
 
-def _synth_db_env(env, svcs, self_name):
-    # A missing env_file is the common bootstrap gap (repos tell users to
-    # "cp .env.example .env" and ship neither). Synthesize the documented
-    # connection vars from the compose's own topology: a sibling db
-    # service names the in-network host, its environment block names the
-    # credentials. Only keys that are still absent are set.
-    from urllib.parse import quote
-    meta = {}
+_DB_SIBLING_PREFIXES = ("mongo", "postgres", "postgis", "mysql",
+                        "mariadb", "redis")
 
-    def _cred(svc, key):
-        eraw = svc.get("environment") or {}
-        if isinstance(eraw, dict):
-            v = eraw.get(key)
-            return "" if v is None else str(v)
-        if isinstance(eraw, list):
-            for kv in eraw:
-                if isinstance(kv, str) and kv.partition("=")[0] == key:
-                    return kv.partition("=")[2]
-        return ""
 
-    out = {}
+def _db_sibling(svcs, self_name):
+    # Trigger detection only: a declared db sibling makes the missing
+    # env_file synthesizable. The VALUES come from the grounded call.
     for n, svc in svcs.items():
+        if n == self_name:
+            continue
         img = str(svc.get("image") or "")
         base = img.rsplit(":", 1)[0].rsplit("/", 1)[-1].lower()
-        if base.startswith("mongo"):
-            if n == self_name:
-                continue
-            user = quote(_cred(svc, "MONGO_INITDB_ROOT_USERNAME") or "root", safe="")
-            pw = quote(_cred(svc, "MONGO_INITDB_ROOT_PASSWORD") or "example", safe="")
-            dbport = _declared_port(svc) or 27017
-            uri = "mongodb://%s:%s@%s:%d/%s?authSource=admin" \
-                % (user, pw, n, dbport, self_name)
-            for k in ("MONGODB_URI", "MONGO_URI"):
-                if k not in env and k not in out:
-                    out[k] = uri
-                    # Build-window provenance: the compose-run build step
-                    # starts this sibling as a throwaway container and
-                    # maps its name to the host loopback for the build.
-                    meta.setdefault(k, {"service": n, "host": n,
-                                        "port": dbport})
+        if base.startswith(_DB_SIBLING_PREFIXES):
+            return n, svc
+    return None, None
+
+
+def _svc_env(svc):
+    # The sibling's declared environment as a plain dict (creds the
+    # prompt shows and the URI may carry).
+    eraw = svc.get("environment") or {}
+    if isinstance(eraw, dict):
+        return {str(k): ("" if v is None else str(v)) for k, v in eraw.items()}
+    out = {}
+    if isinstance(eraw, list):
+        for kv in eraw:
+            if isinstance(kv, str):
+                k, _, v = kv.partition("=")
+                out[k] = v
+            else:
+                out.update({str(k): ("" if v is None else str(v))
+                            for k, v in kv.items()})
+    return out
+
+
+_DB_URI_SCHEMES = ("mongodb", "postgres", "postgresql", "mysql", "redis")
+
+
+def _clamp_synth_value(v, sib, sibport, sibenv):
+    # The compose topology is authoritative for host, port, and
+    # credentials — but only for db connection schemes. App URLs
+    # (http://...) pass through untouched. srv URIs pass through too:
+    # srv cannot carry a port.
+    from urllib.parse import quote
+    v = "".join(c for c in v if ord(c) >= 32 and ord(c) != 127).strip()
+    if len(v) > 300:
+        return ""
+    scheme = v.split("://", 1)[0].lower()
+    if not scheme.startswith(_DB_URI_SCHEMES) or "+srv" in scheme:
+        return v[:300]
+    m = re.match(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.]*://)"
+                 r"(?:(?P<userinfo>[^@/]*)@)?"
+                 r"(?P<host>[^/:?]+)(?P<port>:\d+)?"
+                 r"(?P<rest>[/?].*)?$", v)
+    if not m:
+        return v[:300]
+    d = m.groupdict()
+    host = d["host"]
+    if host != sib:
+        d["host"] = sib
+        d["port"] = ":%d" % sibport if d["port"] or host else ""
+    # Declared credentials win: when the sibling names a user and a
+    # password pair, they REPLACE the model's userinfo or supply one it
+    # omitted (README placeholders and atlas templates are the drift).
+    userinfo = ""
+    if sibenv:
+        ukey = next((k for k in sibenv
+                     if re.search(r"USER|USERNAME|LOGIN", k, re.I)
+                     and sibenv[k]), None)
+        pkey = next((k for k in sibenv
+                     if re.search(r"PASSWORD|PASS\b|SECRET", k, re.I)
+                     and sibenv[k]), None)
+        if ukey and pkey:
+            userinfo = "%s:%s" % (quote(sibenv[ukey], safe=""),
+                                  quote(sibenv[pkey], safe=""))
+    if userinfo:
+        userinfo += "@"
+    out = "%s%s%s%s%s" % (d["scheme"], userinfo,
+                          d["host"], d["port"], d["rest"] or "")
+    # Official-image contract: MONGO_INITDB_ROOT_USERNAME creates the
+    # root user in the admin database, so a mongo URI carrying those
+    # credentials must target authSource=admin when it says nothing.
+    if (userinfo and d["scheme"].startswith("mongodb://")
+            and "MONGO_INITDB_ROOT_USERNAME" in sibenv
+            and "authSource" not in out and "?" not in out):
+        out += "?authSource=admin"
+    return out
+
+
+def _synth_env_for(compose_path, svcs, self_name, have_env):
+    # The trigger is deterministic (env_file declared and missing, no
+    # .env.example, a db sibling exists). The CONTENT is repo knowledge:
+    # one grounded call reads the README and the compose and proposes the
+    # documented env values. The clamp pins keys and rewrites hosts and
+    # ports to the topology. No model → empty result; the satisfiability
+    # check then reports the gap honestly.
+    sib, sibsvc = _db_sibling(svcs, self_name)
+    if not sib:
+        return {}, {}
+    sibport = _declared_port(sibsvc) or 0
+    sibenv = _svc_env(sibsvc)
+    readme = ""
+    for cand in ("README.md", "README.rst", "readme.md", "README"):
+        p = os.path.join(os.path.dirname(compose_path), cand)
+        if os.path.isfile(p):
+            with open(p, errors="replace") as f:
+                readme = f.read(8192)
+            break
+    with open(compose_path, errors="replace") as f:
+        compose_text = f.read(8192)
+    prompt = (
+        "The docker-compose file declares env_file: .env but the repo "
+        "ships none (no .env.example either). Produce the env values the "
+        "app needs.\n"
+        "Sibling service '%s' is reachable in the compose network at host "
+        "'%s' port %d with declared environment %s.\n"
+        'Reply ONE JSON object: {"env": {"<KEY>": "<value>"}}\n'
+        "Rules: at most 6; use the EXACT key names the README's env "
+        "block documents; connection strings use host '%s' and port %d, "
+        "carry the sibling's declared credentials, and follow the shape "
+        "the README documents; database name may be the app name '%s'.\n\n"
+        "===== docker-compose =====\n%s\n===== README =====\n%s\n"
+        % (sib, sib, sibport, json.dumps(sibenv, sort_keys=True),
+           sib, sibport, self_name, compose_text, readme))
+    role = os.environ.get("VMF_SYNTH_ROLE", "gapfill")
+    # One retry: an empty or unparseable reply is usually a transient
+    # model hiccup, and a silent synth gap costs a whole failed build.
+    dj = None
+    for _attempt in (1, 2):
+        rc, o, e = vmf_llm.llm_call(role, prompt, timeout=90)
+        if rc == 0:
+            try:
+                dj = vmf_llm.parse_llm_json(o)
+                if dj.get("env"):
+                    break
+            except Exception:
+                dj = None
+    if not dj:
+        return {}, {}
+    out = {}
+    meta = {}
+    # NODE_ENV never comes from env recovery: it flips npm install (dev
+    # dependencies) and next build behavior — runtime build policy is
+    # the compose/Dockerfile's business, not the synth's.
+    deny = {"NODE_ENV"}
+    for k, v in (dj.get("env") or {}).items():
+        k = str(k).upper()
+        if not re.match(r"^[A-Z_][A-Z0-9_]{0,63}$", k) or k in have_env:
+            continue
+        if k in deny:
+            continue
+        v = _clamp_synth_value(str(v), sib, sibport, sibenv)
+        if not v or len(out) >= 6:
+            continue
+        out[k] = v
+        meta[k] = {"service": sib, "host": sib, "port": sibport}
     return out, meta
 
 
@@ -594,14 +710,25 @@ def translate(compose_path, src, root):
                     sys.stderr.write("warning: env_file %s not found; skipped\n" % f)
         # Build-time visibility for the synthesized vars: the app may read
         # them during the image build (Next.js page-data collection does).
-        synth_env, synth_from = _synth_db_env(env, svcs, name)
+        env_file_missing = bool(s.get("env_file")) and not os.path.isfile(
+            os.path.join(src, ".env.example"))
+        synth_env, synth_from = {}, {}
+        if env_file_missing:
+            synth_env, synth_from = _synth_env_for(compose_path, svcs, name, env)
         if synth_env:
             env.update(synth_env)
             e["synth_env"] = synth_env
             if synth_from:
                 e["synth_from"] = synth_from
-            sys.stderr.write("note: %s: synthesized %s from the compose "
-                             "topology\n" % (name, ", ".join(sorted(synth_env))))
+            sys.stderr.write("note: %s: synthesized %s from the repo docs\n"
+                             % (name, ", ".join(sorted(synth_env))))
+        elif env_file_missing:
+            # Honest gap: the satisfiability check reports this instead of
+            # letting the build or runtime fail with an obscure error.
+            e["env_unresolved"] = True
+            sys.stderr.write("warning: %s: env unresolvable (env_file "
+                             "missing, no .env.example, no db sibling or "
+                             "no model)\n" % name)
         e["env"] = env
         # Network aliases declared on the service's networks: kept so the
         # flattened compose can point every other service's extra_hosts at

@@ -21,7 +21,8 @@
       "properties": {
         "host": {"type": "integer", "minimum": 1, "maximum": 65535},
         "cport": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "proto": {"enum": ["tcp", "udp"]}
+        "proto": {"enum": ["tcp", "udp"]},
+        "bind": {"type": "string"}
       }
     },
     "check": {
@@ -76,6 +77,13 @@
         "ports": {"type": "array", "items": {"$ref": "#/definitions/port"}},
         "expose": {"type": "array", "items": {"type": "string"}},
         "env": {"type": "object", "additionalProperties": {"type": "string"}},
+        "synth_env": {"type": "object", "additionalProperties": {"type": "string"}},
+        "synth_from": {"type": "object",
+                       "additionalProperties": {"type": "object",
+                         "properties": {"service": {"type": "string"},
+                                        "host": {"type": "string"},
+                                        "port": {"type": "integer"}}}},
+        "env_unresolved": {"type": "boolean"},
         "aliases": {"type": "array", "items": {"type": "string"}},
         "depends_on": {"type": "array", "items": {"type": "string"}}
       }

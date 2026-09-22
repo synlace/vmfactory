@@ -51,6 +51,19 @@ tcp_ready() { # port timeout_secs
   done
   return 1
 }
+
+auth_ready() { # container user pass timeout_secs
+  local ctr="$1" u="$2" p="$3" deadline=$(( $(date +%s) + ${4:-60} ))
+  while (( $(date +%s) < deadline )); do
+    if docker exec "$ctr" mongosh --quiet -u "$u" -p "$p" \
+        --authenticationDatabase admin \
+        --eval "db.adminCommand('ping')" 2>/dev/null | grep -q "ok"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
 tag_for() { printf 'localhost/vmf-compose/%s-%s:%s' "$(ref_component "$VMF_COMPOSE_SLUG")" "$(ref_component "$1")" "$VMF_COMPOSE_RUNID"; }
 
 vmf_tool buildah krunvm buildah
@@ -267,7 +280,12 @@ while IFS=$'\t' read -r name kind rest; do
               -e "MONGO_INITDB_ROOT_PASSWORD=$p" \
               -p 127.0.0.1::"$dport" "$dimg" >/dev/null 2>&1; then
             hport=$(docker port "$synth_ctr" "$dport/tcp" 2>/dev/null | awk 'NR==1{print $NF}' | sed 's/.*://')
-            if tcp_ready "$hport" 60; then
+            # TCP-ready is a false signal here: the entrypoint's
+            # init-phase mongod serves the port before the root user
+            # exists, then restarts. An authenticated ping is the real
+            # readiness. (The build db is mongo-shaped by design for
+            # now; other engines need their own readiness probe.)
+            if tcp_ready "$hport" 60 && auth_ready "$synth_ctr" "$u" "$p" 90; then
               [[ "$hport" != "$dport" ]] && \
                 sed -i -E "s/@([^:/]+):$dport/@\1:$hport/" "$plan_tmp/synth-$name.tsv"
               bh_flags+=(--network host --add-host "$dsvc:127.0.0.1")
@@ -305,6 +323,10 @@ while IFS=$'\t' read -r name kind rest; do
           { print; if (FNR == at) { while ((getline l < bf) > 0) print l } }
         ' "$dockerfile" > "$dockerfile.tmp" && mv "$dockerfile.tmp" "$dockerfile"
         echo "compose: build env injected at FROM line $last_from"
+        while IFS=$'\t' read -r k v; do
+          [[ -n "$k" ]] || continue
+          echo "compose: build env $k=$v"
+        done < "$plan_tmp/synth-$name.tsv"
       fi
     fi
     build_args=()
