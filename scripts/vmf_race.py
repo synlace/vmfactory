@@ -51,10 +51,16 @@ def _plan_interp():
 PLAN_PY = _plan_interp()
 
 
-def plan_stage(src, out):
+def plan_stage(src, out, compose_file=None):
+    # The prune-phase plan must see the same compose-file hint the boot
+    # would get, or the prune judges a compose variant the model never
+    # named (ghost's docker/dev-url-testing vs compose.dev.yaml).
+    env = dict(os.environ)
+    if compose_file:
+        env["VMF_COMPOSE_HINT_FILE"] = compose_file
     return subprocess.run(PLAN_PY + [
         os.path.join(SCRIPTS, "vmf_plan.py"), "plan", src, out],
-        capture_output=True, text=True)
+        capture_output=True, text=True, env=env)
 
 
 def say(msg):
@@ -139,7 +145,7 @@ def synth_dir(kind, src, image, ports):
     return d
 
 
-def satisfiable(kind, src, image, ports, log):
+def satisfiable(kind, src, image, ports, log, compose_file=None):
     # Prune before boot: the plan stage must succeed, no env gap, and at
     # least one declared tcp port for the verify arbiter.
     if kind == "prebuilt_image" and not image:
@@ -155,7 +161,7 @@ def satisfiable(kind, src, image, ports, log):
         if kind != "compose":
             psrc = synth_dir(kind, src, image, ports)
         out = os.path.join(RUNS, ".race-plan.json")
-        rc = plan_stage(psrc, out)
+        rc = plan_stage(psrc, out, compose_file)
         if rc.returncode != 0:
             log.write("pruned: plan stage failed\n%s" % rc.stderr[-1500:])
             return False
@@ -258,7 +264,7 @@ def main(argv):
             cand = "%s-c%d" % (base, i)
             lp = os.path.join(logdir, "%s.log" % cand)
             with open(lp, "w") as log:
-                ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log)
+                ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log, a.get("compose_file"))
             if ok:
                 alive += 1
             else:
@@ -278,7 +284,7 @@ def main(argv):
         cand = "%s-c%d" % (base, i)
         lp = os.path.join(logdir, "%s.log" % cand)
         with open(lp, "w") as log:
-            ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log)
+            ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log, a.get("compose_file"))
         if ok:
             keep.append({"i": i, "kind": a["kind"], "cand": cand, "lp": lp,
                          "image": a.get("image"), "ports": a.get("ports") or []})
