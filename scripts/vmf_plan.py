@@ -15,6 +15,9 @@
 #                               plan + refines → flattened compose + ports
 #   ports <plan.json> [refines.json]
 #                               refined extra VM ports as "host<TAB>proto<TAB>reps" TSV
+#   enumerate <src> <out.json> [--grounding]
+#                               repo read set + one grounded call → the
+#                               install-approach list (cheapest first)
 #
 # Contracts (schemas/plan.schema.json, schemas/refines.schema.json):
 #   plan.json    {compose_file, project_dir, primary, services: [...]}
@@ -1532,6 +1535,162 @@ def intent_cmd(image, phrase, out):
     return 0
 
 
+REPO_READ_FILES = (
+    "README.md", "README.rst", "readme.md", "README",
+    "AGENTS.md", "CLAUDE.md",
+    "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml",
+    "Dockerfile", "install.sh", "setup.sh",
+    "package.json", "Makefile", "requirements.txt", "pyproject.toml",
+    "setup.py", "go.mod", "Cargo.toml", "Gemfile", "pom.xml",
+    "build.gradle", "CMakeLists.txt", ".env.example",
+)
+APPROACH_KINDS = ("compose", "dockerfile", "prebuilt_image",
+                  "install_script", "source_build")
+APPROACH_COST = {"compose": "fast", "dockerfile": "slow",
+                 "prebuilt_image": "fast", "install_script": "slowest",
+                 "source_build": "slowest"}
+
+
+def _fmt_bytes(n):
+    if n >= 1048576:
+        return "%.1f MB" % (n / 1048576)
+    if n >= 1024:
+        return "%.1f KB" % (n / 1024)
+    return "%d B" % n
+
+
+def read_repo_files(src, cap_bytes=40960):
+    # Bounded read set from the clone root, cheapest-evidence order.
+    found = []
+    skipped = 0
+    total = 0
+    for rel in REPO_READ_FILES:
+        p = os.path.join(src, rel)
+        if not os.path.isfile(p):
+            continue
+        sz = os.path.getsize(p)
+        if total + sz > cap_bytes:
+            skipped += 1
+            continue
+        with open(p, "rb") as f:
+            content = f.read(cap_bytes - total).decode("utf-8", "replace")
+        found.append((rel, sz, content))
+        total += sz
+    return found, skipped, total
+
+
+def print_reading_phase(found, skipped, src, verbose=False):
+    # The visible reading phase: what was read, in what size, and which
+    # watchlist files are absent. --grounding adds numbered excerpts.
+    watchlist = ("README.md", "AGENTS.md", "docker-compose.yml",
+                 "Dockerfile", ".env.example")
+    shown = set()
+    for rel, sz, content in found:
+        sys.stderr.write("reading: %-24s %8s\n" % (rel, _fmt_bytes(sz)))
+        shown.add(rel)
+        if verbose:
+            for i, line in enumerate(content.splitlines()[:8], 1):
+                if line.strip():
+                    sys.stderr.write("  %4d: %s\n" % (i, line[:100]))
+    for rel in watchlist:
+        if rel in shown:
+            continue
+        if os.path.isfile(os.path.join(src, rel)):
+            continue  # found but over the byte cap; the skip note covers it
+        sys.stderr.write("reading: %-24s      --\n" % rel)
+    if skipped:
+        sys.stderr.write("reading: %d file(s) skipped (byte cap)\n" % skipped)
+
+
+def _base_approaches(found):
+    # Deterministic enumeration from file presence: the fallback when the
+    # model is unavailable, and the sanity floor when it answers.
+    names = {rel for rel, _, _ in found}
+    out = []
+    if names & {"docker-compose.yml", "docker-compose.yaml",
+                "compose.yml", "compose.yaml"}:
+        out.append({"kind": "compose",
+                    "evidence": "compose file in the repo root",
+                    "cost": "fast"})
+    if "Dockerfile" in names:
+        out.append({"kind": "dockerfile",
+                    "evidence": "Dockerfile in the repo root",
+                    "cost": "slow"})
+    if names & {"package.json", "Makefile", "requirements.txt",
+                "pyproject.toml", "go.mod", "Cargo.toml", "Gemfile",
+                "pom.xml", "build.gradle", "CMakeLists.txt"}:
+        out.append({"kind": "source_build",
+                    "evidence": "build manifest in the repo root",
+                    "cost": "slowest"})
+    return out
+
+
+def enumerate_cmd(src, out, verbose=False):
+    found, skipped, total = read_repo_files(src)
+    print_reading_phase(found, skipped, src, verbose=verbose)
+    base = _base_approaches(found)
+
+    prompt = (
+        "You plan disposable microVM runs. These are the first files of a "
+        "cloned repository. List EVERY way to install and run this "
+        "application, cheapest first.\n"
+        'Reply ONE JSON object: {"approaches": [{"kind": "compose|'
+        'dockerfile|prebuilt_image|install_script|source_build", '
+        '"evidence": "<file: reason, max 12 words>", '
+        '"cost": "fast|slow|slowest"}]}\n'
+        "Rules: kinds from the vocabulary only; at most 4; cheapest first; "
+        "evidence names a real file.\n\n")
+    for rel, _, content in found:
+        prompt += "===== %s =====\n%s\n" % (rel, content)
+    role = os.environ.get("VMF_ENUMERATE_ROLE", "gapfill")
+    rc, o, e = vmf_llm.llm_call(role, prompt, timeout=90)
+    got = []
+    if rc == 0:
+        try:
+            dj = vmf_llm.parse_llm_json(o)
+            for a in (dj.get("approaches") or [])[:4]:
+                if not isinstance(a, dict):
+                    continue
+                kind = a.get("kind")
+                if kind not in APPROACH_KINDS:
+                    continue
+                got.append({"kind": kind,
+                            "evidence": str(a.get("evidence") or kind)[:120],
+                            "cost": a.get("cost") if a.get("cost")
+                                    in ("fast", "slow", "slowest")
+                                    else APPROACH_COST[kind]})
+        except Exception:
+            got = []
+    # Clamp: dedupe by kind, first occurrence wins (the model's order);
+    # the substrate owns cost — the model's cost hint is advisory only,
+    # so every entry carries the canonical cost and the table re-sorts.
+    merged = []
+    seen = set()
+    for a in got + base:
+        if a["kind"] in seen:
+            continue
+        seen.add(a["kind"])
+        a["cost"] = APPROACH_COST[a["kind"]]
+        merged.append(a)
+    rank = {"fast": 0, "slow": 1, "slowest": 2}
+    merged.sort(key=lambda a: rank[a["cost"]])
+    if rc != 0:
+        sys.stderr.write("enumerate: model unavailable; deterministic "
+                         "enumeration (%s)\n" % (e.strip() or "no LLM"))
+    sys.stderr.write("grounded call: %d file(s), %s context, %d call(s)\n"
+                     % (len(found), _fmt_bytes(total), 1 if rc == 0 else 0))
+    doc = {"approaches": merged}
+    with open(out, "w") as f:
+        json.dump(doc, f, indent=2)
+    for i, a in enumerate(merged, 1):
+        sys.stderr.write("plan: %d %-14s %-40s %s\n"
+                         % (i, a["kind"], a["evidence"], a["cost"]))
+    if not merged:
+        sys.stderr.write("error: no install approach found in %s\n" % src)
+        return 1
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         usage()
@@ -1539,6 +1698,10 @@ def main(argv):
     cmd, rest = argv[1], argv[2:]
     if cmd == "plan" and len(rest) >= 2:
         plan_cmd(rest[0], rest[1])
+    elif cmd == "enumerate" and len(rest) >= 2:
+        verbose = "--grounding" in rest
+        rest = [a for a in rest if a != "--grounding"]
+        return enumerate_cmd(rest[0], rest[1], verbose=verbose)
     elif cmd == "variant" and len(rest) >= 1:
         variant_cmd(rest[0], rest[1] if len(rest) > 1 else None)
     elif cmd == "refine" and len(rest) >= 2:
