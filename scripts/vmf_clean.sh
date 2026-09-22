@@ -310,6 +310,10 @@ for g in vms drives plans race; do
         [[ -n "$name" ]] || continue
         rm -f "$RUNS_DIR/$name.conf" "$RUNS_DIR/$name.log"
         rm -rf "$RUNS_DIR/$name" "$RUNS_DIR/$name".* 2>/dev/null
+        # The VM's host key line in the shared known_hosts.
+        if [[ -f "$SSH_DIR/known_hosts" ]]; then
+          sed -i "/[ ,[]$name[ ,\]]/d" "$SSH_DIR/known_hosts" 2>/dev/null
+        fi
         n=$((n+1))
       done
       ;;
