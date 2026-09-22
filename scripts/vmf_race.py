@@ -21,6 +21,7 @@
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -380,8 +381,20 @@ def main(argv):
     # Promotion: boot the canonical name from the winner's data drive.
     stop_vm(winner)
     # Let the reaped VMs release their host ports before the canonical
-    # boot claims them (otherwise pick_host_port bumps the app port).
-    time.sleep(3)
+    # boot claims them: wait until the winner's first port is actually
+    # free (qemu teardown can lag the stop), then a short settle.
+    if w.get("ports"):
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            s = socket.socket()
+            try:
+                s.bind(("127.0.0.1", w["ports"][0]))
+                s.close()
+                break
+            except OSError:
+                s.close()
+                time.sleep(1)
+    time.sleep(2)
     cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"])
     env["VMF_NAME"] = base
     log = open(w["lp"], "a")

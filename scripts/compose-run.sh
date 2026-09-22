@@ -401,7 +401,12 @@ size_kb=$(du -sk "$stage" | cut -f1)
 # docker-data on the same drive. Sparse file: host disk usage grows
 # with real use.
 fs_size=$(( size_kb * 4 + 4194304 ))
-h=$(printf 'layout-v3\n' | cat - "$plan_tmp/manifest.json" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
+# The drive key must be name-independent: the manifest embeds
+# name-derived build tags ("...cyberchef-c1-app:0"), so a promotion
+# under the canonical name would rebuild the 6 GB drive. Hash the
+# digests and the compose content, not the tags.
+"${JQ[@]}" 'del(.tags)' "$plan_tmp/manifest.json" > "$plan_tmp/manifest.h"
+h=$(printf 'layout-v4\n' | cat - "$plan_tmp/manifest.h" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
 mkdir -p "$COMPOSE_CACHE"
 # Content-keyed: candidates of a race and the canonical promotion share
 # the same drive (the name prefix would force a rebuild per name).
