@@ -504,8 +504,8 @@ def revise_cmd(args):
     # The revise is a PLANNING task (diagnosis + a fresh plan): it runs
     # in the gapfill class — high reasoning effort via llm.sh's mapping,
     # not the lean intent class that produced thin guesses before.
-    rc, o, err = vmf_llm.llm_call("gapfill", prompt, timeout=240,
-                                  env={"VMF_LLM_TIMEOUT": "220"})
+    rc, o, err = vmf_llm.llm_call("gapfill", prompt, timeout=480,
+                                  env={"VMF_LLM_TIMEOUT": "420"})
     if rc != 0:
         # One retry: a stalled stream (curl 28 with a partial body) is a
         # provider hiccup, not a missing model — the evidence is worth

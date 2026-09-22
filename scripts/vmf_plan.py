@@ -261,7 +261,7 @@ def gapfill(root, plan_out):
         '"lookup": ["<doc topic, e.g. <tool> install on linux>"], '
         '"why": "<max 8 words>"}\n'
 "Evidence:\n" + bundle[:32768])
-    rc, out, err = vmf_llm.llm_call("gapfill", draft_prompt, timeout=240)
+    rc, out, err = vmf_llm.llm_call("gapfill", draft_prompt, timeout=480)
     lookup = []
     if rc == 0:
         try:
@@ -321,7 +321,7 @@ def gapfill(root, plan_out):
         if feedback:
             p += ("\nThe user reviewed the previous proposal and says: "
                   "\"%s\"\nRevise the plan accordingly." % feedback)
-        rc, o, err = vmf_llm.llm_call("gapfill", p, timeout=240)
+        rc, o, err = vmf_llm.llm_call("gapfill", p, timeout=480)
         if rc != 0:
             sys.stderr.write(err or "")
             sys.stderr.write("error: gap-filler call failed (rc=%s); "
@@ -1840,7 +1840,7 @@ def enumerate_cmd(src, out, verbose=False):
     for rel, _, content in found:
         prompt += "===== %s =====\n%s\n" % (rel, content)
     role = os.environ.get("VMF_ENUMERATE_ROLE", "gapfill")
-    rc, o, e = vmf_llm.llm_call(role, prompt, timeout=180)
+    rc, o, e = vmf_llm.llm_call(role, prompt, timeout=480)
     got = []
     if rc == 0:
         try:

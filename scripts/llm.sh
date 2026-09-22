@@ -60,7 +60,8 @@ esac
 # evidence and doc excerpts; a 60s default times them out mid-flight
 # and the caller reports "needs a model" instead of a timeout.
 case "${role:-}" in
-  gapfill|agent) timeout_default=220 ;;
+  gapfill) timeout_default=420 ;;
+  agent)   timeout_default=220 ;;
   *)             timeout_default=60 ;;
 esac
 
