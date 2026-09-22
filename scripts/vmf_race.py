@@ -259,6 +259,14 @@ def main(argv):
     started = time.time()
     last_event = started
     queue = list(keep)
+    # Reruns reuse candidate names: stale verdict markers would poison
+    # the poll (and the crown).
+    for k in keep:
+        for p in (os.path.join(RUNS, "%s.verdict" % k["cand"]),):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
     while queue or running:
         now = time.time()
         # Stagger: the next candidate starts STAGGER seconds after the
