@@ -296,9 +296,12 @@ def run_cmd(args):
         port = c.get(verb, {}).get("port", "")
         print("check %s:%s SKIP (runner not built yet)" % (verb, port))
     if not runnable:
+        # A plan that declares nothing cannot be replay-verified: "pass"
+        # would be vacuous (the race would crown an unverifiable
+        # candidate). Honest exit: unverified, not passed.
         print("verify: no runnable checks (plan declares no ports)")
-        print("verdict: 0/0 checks pass (nothing to verify)")
-        return 0
+        print("verdict: unverified (nothing to verify)")
+        return 2
     deadline = time.time() + args.deadline
     print("verify: %d checks, deadline %ds" % (len(runnable), args.deadline))
     if not wait_ssh(args.name, deadline):

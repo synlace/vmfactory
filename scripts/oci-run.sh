@@ -846,6 +846,10 @@ vmf_verify_stage() {
     rm -f "$RUNS_DIR/$name.transcript.json"
     return 0
   fi
+  if [[ "$vrc" -eq 2 ]]; then
+    _verdict "unverified (plan declares no checks)"
+    return 0
+  fi
   if [[ "$vrc" -ne 1 ]]; then
     _verdict "fail (verify infra error rc=$vrc)"
     return 0

@@ -309,8 +309,10 @@ class RunFlow(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             rc = vmf_verify.run_cmd(self.args({"ports": []}))
-        self.assertEqual(rc, 0)
-        self.assertIn("nothing to verify", out.getvalue())
+        # Vacuous passes are gone: an unverifiable plan is "unverified",
+        # not "pass" (the race must not crown it).
+        self.assertEqual(rc, 2)
+        self.assertIn("unverified", out.getvalue())
 
     def test_log_and_rfb_skipped(self):
         out = io.StringIO()
@@ -318,7 +320,7 @@ class RunFlow(unittest.TestCase):
             rc = vmf_verify.run_cmd(self.args(
                 {"ports": [], "checks": [{"log": {"match": "up"}},
                                           {"rfb": {"port": 5900}}]}))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 2)
         text = out.getvalue()
         self.assertIn("check log: SKIP", text)
         self.assertIn("check rfb:5900 SKIP", text)
