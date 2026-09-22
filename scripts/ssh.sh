@@ -118,6 +118,17 @@ SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
   echo "error: ssh client key missing: $SSH_DIR/id_ed25519 (run 'just run --keep <image>' once)" >&2
   exit 1
 }
+# ip mode: the VM has a routable address; ssh goes straight there.
+# Slirp: the hostfwd port on loopback.
+if [[ -n "${IP:-}" ]]; then
+  exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} \
+    -i "$SSH_DIR/id_ed25519" \
+    -o UserKnownHostsFile=/dev/null \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=5 \
+    -o LogLevel=ERROR \
+    root@"$IP" "$@"
+fi
 exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} \
   -i "$SSH_DIR/id_ed25519" \
   -o UserKnownHostsFile=/dev/null \

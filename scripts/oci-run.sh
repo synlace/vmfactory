@@ -80,6 +80,7 @@ name=""
 cpus=""
 mem=""
 netmode=""
+replace_flag=0
 timeout_spec=""
 diskcap=""
 ssh=1
@@ -124,7 +125,8 @@ while [[ $# -gt 0 ]]; do
     --expose) [[ $# -ge 2 ]] || usage; expose="$2"; shift 2 ;;
     --volume|-v) [[ $# -ge 2 ]] || usage; volumes+=("$2"); shift 2 ;;
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
---name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
+    --name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
+    --replace) replace_flag=1; shift ;;
   --cpus) [[ $# -ge 2 ]] || usage; cpus="$2"; shift 2 ;;
   --as) [[ $# -ge 2 ]] || usage; input_as="$2"; shift 2 ;;
   --plan) plan_mode=1; shift ;;
@@ -172,8 +174,8 @@ if [[ -z "$timeout_spec" ]]; then timeout_spec="${VMF_RUN_TIMEOUT_SPEC:-}"; fi
 if [[ -z "$diskcap" ]]; then diskcap="${VMF_RUN_DISKCAP:-}"; fi
 expose_mode="${VMF_RUN_EXPOSE:-$expose_mode}"
 case "$netmode" in
-  ""|open|restricted|off) ;;
-  *) echo "error: --net must be open|restricted|off" >&2; exit 2 ;;
+  ""|open|restricted|off|ip) ;;
+  *) echo "error: --net must be open|restricted|off|ip" >&2; exit 2 ;;
 esac
 # Classifier: state what vmf thinks the input is — the first line of
 # every run. Cheap facts only (path magic, URL shape); never a guess.
@@ -246,8 +248,7 @@ if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
   [[ -z "$runtime" ]] || export VMF_RUN_RUNTIME="$runtime"
-elif [[ -d "$image" ]]; then
-  # Any local directory: compose-run.sh locates the compose file (root,
+elif [[ -d "$image" ]]; then  # Any local directory: compose-run.sh locates the compose file (root,
   # then a unique subdirectory) and errors clearly when there is none.
   export VMF_COMPOSE_SRC="$(cd "$image" && pwd)"
   name="${name:-$(basename "$image")}"
@@ -256,6 +257,10 @@ elif [[ -d "$image" ]]; then
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
   [[ -z "$runtime" ]] || export VMF_RUN_RUNTIME="$runtime"
 fi
+# Instance numbering: a running lab keeps the bare name; this run
+# takes a numbered instance unless --replace. Race children exempt.
+numbered=$(vmf_number_instance "$name" "$replace_flag")
+[[ "$numbered" == "$name" ]] || name="$numbered"
 if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
   export VMF_RUN_DETACH="${detach:-0}" VMF_RUN_KEEP="${keep:-0}"
@@ -296,6 +301,8 @@ krun() { "${TOOL[@]}" buildah unshare -- krunvm "$@"; }
 if [[ -z "$name" ]]; then
   name="${VMF_NAME:-$(basename "${image%%:*}")}"
 fi
+numbered=$(vmf_number_instance "$name" "$replace_flag")
+[[ "$numbered" == "$name" ]] || name="$numbered"
 
 RUNS_DIR="${VMF_RUNS:-$HOME/.vmf/runs}"
 SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
@@ -379,6 +386,7 @@ ensure_microvm_assets() {
       NET_9P = k.yes; "9P_FS" = k.yes; NET_9P_VIRTIO = k.yes;
       DEVPTS_FS = k.yes; TMPFS = k.yes; DEVTMPFS = k.yes; DEVTMPFS_MOUNT = k.yes;
       SERIAL_8250 = k.yes; SERIAL_8250_CONSOLE = k.yes; UNIX = k.yes;
+      PACKET = k.yes; INET = k.yes;
       BINFMT_ELF = k.yes; BINFMT_SCRIPT = k.yes;
       SQUASHFS = k.yes; OVERLAY_FS = k.yes; EXT4_FS = k.yes;
       VETH = k.yes; BRIDGE = k.yes; BRIDGE_NETFILTER = k.yes;
@@ -864,10 +872,13 @@ vmf_verify_stage() {
     [[ -n "$f" && -f "$f" ]] && { vplan="$f"; break; }
   done
   [[ -n "$vplan" ]] || return 0
-  local turn="${VMF_VERIFY_TURN:-1}" vrc=0
+  local turn="${VMF_VERIFY_TURN:-1}" vrc=0 probe_host="127.0.0.1"
+  probe_host=$(grep -oE '^IP=.*' "$inst_dir/conf" 2>/dev/null | cut -d= -f2-)
+  probe_host="${probe_host:-127.0.0.1}"
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
     --hostfwd "$rundir/hostfwd" --console "$inst_dir/log" \
     --evidence-out "$rundir/verify-evidence.json" \
+    --probe-host "$probe_host" \
     --target-out "$rundir/target" || vrc=$?
   # Verdict marker for the race coordinator: the final state of this
   # stage per VM. Recursions overwrite; the last writer wins.

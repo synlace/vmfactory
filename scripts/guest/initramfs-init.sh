@@ -68,18 +68,50 @@ hn=$($BB cat /root/vmf-run/hostname 2>/dev/null)
 # Docker parity: docker makes the container hostname resolvable via
 # /etc/hosts. Without this, apps that resolve their own hostname (apache
 # ServerName, slapd, postfix...) log warnings or fail at startup.
-[ -n "$hn" ] && [ -d /root/etc ] && echo "10.0.2.15 $hn" >> /root/etc/hosts
+[ -n "$hn" ] && [ -d /root/etc ] && \
+  [ "$($BB cat /root/vmf-run/net 2>/dev/null)" != "ip" ] && \
+  echo "10.0.2.15 $hn" >> /root/etc/hosts
 
-# Static slirp networking (both engines): guest 10.0.2.15, gateway
-# 10.0.2.2, DNS 10.0.2.3. Host forwards arrive via the same net stack —
-# no TSI, so guest binds behave like real kernel binds. --net off boots
-# with no NIC at all; skip networking then.
+# Networking (both engines). Default: static slirp (guest 10.0.2.15,
+# gateway 10.0.2.2, DNS 10.0.2.3) — host forwards arrive via the same
+# net stack, no TSI, so guest binds behave like real kernel binds.
+# net=ip (rundir marker): bridge mode — DHCP on eth0 from the host's
+# dnsmasq; the VM gets a routable host-subnet address, so the host
+# reaches it directly and no hostfwd exists.
 if $BB ip link show eth0 >/dev/null 2>&1; then
   $BB ip link set lo up
   $BB ip link set eth0 up
-  $BB ip addr add 10.0.2.15/24 dev eth0
-  $BB ip route add default via 10.0.2.2
-  [ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
+  if [ "$($BB cat /root/vmf-run/net 2>/dev/null)" = "ip" ]; then
+    # udhcpc applies leases through a helper script (the default
+    # script is absent in the initramfs); bound/renew both re-add.
+    # Only busybox applets exist here, so the helper uses full paths.
+    $BB mkdir -p /tmp
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'BB=/bin/busybox' \
+      'case "$1" in' \
+      '  deconfig) $BB ip addr flush dev "$interface" ;;' \
+      '  bound|renew)' \
+      '    [ -n "$ip" ] && $BB ip addr flush dev "$interface"' \
+      '    [ -n "$ip" ] && $BB ip addr add "$ip/$mask" dev "$interface"' \
+      '    [ -n "$router" ] && $BB ip route add default via "$router"' \
+      '    [ -n "$dns" ] && $BB echo "nameserver $dns" > /root/etc/resolv.conf 2>/dev/null' \
+      '    ;;' \
+      'esac' > /tmp/udhcpc.sh
+    $BB chmod +x /tmp/udhcpc.sh
+    echo "net: ip mode; dhcp on eth0 (tap pool)..." > /dev/console
+    $BB udhcpc -i eth0 -q -n -t 10 -T 3 -s /tmp/udhcpc.sh 2>&1 | $BB tail -3
+    gip=$($BB ip -4 addr show eth0 | $BB grep -oE 'inet [0-9.]+' | $BB cut -d' ' -f2)
+    echo "net: leased address ${gip:-NONE}" > /dev/console
+    $BB ifconfig eth0 > /dev/console 2>&1
+    [ -n "$hn" ] && [ -n "$gip" ] && $BB echo "$gip $hn" >> /root/etc/hosts
+    [ -d /root/etc ] && [ ! -s /root/etc/resolv.conf ] && \
+      $BB echo "nameserver 192.168.42.1" > /root/etc/resolv.conf
+  else
+    $BB ip addr add 10.0.2.15/24 dev eth0
+    $BB ip route add default via 10.0.2.2
+    [ -d /root/etc ] && echo "nameserver 10.0.2.3" > /root/etc/resolv.conf
+  fi
 fi
 
 # Mount the boot-time filesystems INTO the new root: mounts on the

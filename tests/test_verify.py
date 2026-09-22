@@ -206,6 +206,7 @@ class RunFlow(unittest.TestCase):
         a.deadline = deadline
         a.evidence_out = evidence_out
         a.target_out = None
+        a.probe_host = "127.0.0.1"
         return a
 
     def test_all_pass(self):
@@ -493,6 +494,28 @@ class FwdParsePy(unittest.TestCase):
         fwd = vmf_verify.load_hostfwd(f.name)
         os.unlink(f.name)
         self.assertEqual(fwd, {8080: 36485, 22: 23348})
+
+
+class ProbeHost(unittest.TestCase):
+    """check_probe/check_tcp honor the probe host (ip mode = the VM
+    address; slirp = loopback with the fwd map)."""
+
+    def test_probe_builds_url_with_host(self):
+        # TEST-NET-1 drops connections deterministically: the call
+        # exercises the host parameter and fails closed.
+        ok, _ = vmf_verify.check_probe(
+            {"probe": {"port": 80, "path": "/", "expect_status_max": 599}},
+            {}, None, host="192.0.2.1")
+        self.assertFalse(ok)
+
+    def test_tcp_with_host(self):
+        ok, _ = vmf_verify.check_tcp(80, {}, None, host="192.0.2.1")
+        self.assertFalse(ok)
+
+    def test_render_uses_host(self):
+        runnable = [("probe", 8080, {"probe": {"port": 8080, "path": "/"}})]
+        url = vmf_verify.render_target(runnable, {}, host="192.168.42.15")
+        self.assertEqual(url, "http://192.168.42.15:8080/")
 
 
 class TargetRender(unittest.TestCase):

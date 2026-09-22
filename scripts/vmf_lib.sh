@@ -71,6 +71,39 @@ vmf_fwd_parse() {
   fi
 }
 
+# True when a live VM holds the name (resolver + liveness by PID).
+vmf_conf_running() {
+  local pid
+  vmf_instance_dir "$1" 2>/dev/null || return 1
+  [[ -f "$VMF_INST_CONF" ]] || return 1
+  pid=$(grep -oE '^PID=[0-9]+' "$VMF_INST_CONF" 2>/dev/null | cut -d= -f2)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Instance numbering: when a running VM holds the name, a new run takes
+# the next free numbered name instead of replacing. --replace redeploys
+# over the bare name; race children manage their own names.
+vmf_number_instance() { # name [replace_flag] -> final name on stdout
+  local base="$1" replace="${2:-0}" n cand
+  [[ -n "$base" ]] || { printf '%s' "$base"; return 0; }
+  # Handoffs keep their name: compose children, the verify re-exec
+  # (VMF_VERIFY_TURN), and race children all boot under an owner's
+  # name and must not number themselves away from it.
+  [[ -n "${VMF_NAME:-}" || -n "${VMF_VERIFY_TURN:-}" || \
+    "${VMF_RACE_CHILD:-0}" == "1" ]] && { printf '%s' "$base"; return 0; }
+  [[ "$replace" == "1" ]] && { printf '%s' "$base"; return 0; }
+  vmf_conf_running "$base" || { printf '%s' "$base"; return 0; }
+  for n in 2 3 4 5 6 7 8 9; do
+    cand="$base-$n"
+    if ! vmf_conf_running "$cand"; then
+      echo "lab: $base is running — booting instance $cand" >&2
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  printf '%s' "$base"
+}
+
 # Resolve a VM reference to its instance directory.
 # Accepts a name (the current symlink holder), a full 12-hex id, or a
 # unique id prefix. Falls back to the legacy flat layout (<name>.conf).

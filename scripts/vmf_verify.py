@@ -122,10 +122,10 @@ def derive_checks(plan, fwd):
     return runnable, skipped
 
 
-def check_tcp(port, fwd, _spec):
+def check_tcp(port, fwd, _spec, host="127.0.0.1"):
     hp = fwd.get(port, port)
     try:
-        s = socket.create_connection(("127.0.0.1", hp), timeout=2)
+        s = socket.create_connection((host, hp), timeout=2)
     except OSError as e:
         return False, {"check": "tcp:%d" % port, "expected": "connect",
                        "actual": str(e)}
@@ -151,10 +151,10 @@ def check_tcp(port, fwd, _spec):
     return True, None
 
 
-def check_probe(spec, fwd, _name):
+def check_probe(spec, fwd, _name, host="127.0.0.1"):
     p = spec["probe"]
     hp = fwd.get(p["port"], p["port"])
-    url = "http://127.0.0.1:%d%s" % (hp, p.get("path", "/"))
+    url = "http://%s:%d%s" % (host, hp, p.get("path", "/"))
     want = p.get("expect_status")
     want_max = p.get("expect_status_max")
     try:
@@ -327,9 +327,9 @@ def run_cmd(args):
             if results[i]:
                 continue
             if kind == "tcp":
-                ok, ev = check_tcp(port, fwd, spec)
+                ok, ev = check_tcp(port, fwd, spec, args.probe_host)
             elif kind == "probe":
-                ok, ev = check_probe(spec, fwd, args.name)
+                ok, ev = check_probe(spec, fwd, args.name, args.probe_host)
             else:
                 ok, ev = check_exec(spec["exec"]["cmd"], args.name, spec)
             label = spec_key(kind, port, spec)
@@ -368,7 +368,7 @@ def run_cmd(args):
         print("verdict: %d/%d checks pass%s"
               % (passed, len(runnable), skipped_note))
         if args.target_out:
-            url = render_target(runnable, fwd)
+            url = render_target(runnable, fwd, args.probe_host)
             if url:
                 try:
                     open(args.target_out, "w").write(url + "\n")
@@ -381,7 +381,7 @@ def run_cmd(args):
     return 1
 
 
-def render_target(runnable, fwd):
+def render_target(runnable, fwd, host="127.0.0.1"):
     # The user-facing deliverable: the first web surface with its
     # PUBLISHED host port (the bump is visible, never a surprise).
     for kind, _port, spec in runnable:
@@ -389,12 +389,12 @@ def render_target(runnable, fwd):
             continue
         p = spec["probe"]
         hp = fwd.get(p["port"], p["port"])
-        return "http://127.0.0.1:%d%s" % (hp, p.get("path", "/"))
+        return "http://%s:%d%s" % (host, hp, p.get("path", "/"))
     for kind, _port, spec in runnable:
         if kind != "tcp":
             continue
         hp = fwd.get(spec["tcp"]["port"], spec["tcp"]["port"])
-        return "tcp://127.0.0.1:%d" % hp
+        return "tcp://%s:%d" % (host, hp)
     return None
 
 
@@ -567,6 +567,7 @@ def main(argv):
                    default=int(os.environ.get("VMF_VERIFY_SECS", "300")))
     r.add_argument("--evidence-out")
     r.add_argument("--target-out")
+    r.add_argument("--probe-host", default="127.0.0.1")
     v = sub.add_parser("revise")
     v.add_argument("plan")
     v.add_argument("out")

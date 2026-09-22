@@ -144,6 +144,17 @@ ps *args:
     #!/bin/sh
     exec python3 scripts/vmf_ps.py "$@"
 
+# One-time host bridge stack for ip mode: bridge, tap pool, dnsmasq.
+# Needs sudo once; boots never do (they claim a free tap).
+lab-init:
+    #!/bin/sh
+    exec bash scripts/vmf_net.sh init
+
+# Bridge stack summary
+net-status:
+    #!/bin/sh
+    exec bash scripts/vmf_net.sh status
+
 # Remove generated build output for a box
 clean-lab lab:
     rm -rf build/{{ lab }}

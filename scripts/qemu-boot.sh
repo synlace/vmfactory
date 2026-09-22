@@ -79,11 +79,41 @@ fi
 # resolver's host sockets). Bind/listen stay allowed, so published ports
 # and ssh (inbound hostfwd) keep working. DNS is intentionally dead in
 # this mode: no outbound includes name resolution. off = no NIC at all
-# (also means no ssh).
+# (also means no ssh). ip = the bridge pool: a free tap, guest DHCP, the
+# host reaches the VM by address — no hostfwd, no bumps. Falls back to
+# slirp with a note when the stack (lab-init) is absent or exhausted.
+# Net args: slirp (default), off, restricted, or the bridge pool.
+# ip mode = a free tap + guest DHCP: the host reaches the VM by address,
+# no hostfwd, no bumps. Requested with --net ip; auto-detected for plain
+# runs when the lab-init stack is ready, silent slirp fallback otherwise.
+net_args=()
+ip_nic() {
+  local macs mac tap
+  macs=$(od -An -tx1 -N3 /dev/urandom)
+  mac=$(printf '52:54:00:%02x:%02x:%02x' \
+    "0x$(echo $macs | awk '{print $1}')" \
+    "0x$(echo $macs | awk '{print $2}')" \
+    "0x$(echo $macs | awk '{print $3}')") || return 1
+  tap=$(bash "$SCRIPT_DIR/vmf_net.sh" claim "$mac") || return 1
+  printf 'ip\n' > "$VMF_RUNDIR/net"
+  printf 'TAP=%s\nMAC=%s\n' "$tap" "$mac" >> "$VMF_CONF"
+  net_args=(-netdev "tap,id=net0,ifname=$tap,script=no,downscript=no,vnet_hdr=off" \
+            -device "virtio-net-pci,netdev=net0,mac=$mac")
+}
 case "$VMF_NET_MODE" in
-  off)        nic=(none) ;;
-  restricted) nic=("user,model=virtio-net-pci$hostfwd") ;;
-  *)          nic=("user,model=virtio-net-pci$hostfwd") ;;
+  off)        net_args=(-nic none) ;;
+  restricted) net_args=(-nic "user,model=virtio-net-pci$hostfwd") ;;
+  ip)
+    if ! ip_nic; then
+      echo "note: --net ip requested but the stack is not ready; slirp hostfwd" >&2
+      net_args=(-nic "user,model=virtio-net-pci$hostfwd")
+    fi ;;
+  *)
+    if ip_nic 2>/dev/null; then
+      echo "net: ip mode (bridge pool; the VM has a routable address)"
+    else
+      net_args=(-nic "user,model=virtio-net-pci$hostfwd")
+    fi ;;
 esac
 
 # Optional run timeout: timeout execs qemu in place, so the recorded
@@ -114,7 +144,7 @@ qemu=(qemu-system-x86_64
   -fsdev "local,id=fs1,path=$VMF_RUNDIR,security_model=none"
   -device "virtio-9p-pci,fsdev=fs1,mount_tag=vmf-run"
   ${VMF_DATA_DRIVE:+-drive "file=$VMF_DATA_DRIVE,if=virtio,format=raw"}
-  -nic "$nic"
+  "${net_args[@]}"
   -pidfile "$VMF_RUNDIR/qemu.pid"
   -no-reboot
   -display none
@@ -127,6 +157,25 @@ record_state() {
   printf 'PID=%s\nCTR=%s\n' "$qpid" "$ctr" >> "$VMF_CONF"
 }
 
+# ip mode: poll the dnsmasq lease file for this VM's MAC and record the
+# assigned address in the conf — ssh, verify, and ps resolve IP= first.
+lease_wait() {
+  local mac ip i leases
+  [[ -f "$VMF_RUNDIR/net" ]] || return 0
+  mac=$(grep -oE '^MAC=.*' "$VMF_CONF" 2>/dev/null | cut -d= -f2)
+  [[ -n "$mac" ]] || return 0
+  leases="${VMF_NET_DIR:-$HOME/.vmf/net}/dnsmasq.leases"
+  for i in $(seq 1 15); do
+    ip=$(awk -v m="$mac" '$2==m {print $3; exit}' "$leases" 2>/dev/null)
+    if [[ -n "$ip" ]]; then
+      printf 'IP=%s\n' "$ip" >> "$VMF_CONF"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "warning: no DHCP lease for $mac after 30s" >&2
+}
+
 if [[ "${VMF_DETACH:-0}" == "1" ]]; then
   # The detached subshell owns the VM lifecycle (container cleanup +
   # state removal); the outer script must NOT clean up on exit. qemu
@@ -136,6 +185,7 @@ if [[ "${VMF_DETACH:-0}" == "1" ]]; then
     vm </dev/null >>"$VMF_CONSOLE" 2>&1 &
     qpid=$!
     record_state "$qpid"
+    lease_wait
     wait "$qpid" 2>/dev/null || true
     cleanup "$qpid"
   ) >/dev/null 2>&1 &
@@ -153,6 +203,7 @@ fi
 vm &
 qpid=$!
 record_state "$qpid"
+lease_wait
 trap 'kill "$qpid" 2>/dev/null || true' INT TERM
 rc=0
 wait "$qpid" || rc=$?

@@ -400,10 +400,16 @@ def main(argv):
     # Promotion: boot the canonical name from the winner's data drive.
     say("promotion: stopping %s" % winner)
     stop_vm(winner)
-    # Let the reaped VMs release their host ports before the canonical
-    # boot claims them: wait until the winner's first port is actually
-    # free (qemu teardown can lag the stop), then a short settle.
-    if w.get("ports"):
+    # Slirp winners must release their host ports before the canonical
+    # boot claims them (qemu teardown can lag the stop). ip-mode winners
+    # own an address instead: nothing to free, skip the wait.
+    winner_ip_mode = False
+    try:
+        with open(conf_path(winner)) as f:
+            winner_ip_mode = any(line.startswith("TAP=") for line in f)
+    except OSError:
+        pass
+    if not winner_ip_mode and w.get("ports"):
         deadline = time.time() + 20
         waited = False
         while time.time() < deadline:

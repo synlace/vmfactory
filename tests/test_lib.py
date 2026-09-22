@@ -120,5 +120,50 @@ class InstanceResolve(unittest.TestCase):
         self.assertIn("conf=%s/oldvm.conf" % self.runs, out)
 
 
+class InstanceNumbering(unittest.TestCase):
+    """vmf_number_instance: free name stays bare; a running holder
+    numbers the next run; handoffs and --replace keep the name."""
+
+    def _num(self, base, replace="0", extra_env=""):
+        return run_bash(
+            'export VMF_RUNS=%s; %s vmf_number_instance %s %s || true; '
+            % (self.runs, extra_env, base, replace)).stdout.strip()
+
+    def setUp(self):
+        import tempfile, subprocess
+        self.runs = tempfile.mkdtemp(prefix="vmf-num-")
+        # A running legacy instance: conf + a live pid (this shell's).
+        d = tempfile.mkdtemp(prefix="vmf-num-inst-", dir=self.runs)
+        self.live_pid = str(subprocess.Popen(["sleep", "30"]).pid)
+        open(os.path.join(d, "conf"), "w").write(
+            "ID=aabb11223344\nNAME=web\nPID=%s\n" % self.live_pid)
+        os.symlink(os.path.basename(d), os.path.join(self.runs, "web"))
+
+    def tearDown(self):
+        subprocess.run(["kill", self.live_pid], capture_output=True)
+
+    def test_free_name_stays_bare(self):
+        self.assertEqual(self._num("freename"), "freename")
+
+    def test_running_name_numbers(self):
+        out = self._num("web")
+        self.assertEqual(out, "web-2")
+
+    def test_replace_keeps_bare(self):
+        self.assertEqual(self._num("web", "1"), "web")
+
+    def test_race_child_keeps_name(self):
+        out = run_bash(
+            'export VMF_RUNS=%s VMF_RACE_CHILD=1; vmf_number_instance web 0'
+            % self.runs).stdout.strip()
+        self.assertEqual(out, "web")
+
+    def test_handoff_env_keeps_name(self):
+        out = run_bash(
+            'export VMF_RUNS=%s VMF_NAME=web; vmf_number_instance web 0'
+            % self.runs).stdout.strip()
+        self.assertEqual(out, "web")
+
+
 if __name__ == "__main__":
     unittest.main()
