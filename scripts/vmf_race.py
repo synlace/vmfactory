@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# vmf_race.py — the staggered install-approach race.
+#
+# usage: vmf_race.py <src>
+#
+# The enumeration (vmf_plan.py enumerate) supplies the approach table.
+# Each candidate materializes as an oci-run invocation:
+#   compose         oci-run.sh <src>            (real repo; compose found)
+#   dockerfile      oci-run.sh <tmpdir>         (synthetic 1-service compose)
+#   prebuilt_image  oci-run.sh <tmpdir>         (synthetic compose, image ref)
+#   source_build    oci-run.sh <src> + VMF_PLAN_SKIP_COMPOSE=1 (gapfill direct)
+# Candidates boot detached with ssh; the verify stage writes
+# $RUNS_DIR/<name>.verdict. First pass wins; losers reaped; the winner
+# reboots under the canonical name from the shared content-keyed data
+# drive.
+#
+# Env: VMF_RACE_MODE=plan  — table only, boot nothing (exit 0/1)
+#      VMF_RACE_APPROACH / VMF_RACE_SKIP — name or number filters (csv)
+#      VMF_RACE_STAGGER (90) VMF_RACE_PARALLEL (2) VMF_RACE_DEADLINE (900)
+#      VMF_RACE_CHILD=1    — candidate runners must not re-enter the race
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+RUNS = os.environ.get("VMF_RUNS") or os.path.expanduser("~/.vmf/runs")
+SCRIPTS = os.environ.get("VMF_SCRIPTS_DIR") or os.path.dirname(
+    os.path.abspath(__file__))
+STAGGER = int(os.environ.get("VMF_RACE_STAGGER") or 90)
+PARALLEL = int(os.environ.get("VMF_RACE_PARALLEL") or 2)
+DEADLINE = int(os.environ.get("VMF_RACE_DEADLINE") or 900)
+
+
+def _plan_interp():
+    # vmf_plan's yaml import is a runtime-optional dependency (pyyaml);
+    # mirror compose-run's provisioning: bare python3 when yaml imports,
+    # else the nix-provisioned interpreter.
+    if subprocess.run([sys.executable, "-c", "import yaml"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode == 0:
+        return [sys.executable]
+    return ["nix", "shell", "--impure", "--expr",
+            "with import <nixpkgs> {}; python3.withPackages (p: [ p.pyyaml ])",
+            "-c", "python3"]
+
+
+PLAN_PY = _plan_interp()
+
+
+def plan_stage(src, out):
+    return subprocess.run(PLAN_PY + [
+        os.path.join(SCRIPTS, "vmf_plan.py"), "plan", src, out],
+        capture_output=True, text=True)
+
+
+def say(msg):
+    sys.stderr.write("race: %s\n" % msg)
+    sys.stderr.flush()
+
+
+def load_approaches(src):
+    enum = os.path.join(RUNS, ".race-enum.json")
+    rc = subprocess.run(
+        [sys.executable, os.path.join(SCRIPTS, "vmf_plan.py"),
+         "enumerate", src, enum],
+        capture_output=True, text=True)
+    sys.stderr.write(rc.stderr)
+    if rc.returncode != 0:
+        return []
+    try:
+        with open(enum) as f:
+            return json.load(f).get("approaches") or []
+    except (OSError, ValueError):
+        return []
+
+
+def apply_filters(approaches):
+    only = [x.strip() for x in
+            (os.environ.get("VMF_RACE_APPROACH") or "").split(",") if x.strip()]
+    skip = [x.strip() for x in
+            (os.environ.get("VMF_RACE_SKIP") or "").split(",") if x.strip()]
+    out = []
+    for i, a in enumerate(approaches, 1):
+        handles = {a["kind"], str(i)}
+        if only and not (handles & set(only)):
+            continue
+        if skip and (handles & set(skip)):
+            continue
+        out.append(a)
+    return out
+
+
+def _expose_ports(src):
+    # EXPOSE lines from the root Dockerfile: the dockerfile candidate's
+    # declared surface (deterministic; the compose kind scrapes its own).
+    ports = []
+    p = os.path.join(src, "Dockerfile")
+    if os.path.isfile(p):
+        for line in open(p, errors="replace"):
+            m = re.match(r"^\s*EXPOSE\s+(\d+)", line)
+            if m and int(m.group(1)) not in ports:
+                ports.append(int(m.group(1)))
+    return ports[:8]
+
+
+def synth_dir(kind, src, image):
+    # Synthetic single-service compose dir for the dockerfile and
+    # prebuilt_image kinds; the compose kind uses the real repo dir.
+    d = tempfile.mkdtemp(prefix="vmf-race-%s-" % kind)
+    ports = _expose_ports(src)
+    svc = {"image": image} if kind != "dockerfile" else \
+        {"build": {"context": src, "dockerfile": "Dockerfile"}}
+    doc = {"services": {"app": dict(
+        svc, ports=["%d:%d" % (p, p) for p in ports], environment={})}}
+    with open(os.path.join(d, "docker-compose.yml"), "w") as f:
+        json.dump(doc, f, indent=2)
+    return d
+
+
+def satisfiable(kind, src, image, log):
+    # Prune before boot: the plan stage must succeed, no env gap, and at
+    # least one declared tcp port for the verify arbiter.
+    if kind == "prebuilt_image" and not image:
+        log.write("pruned: no image ref from the enumeration\n")
+        return False
+    if kind in ("compose", "dockerfile", "prebuilt_image"):
+        psrc = src
+        if kind != "compose":
+            psrc = synth_dir(kind, src, image)
+        out = os.path.join(RUNS, ".race-plan.json")
+        rc = plan_stage(psrc, out)
+        if rc.returncode != 0:
+            log.write("pruned: plan stage failed\n%s" % rc.stderr[-1500:])
+            return False
+        try:
+            with open(out) as f:
+                plan = json.load(f)
+        except (OSError, ValueError):
+            log.write("pruned: unreadable plan\n")
+            return False
+        for s in plan.get("services") or []:
+            if s.get("env_unresolved"):
+                log.write("pruned: env unresolvable (env_file missing, "
+                          "no .env.example, no db sibling or no model)\n")
+                return False
+        primary = plan.get("primary")
+        for s in plan.get("services") or []:
+            if s.get("name") != primary:
+                continue
+            if not any(pp.get("proto", "tcp") != "udp"
+                       for pp in s.get("ports") or []):
+                log.write("pruned: no declared tcp ports to verify\n")
+                return False
+        return True
+    # source_build / install_script: the gapfill flow answers honestly
+    # on its own; nothing to prune cheaply here.
+    return True
+
+
+def runner_cmd(kind, name, src, image):
+    # Candidates re-enter oci-run as children; the marker env stops the
+    # race from re-entering. --yes/--ssh ride the runner args.
+    env = dict(os.environ)
+    env["VMF_RACE_CHILD"] = "1"
+    env["VMF_NAME"] = name
+    env["VMF_RUN_YES"] = "1"
+    env["VMF_RUN_DETACH"] = "1"
+    env["VMF_RUN_SSH"] = "1"
+    env.pop("VMF_RUN_INTENT", None)
+    if kind == "source_build":
+        env["VMF_PLAN_SKIP_COMPOSE"] = "1"
+        args = [src]
+    elif kind == "compose":
+        args = [src]
+    else:
+        args = [synth_dir(kind, src, image)]
+    return ["bash", os.path.join(SCRIPTS, "oci-run.sh"), "--yes",
+            "--name", name] + args, env
+
+
+def stop_vm(name):
+    subprocess.run(["bash", os.path.join(SCRIPTS, "stop.sh"), name],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.stderr.write("usage: vmf_race.py <src>\n")
+        return 2
+    src = os.path.abspath(argv[1])
+    base = os.environ.get("VMF_NAME") or os.path.basename(src)
+    plan_only = os.environ.get("VMF_RACE_MODE") == "plan"
+
+    approaches = apply_filters(load_approaches(src))
+    if plan_only:
+        # Satisfiability without booting: pruned candidates print and
+        # any survivor means the run would race.
+        logdir = os.path.join(RUNS, "race-logs")
+        os.makedirs(logdir, exist_ok=True)
+        alive = 0
+        for i, a in enumerate(approaches, 1):
+            cand = "%s-c%d" % (base, i)
+            lp = os.path.join(logdir, "%s.log" % cand)
+            with open(lp, "w") as log:
+                ok = satisfiable(a["kind"], src, a.get("image"), log)
+            if ok:
+                alive += 1
+            else:
+                say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
+        say("plan only: %d/%d approach(es) satisfiable; nothing booted"
+            % (alive, len(approaches)))
+        return 0 if alive else 1
+    if not approaches:
+        say("no approach allowed; nothing to race")
+        return 1
+
+    # Satisfiability prune before any boot.
+    keep = []
+    logdir = os.path.join(RUNS, "race-logs")
+    os.makedirs(logdir, exist_ok=True)
+    for i, a in enumerate(approaches, 1):
+        cand = "%s-c%d" % (base, i)
+        lp = os.path.join(logdir, "%s.log" % cand)
+        with open(lp, "w") as log:
+            ok = satisfiable(a["kind"], src, a.get("image"), log)
+        if ok:
+            keep.append({"i": i, "kind": a["kind"], "cand": cand, "lp": lp,
+                         "image": a.get("image")})
+        else:
+            say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
+    if not keep:
+        say("all approaches pruned at plan time")
+        return 1
+
+    running = {}
+    verdicts = {}
+    winner = None
+    started = time.time()
+    last_event = started
+    queue = list(keep)
+    while queue or running:
+        now = time.time()
+        # Stagger: the next candidate starts STAGGER seconds after the
+        # last race event (a start, a verdict, or a failure). Cheapest
+        # boots first; usually it wins alone.
+        if (queue and len(running) < PARALLEL
+                and now - last_event >= STAGGER):
+            k = queue.pop(0)
+            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"])
+            log = open(k["lp"], "a")
+            log.write("\n===== boot =====\n")
+            proc = subprocess.Popen(cmd, env=env, stdout=log,
+                                    stderr=subprocess.STDOUT)
+            running[k["cand"]] = dict(k, proc=proc, log=log, born=now)
+            say("%d %s .. started (%s)" % (k["i"], k["kind"], k["cand"]))
+            last_event = now
+        # Poll verdicts and dead runners.
+        for cand in list(running):
+            r = running[cand]
+            vpath = os.path.join(RUNS, "%s.verdict" % cand)
+            rc = r["proc"].poll()
+            if os.path.isfile(vpath):
+                with open(vpath) as f:
+                    verdicts[cand] = f.read().strip() or "fail"
+                if verdicts[cand] == "pass":
+                    winner = cand
+            elif rc is not None and rc != 0:
+                verdicts[cand] = "fail (runner exit %d)" % rc
+            elif rc == 0:
+                # Runner done without a verdict: brief grace for the
+                # marker write, then judge.
+                if "done_at" not in r:
+                    r["done_at"] = now
+                elif now - r["done_at"] > 30:
+                    verdicts[cand] = "fail (no verdict after boot)"
+            if cand in verdicts:
+                say("%d %s .. %s" % (r["i"], r["kind"], verdicts[cand]))
+                r["log"].close()
+                r["proc"].terminate()
+                del running[cand]
+                last_event = now
+                if winner:
+                    break
+            elif rc == 0 and not os.path.isfile(vpath):
+                # Boot finished; the verify stage may still be running
+                # (the child re-runs) — grace window before judging.
+                r.setdefault("grace", now + 120)
+                if now > r["grace"]:
+                    verdicts[cand] = "fail (no verdict after boot)"
+        if winner:
+            break
+        if time.time() - started > DEADLINE:
+            for cand, r in running.items():
+                verdicts.setdefault(cand, "fail (race deadline)")
+                r["log"].close()
+                r["proc"].terminate()
+            say("race deadline reached")
+            break
+        time.sleep(2)
+
+    for k in keep:
+        if k["cand"] != winner:
+            stop_vm(k["cand"])
+    if not winner:
+        say("no approach produced a working service")
+        for cand, status in verdicts.items():
+            say("%s: %s (log: %s)" % (
+                cand, status, os.path.join(RUNS, "race-logs",
+                                           "%s.log" % cand)))
+        say("rerun with --approach <name|number> to retry one approach")
+        return 1
+
+    w = next(k for k in keep if k["cand"] == winner)
+    say("winner %d %s; reaping losers" % (w["i"], w["kind"]))
+
+    # Promotion: boot the canonical name from the winner's data drive.
+    stop_vm(winner)
+    cmd, env = runner_cmd(w["kind"], base, src, w["image"])
+    env["VMF_NAME"] = base
+    log = open(w["lp"], "a")
+    log.write("\n===== promotion (%s) =====\n" % base)
+    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    proc.wait()
+    vpath = os.path.join(RUNS, "%s.verdict" % base)
+    status = "pass"
+    if os.path.isfile(vpath):
+        with open(vpath) as f:
+            status = f.read().strip() or "pass"
+    log.close()
+    say("promotion %s: %s" % (base, status))
+    return 0 if status == "pass" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

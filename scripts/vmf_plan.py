@@ -215,6 +215,11 @@ def gapfill(root, plan_out):
     runtime = os.environ.get("VMF_RUN_RUNTIME", "auto").strip().lower()
     if runtime not in ("auto", "direct", "docker"):
         runtime = "auto"
+    # The race's source_build candidate forces the direct path: a
+    # compose-mode plan here would race the compose candidate against
+    # itself (and the gap-fill model must not invent one).
+    if runtime == "auto" and os.environ.get("VMF_PLAN_SKIP_COMPOSE") == "1":
+        runtime = "direct"
     # The cache respects the requested runtime: a docker-mode cache hit
     # must not hijack a --runtime direct run and vice versa.
     if runtime in ("auto", "docker") and os.path.isfile(cache):
@@ -366,7 +371,17 @@ def gapfill(root, plan_out):
             e = {}
             b = s.get("build") or {}
             if b.get("dockerfile") or b.get("context"):
-                be = {"context": b.get("context") or ".",
+                ctx = b.get("context") or "."
+                # The context must name a real directory (relative to the
+                # repo root or absolute); invented paths ("/workspace")
+                # collapse to the root — the whole repo is the context.
+                cand = ctx if os.path.isabs(ctx) \
+                    else os.path.join(root, ctx)
+                if not os.path.isdir(cand):
+                    sys.stderr.write("gap-filler: build context '%s' does "
+                                     "not exist; using the repo root\n" % ctx)
+                    ctx = "."
+                be = {"context": ctx,
                       "dockerfile": b.get("dockerfile") or "Dockerfile"}
                 if b.get("args"):
                     be["args"] = {str(k): str(v) for k, v in b["args"].items()}
@@ -857,16 +872,20 @@ def plan_cmd(src_arg, out):
     hint = os.environ.get("VMF_COMPOSE_PROJECT", "").strip()
 
     # Root compose wins; otherwise every subdirectory compose is a candidate.
+    # VMF_PLAN_SKIP_COMPOSE=1 (the race's source_build candidate) forces
+    # the direct/gapfill path even when a compose file exists.
     candidates = []
-    for cand in NAMES:
-        p = os.path.join(src, cand)
-        if os.path.isfile(p):
-            name_, svcs_, ports_ = meta(p)
-            candidates.append({"dir": src, "rel": ".", "file": cand,
-                               "name": name_, "services": svcs_, "ports": ports_})
-            break
-    if not candidates:
-        candidates = scan(src)
+    if os.environ.get("VMF_PLAN_SKIP_COMPOSE", "") != "1":
+        for cand in NAMES:
+            p = os.path.join(src, cand)
+            if os.path.isfile(p):
+                name_, svcs_, ports_ = meta(p)
+                candidates.append({"dir": src, "rel": ".", "file": cand,
+                                   "name": name_, "services": svcs_,
+                                   "ports": ports_})
+                break
+        if not candidates:
+            candidates = scan(src)
 
     sel = None
     if candidates:

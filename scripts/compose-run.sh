@@ -190,8 +190,10 @@ while IFS=$'\t' read -r name kind rest; do
   else
     dockerfile="$plan_tmp/df-$name"
     # Build contexts resolve against the project dir (a monorepo compose
-    # file may live in a subdirectory of the clone).
+    # file may live in a subdirectory of the clone); absolute contexts
+    # (the race's synthetic composes point at the real repo) pass through.
     ctx="$PROJ/$rest"
+    [[ "$rest" == /* ]] && ctx="$rest"
     echo "compose: building $name (context: ${rest#./})..."
     # Patch unqualified FROM images in a generated copy: buildah refuses
     # short names without a registry (FROM php@sha256:... etc.).
@@ -401,7 +403,9 @@ size_kb=$(du -sk "$stage" | cut -f1)
 fs_size=$(( size_kb * 4 + 4194304 ))
 h=$(printf 'layout-v3\n' | cat - "$plan_tmp/manifest.json" "$stage/compose.yaml" "$DOCKER_BUNDLE/docker.tgz.sha256" "$DOCKER_BUNDLE/docker-compose.sha256" | sha256sum | cut -c1-12)
 mkdir -p "$COMPOSE_CACHE"
-drive="$COMPOSE_CACHE/${VMF_NAME}-$h.ext4"
+# Content-keyed: candidates of a race and the canonical promotion share
+# the same drive (the name prefix would force a rebuild per name).
+drive="$COMPOSE_CACHE/$h.ext4"
 if [[ ! -f "$drive" ]]; then
   echo "compose: building data drive ($(( fs_size / 1024 )) MiB sparse)..."
   vmf_run util-linux -- truncate -s $(( fs_size / 1024 ))M "$drive.tmp"

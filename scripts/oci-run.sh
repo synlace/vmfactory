@@ -85,6 +85,9 @@ diskcap=""
 ssh=1
 keep=0
 detach=0
+plan_mode=0
+approach_list=""
+skip_list=""
 image=""
 cmd_args=()
 # Needed by the compose handoff, which runs before the later defaults.
@@ -124,6 +127,9 @@ while [[ $# -gt 0 ]]; do
 --name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
   --cpus) [[ $# -ge 2 ]] || usage; cpus="$2"; shift 2 ;;
   --as) [[ $# -ge 2 ]] || usage; input_as="$2"; shift 2 ;;
+  --plan) plan_mode=1; shift ;;
+  --approach) [[ $# -ge 2 ]] || usage; approach_list="$2"; shift 2 ;;
+  --skip) [[ $# -ge 2 ]] || usage; skip_list="$2"; shift 2 ;;
   -h|--help) usage ;;
     --) shift; cmd_args+=("$@"); break ;;
     -*) echo "error: unknown flag $1" >&2; exit 2 ;;
@@ -257,7 +263,18 @@ if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_RUN_TIMEOUT_SPEC="$timeout_spec" VMF_RUN_DISKCAP="$diskcap"
   export VMF_RUN_CPUS="${cpus:-2}" VMF_RUN_SSH="$ssh"
   export VMF_RUN_ENGINE="$ENGINE" VMF_RUN_EXPOSE="$expose_mode"
-  exec bash "$(cd "$(dirname "$0")" && pwd)/compose-run.sh"
+  if [[ "${VMF_RACE_CHILD:-0}" == "1" ]]; then
+    # A race candidate: run the plan+boot chain directly.
+    exec bash "$(cd "$(dirname "$0")" && pwd)/compose-run.sh"
+  fi
+  # Repo sources race their install approaches; --plan prints the
+  # satisfiable table and boots nothing.
+  if [[ "$plan_mode" -eq 1 ]]; then
+    export VMF_RACE_MODE=plan
+  fi
+  [[ -z "$approach_list" ]] || export VMF_RACE_APPROACH="$approach_list"
+  [[ -z "$skip_list" ]] || export VMF_RACE_SKIP="$skip_list"
+  exec python3 "$(cd "$(dirname "$0")" && pwd)/vmf_race.py" "$VMF_COMPOSE_SRC"
 fi
 
 # Docker-compatible normalization: unprefixed names imply docker.io
