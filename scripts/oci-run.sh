@@ -873,7 +873,18 @@ vmf_verify_stage() {
   done
   [[ -n "$vplan" ]] || return 0
   local turn="${VMF_VERIFY_TURN:-1}" vrc=0 probe_host="127.0.0.1"
-  probe_host=$(grep -oE '^IP=.*' "$inst_dir/conf" 2>/dev/null | cut -d= -f2-)
+  # ip mode: the lease_wait in the detached boot subshell lands IP=
+  # asynchronously; the verify must not probe loopback before it does.
+  if grep -q '^TAP=' "$inst_dir/conf" 2>/dev/null; then
+    local i
+    for i in $(seq 1 20); do
+      grep -q '^IP=' "$inst_dir/conf" 2>/dev/null && break
+      sleep 2
+    done
+  fi
+  # The conf may lack IP= (slirp boots): the no-match grep must not
+  # kill the stage under set -e + pipefail.
+  probe_host=$(grep -oE '^IP=.*' "$inst_dir/conf" 2>/dev/null | cut -d= -f2- || true)
   probe_host="${probe_host:-127.0.0.1}"
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
     --hostfwd "$rundir/hostfwd" --console "$inst_dir/log" \

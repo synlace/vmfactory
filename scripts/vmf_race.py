@@ -194,6 +194,9 @@ def runner_cmd(kind, name, src, image, ports=None):
     env["VMF_RUN_YES"] = "1"
     env["VMF_RUN_DETACH"] = "1"
     env["VMF_RUN_SSH"] = "1"
+    # Candidates pay boot + in-guest install latency; the default
+    # verify deadline (built for fast images) expires mid-install.
+    env.setdefault("VMF_VERIFY_SECS", "420")
     env.pop("VMF_RUN_INTENT", None)
     if kind == "source_build":
         env["VMF_PLAN_SKIP_COMPOSE"] = "1"

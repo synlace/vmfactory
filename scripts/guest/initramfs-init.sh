@@ -103,7 +103,6 @@ if $BB ip link show eth0 >/dev/null 2>&1; then
     $BB udhcpc -i eth0 -q -n -t 10 -T 3 -s /tmp/udhcpc.sh 2>&1 | $BB tail -3
     gip=$($BB ip -4 addr show eth0 | $BB grep -oE 'inet [0-9.]+' | $BB cut -d' ' -f2)
     echo "net: leased address ${gip:-NONE}" > /dev/console
-    $BB ifconfig eth0 > /dev/console 2>&1
     [ -n "$hn" ] && [ -n "$gip" ] && $BB echo "$gip $hn" >> /root/etc/hosts
     [ -d /root/etc ] && [ ! -s /root/etc/resolv.conf ] && \
       $BB echo "nameserver 192.168.42.1" > /root/etc/resolv.conf
