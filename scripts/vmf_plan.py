@@ -261,7 +261,7 @@ def gapfill(root, plan_out):
         '"lookup": ["<doc topic, e.g. <tool> install on linux>"], '
         '"why": "<max 8 words>"}\n'
 "Evidence:\n" + bundle[:32768])
-    rc, out, err = vmf_llm.llm_call("gapfill", draft_prompt)
+    rc, out, err = vmf_llm.llm_call("gapfill", draft_prompt, timeout=240)
     lookup = []
     if rc == 0:
         try:
@@ -321,7 +321,7 @@ def gapfill(root, plan_out):
         if feedback:
             p += ("\nThe user reviewed the previous proposal and says: "
                   "\"%s\"\nRevise the plan accordingly." % feedback)
-        rc, o, err = vmf_llm.llm_call("gapfill", p)
+        rc, o, err = vmf_llm.llm_call("gapfill", p, timeout=240)
         if rc != 0:
             sys.stderr.write(err or "")
             sys.stderr.write("error: gap-filler call failed (rc=%s); "
@@ -880,10 +880,11 @@ def plan_cmd(src_arg, out):
     # the dev script and named the file — the substrate honors it.
     candidates = []
     if os.environ.get("VMF_PLAN_SKIP_COMPOSE", "") != "1":
-        hint = os.environ.get("VMF_COMPOSE_HINT_FILE", "").strip()
-        if hint and "/" not in hint and os.path.isfile(os.path.join(src, hint)):
-            name_, svcs_, ports_ = meta(os.path.join(src, hint))
-            candidates.append({"dir": src, "rel": ".", "file": hint,
+        cf_hint = os.environ.get("VMF_COMPOSE_HINT_FILE", "").strip()
+        if cf_hint and "/" not in cf_hint \
+                and os.path.isfile(os.path.join(src, cf_hint)):
+            name_, svcs_, ports_ = meta(os.path.join(src, cf_hint))
+            candidates.append({"dir": src, "rel": ".", "file": cf_hint,
                                "name": name_, "services": svcs_,
                                "ports": ports_})
         else:
@@ -1839,7 +1840,7 @@ def enumerate_cmd(src, out, verbose=False):
     for rel, _, content in found:
         prompt += "===== %s =====\n%s\n" % (rel, content)
     role = os.environ.get("VMF_ENUMERATE_ROLE", "gapfill")
-    rc, o, e = vmf_llm.llm_call(role, prompt, timeout=90)
+    rc, o, e = vmf_llm.llm_call(role, prompt, timeout=180)
     got = []
     if rc == 0:
         try:
