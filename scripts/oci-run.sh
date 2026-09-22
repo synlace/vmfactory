@@ -810,6 +810,30 @@ if [[ "${VMF_WANT_DOCKER:-0}" == "1" ]]; then
   DB_DIR="${VMF_DOCKER_BUNDLE:-$HOME/.local/share/vmf/docker-bundle}"
   echo "staging docker bundle into the inputs..."
   tar -czf "$rundir/docker-bundle.tar.gz" -C "$DB_DIR" bin
+  # The plan's container images: the host pulls them with its own
+  # trust and stages the tars; the guest loads them before install.sh
+  # and never dials a registry (the in-guest dockerd has no CA story
+  # for docker.io — the pull died with a TLS verify error).
+  n=0
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    [[ "$n" -lt 4 ]] || break
+    if bash "$SCRIPTS_DIR/image-supply.sh" "$ref" \
+        "$rundir/images-seed-$n.tar" >/dev/null 2>&1; then
+      echo "staged image: $ref"
+      n=$((n + 1))
+    else
+      echo "note: host supply failed for $ref; the guest will pull it itself" >&2
+    fi
+  done < <(python3 -c "
+import json, os, sys
+p = os.environ.get('VMF_VERIFY_PLAN') or ''
+try:
+    plan = json.load(open(p))
+except Exception:
+    sys.exit(0)
+for r in (plan.get('images') or [])[:4]:
+    print(r)" 2>/dev/null)
 fi
 # Host port pick: 1:1 when the unprivileged slirp bind can take it,
 # otherwise a stable high port (hash of name+want, probed upward). The
