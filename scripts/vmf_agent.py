@@ -241,6 +241,11 @@ def validate_spec(raw, plan):
     cmd = [str(x) for x in (raw.get("command") or [])][:16]
     if not cmd:
         return None
+    # A docker-driving command needs the in-guest daemon: coerce
+    # needs_docker so the docker bundle stages it (a docker command
+    # with no runtime dies with "executable not found" at boot).
+    needs_docker = bool(raw.get("needs_docker")) or \
+        (cmd[0].strip() in ("docker", "podman", "nerdctl"))
     return {"base_image": plan.get("base_image", ""),
             "install": install,
             "command": cmd,
@@ -249,9 +254,9 @@ def validate_spec(raw, plan):
             "images": vmf_plan._clamp_images(raw.get("images")),
             "env": {str(k): str(v)
                     for k, v in (raw.get("env") or {}).items()},
-            "needs_docker": bool(raw.get("needs_docker")),
+            "needs_docker": needs_docker,
             "memory_mb": vmf_plan._clamp_memory(raw.get("memory_mb"),
-                                                raw.get("needs_docker")),
+                                                needs_docker),
             "notes": str(raw.get("notes") or "")[:80]}
 
 

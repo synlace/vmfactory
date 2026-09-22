@@ -552,6 +552,20 @@ class CrashEvidencePhases(unittest.TestCase):
         self.assertIn("install.sh FAILED", ev["actual"])
 
 
+class DockerCommandClamp(unittest.TestCase):
+    """A docker-driving command coerces needs_docker (the ghost
+    hallucination class: docker run with no in-guest runtime)."""
+
+    def test_docker_first_word(self):
+        self.assertTrue(vmf_verify._command_needs_docker(["docker", "run", "x"]))
+
+    def test_plain_command(self):
+        self.assertFalse(vmf_verify._command_needs_docker(["node", "server.js"]))
+
+    def test_empty_command(self):
+        self.assertFalse(vmf_verify._command_needs_docker([]))
+
+
 class TargetRender(unittest.TestCase):
     """render_target: the published deliverable from passing checks."""
 

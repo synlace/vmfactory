@@ -439,6 +439,15 @@ def oom_floor_mb(evidence):
     return 0
 
 
+def _command_needs_docker(cmd):
+    # A command that drives docker (docker/podman/compose...) requires
+    # the in-guest daemon: a plan must declare needs_docker=true (the
+    # docker bundle stages it) or the guest has no container runtime
+    # and the first command word dies with "executable not found".
+    first = (cmd or [""])[0].strip()
+    return first in ("docker", "podman", "nerdctl")
+
+
 def revise_cmd(args):
     plan = json.load(open(args.plan))
     try:
@@ -492,8 +501,11 @@ def revise_cmd(args):
             sys.stderr.write("verify: revise grounding unavailable (%s)\n"
                              % e)
     prompt = facts + prompt
-    rc, o, err = vmf_llm.llm_call("intent", prompt, timeout=200,
-                                  env={"VMF_LLM_TIMEOUT": "180"})
+    # The revise is a PLANNING task (diagnosis + a fresh plan): it runs
+    # in the gapfill class — high reasoning effort via llm.sh's mapping,
+    # not the lean intent class that produced thin guesses before.
+    rc, o, err = vmf_llm.llm_call("gapfill", prompt, timeout=240,
+                                  env={"VMF_LLM_TIMEOUT": "220"})
     if rc != 0:
         # One retry: a stalled stream (curl 28 with a partial body) is a
         # provider hiccup, not a missing model — the evidence is worth
@@ -523,11 +535,13 @@ def revise_cmd(args):
                "images": vmf_plan._clamp_images(j.get("images")),
                "env": {str(k): str(v)
                        for k, v in (j.get("env") or {}).items()},
-               "needs_docker": bool(j.get("needs_docker")),
-               "memory_mb": vmf_plan._clamp_memory(
-                   j.get("memory_mb") or plan.get("memory_mb"),
-                   j.get("needs_docker", plan.get("needs_docker"))),
-               "notes": j.get("notes", "")}
+                "needs_docker": bool(j.get("needs_docker")) or \
+                    _command_needs_docker(cmd),
+                "memory_mb": vmf_plan._clamp_memory(
+                    j.get("memory_mb") or plan.get("memory_mb"),
+                    j.get("needs_docker", plan.get("needs_docker"))
+                    or _command_needs_docker(cmd)),
+                "notes": j.get("notes", "")}
     floor = oom_floor_mb(evidence)
     if floor and revised["memory_mb"] < floor:
         sys.stderr.write("verify: memory floor %d MB from the measured "

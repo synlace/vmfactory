@@ -56,15 +56,17 @@ case "${role:-}" in
 esac
 
 # The caller passes the user-side prompt; the system prompt is fixed and
-# terse: strict JSON, nothing else. Reasoning effort is per-role:
-# bounded-vocab calls stay lean (intent), plan/repair calls get depth
-# (gapfill low, agent medium). Env overrides per role; VMF_REASONING=off
-# disables everywhere.
+# terse: strict JSON, nothing else. Reasoning effort follows the task
+# class: PLANNING calls (enumerate, gap-fill, revise — the gapfill role)
+# get high effort: a wrong plan costs a full boot cycle. The in-guest
+# repair agent gets medium (iterative turns over a live VM). Intent
+# stays lean (bounded-vocab pointer work). Env overrides per role;
+# VMF_REASONING=off disables everywhere.
 body=$(VMF_ROLE="$role" python3 - "$model" "$prompt" <<'PY'
 import json, os, sys
 model, prompt = sys.argv[1], sys.argv[2]
 role = os.environ.get("VMF_ROLE", "")
-effort = {"gapfill": "low", "agent": "medium"}.get(role)
+effort = {"gapfill": "high", "agent": "medium"}.get(role)
 if os.environ.get("VMF_REASONING", "").strip().lower() == "off":
     effort = None
 override = {"intent": "VMF_INTENT_REASONING",
