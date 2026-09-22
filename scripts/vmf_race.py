@@ -283,8 +283,15 @@ def main(argv):
             rc = r["proc"].poll()
             if os.path.isfile(vpath):
                 with open(vpath) as f:
-                    verdicts[cand] = f.read().strip() or "fail"
-                if verdicts[cand] == "pass":
+                    status = f.read().strip() or "fail"
+                if status == "pass" and r["proc"].poll() is None:
+                    # Provisional: the runner's chain may still be
+                    # repairing or rebooting behind the verdict marker.
+                    # The crown waits for the runner to exit, then the
+                    # file's last write wins.
+                    continue
+                verdicts[cand] = status
+                if status == "pass":
                     winner = cand
             elif rc is not None and rc != 0:
                 verdicts[cand] = "fail (runner exit %d)" % rc
@@ -335,6 +342,25 @@ def main(argv):
 
     w = next(k for k in keep if k["cand"] == winner)
     say("winner %d %s; reaping losers" % (w["i"], w["kind"]))
+    # Kill the losers' runner chains FIRST (a candidate that is still
+    # building can boot its VM after the reap otherwise), then stop any
+    # VM that already rose, and re-stop after a settle for stragglers.
+    for k in keep:
+        if k["cand"] != winner and k["cand"] in running_state:
+            r = running_state[k["cand"]]
+            try:
+                r["proc"].terminate()
+                r["log"].close()
+            except Exception:
+                pass
+    time.sleep(2)
+    for k in keep:
+        if k["cand"] != winner:
+            stop_vm(k["cand"])
+    time.sleep(4)
+    for k in keep:
+        if k["cand"] != winner:
+            stop_vm(k["cand"])
 
     # Promotion: boot the canonical name from the winner's data drive.
     stop_vm(winner)

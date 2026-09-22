@@ -906,7 +906,7 @@ sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
         done < <(printf '%s' "$VMF_ORIG_ARGS_B64" | base64 -d)
       fi
       VMF_VERIFY_TURN=$((turn + 1)) VMF_RUN_YES=1 bash "$0" \
-        ${child_args[@]+"${child_args[@]}"}
+        ${child_args[@]+"${child_args[@]}"} --name "$name"
       exit $?
     fi
   fi
