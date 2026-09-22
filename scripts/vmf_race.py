@@ -186,6 +186,24 @@ def stop_vm(name):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _die(signum, _frame):
+    # Killed races must not orphan candidate VMs: reap everything this
+    # race started, then exit.
+    say("killed (signal %d); reaping candidates" % signum)
+    for cand in list(running_state):
+        r = running_state[cand]
+        try:
+            r["log"].close()
+        except Exception:
+            pass
+        r["proc"].terminate()
+        stop_vm(cand)
+    sys.exit(128 + signum)
+
+
+running_state = {}
+
+
 def main(argv):
     if len(argv) < 2:
         sys.stderr.write("usage: vmf_race.py <src>\n")
@@ -255,6 +273,7 @@ def main(argv):
             proc = subprocess.Popen(cmd, env=env, stdout=log,
                                     stderr=subprocess.STDOUT)
             running[k["cand"]] = dict(k, proc=proc, log=log, born=now)
+            running_state[k["cand"]] = running[k["cand"]]
             say("%d %s .. started (%s)" % (k["i"], k["kind"], k["cand"]))
             last_event = now
         # Poll verdicts and dead runners.
@@ -281,6 +300,7 @@ def main(argv):
                 r["log"].close()
                 r["proc"].terminate()
                 del running[cand]
+                running_state.pop(cand, None)
                 last_event = now
                 if winner:
                     break
@@ -335,4 +355,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGTERM, _die)
+    signal.signal(signal.SIGINT, _die)
     sys.exit(main(sys.argv))
