@@ -821,14 +821,20 @@ vmf_verify_stage() {
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
     --hostfwd "$rundir/hostfwd" --console "$RUNS_DIR/$name.log" \
     --evidence-out "$rundir/verify-evidence.json" || vrc=$?
+  # Verdict marker for the race coordinator: the final state of this
+  # stage per VM. Recursions overwrite; the last writer wins.
+  _verdict() { printf '%s\n' "$1" > "$RUNS_DIR/$name.verdict"; }
   if [[ "$vrc" -eq 0 ]]; then
+    _verdict pass
     rm -f "$RUNS_DIR/$name.transcript.json"
     return 0
   fi
   if [[ "$vrc" -ne 1 ]]; then
+    _verdict "fail (verify infra error rc=$vrc)"
     return 0
   fi
   if [[ "$turn" -ge "${VMF_VERIFY_TURNS:-2}" ]]; then
+    _verdict fail
     # Cache hygiene: record the failed replay on the intent cache —
     # a fresh grounded plan then replaces a repeatedly-dead spec.
     if [[ -n "$intent" ]]; then

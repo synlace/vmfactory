@@ -79,8 +79,33 @@ def derive_checks(plan, fwd):
     # probe/exec checks (clamped). Returns (runnable, skipped) where a
     # runnable check is (kind, port_or_cmd, spec_dict).
     runnable, skipped = [], []
-    for p in vmf_plan._clamp_ports(plan.get("ports")):
+    ports = plan.get("ports")
+    if ports is None and plan.get("services"):
+        # Compose-shaped plan: the primary service's declared guest
+        # ports are the app's surface; tcp only (udp is not probed).
+        primary = plan.get("primary")
+        for s in plan.get("services") or []:
+            if s.get("name") != primary:
+                continue
+            ports = [pp.get("host") for pp in s.get("ports") or []
+                     if pp.get("proto", "tcp") != "udp"]
+            break
+    clamped = vmf_plan._clamp_ports(ports)
+    for p in clamped:
         runnable.append(("tcp", p, {"tcp": {"port": p}}))
+    # Lenient http probe on the first tcp surface (status < 400 covers
+    # 200 and auth redirects) when the plan declared no checks of its
+    # own. tcp alone proved shallow: a published port with a dying app
+    # accepts the connection and dies after.
+    probe_pool = [pp.get("host") if isinstance(pp, dict) else pp
+                  for pp in (ports or [])
+                  if not (isinstance(pp, dict) and pp.get("proto") == "udp")]
+    probe_c = vmf_plan._clamp_ports(probe_pool)
+    if not plan.get("checks") and probe_c:
+        first = min(probe_c)
+        runnable.append(("probe", first,
+                         {"probe": {"port": first, "path": "/",
+                                    "expect_status_max": 399}}))
     for c in vmf_plan._clamp_checks(plan.get("checks")):
         if "probe" in c:
             runnable.append(("probe", c["probe"]["port"], c))
@@ -127,7 +152,8 @@ def check_probe(spec, fwd, _name):
     p = spec["probe"]
     hp = fwd.get(p["port"], p["port"])
     url = "http://127.0.0.1:%d%s" % (hp, p.get("path", "/"))
-    want = p.get("expect_status", 200)
+    want = p.get("expect_status")
+    want_max = p.get("expect_status_max")
     try:
         r = urllib.request.urlopen(url, timeout=5)
         status, body = r.status, r.read(8192).decode("utf-8", "replace")
@@ -135,15 +161,24 @@ def check_probe(spec, fwd, _name):
         status = e.code
         body = (e.read(8192) or b"").decode("utf-8", "replace")
     except Exception as e:
-        return False, {"check": "probe:%d" % p["port"], "expected": str(want),
+        return False, {"check": "probe:%d" % p["port"],
+                       "expected": str(want or want_max),
                        "actual": "http fetch failed: %s" % e}
-    ok = status == want
+    if want is not None:
+        ok = status == want
+        desc = str(want)
+    elif want_max is not None:
+        ok = 100 <= status <= want_max
+        desc = "status 100..%d" % want_max
+    else:
+        ok = status == 200
+        desc = "200"
     if ok and p.get("expect_contains"):
         ok = p["expect_contains"] in body
     ev = None
     if not ok:
         ev = {"check": "probe:%d" % p["port"],
-              "expected": "%s%s" % (want, (" containing %r"
+              "expected": "%s%s" % (desc, (" containing %r"
                                            % p["expect_contains"])
                                     if p.get("expect_contains") else ""),
               "actual": "status %d; body: %s" % (status, body[:120])}

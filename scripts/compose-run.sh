@@ -450,4 +450,5 @@ if [[ "${VMF_COMPOSE_NOEXEC:-0}" == "1" ]]; then
   exit 0
 fi
 exec env -u VMF_COMPOSE_SRC VMF_MODE=compose VMF_DATA_DRIVE="$drive" \
+  VMF_VERIFY_PLAN="$plan_tmp/plan.json" \
   "$SCRIPT_DIR/oci-run.sh" ${ports_args[@]+"${ports_args[@]}"} "$primary_tag"

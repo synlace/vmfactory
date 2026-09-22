@@ -231,8 +231,10 @@ class RunFlow(unittest.TestCase):
                 self.args({"ports": [port]}, deadline=3,
                            evidence_out=ev_path))
         self.assertEqual(rc, 1)
-        self.assertIn("0/1 checks pass", out.getvalue())
-        self.assertIn("1 failed", out.getvalue())
+        # The declared port now also carries a lenient auto-probe
+        # (status < 400) when the plan declares no checks of its own.
+        self.assertIn("0/2 checks pass", out.getvalue())
+        self.assertIn("2 failed", out.getvalue())
         ev = json.load(open(ev_path))
         self.assertEqual(ev[0]["check"], "tcp:%d" % port)
 
