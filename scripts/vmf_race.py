@@ -106,11 +106,13 @@ def _expose_ports(src):
     return ports[:8]
 
 
-def synth_dir(kind, src, image):
+def synth_dir(kind, src, image, ports):
     # Synthetic single-service compose dir for the dockerfile and
     # prebuilt_image kinds; the compose kind uses the real repo dir.
+    # Ports come from the Dockerfile's EXPOSE lines, falling back to the
+    # enumeration's documented ports.
     d = tempfile.mkdtemp(prefix="vmf-race-%s-" % kind)
-    ports = _expose_ports(src)
+    ports = _expose_ports(src) or ports or []
     svc = {"image": image} if kind != "dockerfile" else \
         {"build": {"context": src, "dockerfile": "Dockerfile"}}
     doc = {"services": {"app": dict(
@@ -120,16 +122,21 @@ def synth_dir(kind, src, image):
     return d
 
 
-def satisfiable(kind, src, image, log):
+def satisfiable(kind, src, image, ports, log):
     # Prune before boot: the plan stage must succeed, no env gap, and at
     # least one declared tcp port for the verify arbiter.
     if kind == "prebuilt_image" and not image:
         log.write("pruned: no image ref from the enumeration\n")
         return False
+    if kind in ("dockerfile", "prebuilt_image") \
+            and not _expose_ports(src) and not ports:
+        log.write("pruned: no declared tcp ports to verify "
+                  "(no EXPOSE lines, none documented)\n")
+        return False
     if kind in ("compose", "dockerfile", "prebuilt_image"):
         psrc = src
         if kind != "compose":
-            psrc = synth_dir(kind, src, image)
+            psrc = synth_dir(kind, src, image, ports)
         out = os.path.join(RUNS, ".race-plan.json")
         rc = plan_stage(psrc, out)
         if rc.returncode != 0:
@@ -160,7 +167,7 @@ def satisfiable(kind, src, image, log):
     return True
 
 
-def runner_cmd(kind, name, src, image):
+def runner_cmd(kind, name, src, image, ports=None):
     # Candidates re-enter oci-run as children; the marker env stops the
     # race from re-entering. --yes/--ssh ride the runner args.
     env = dict(os.environ)
@@ -176,7 +183,7 @@ def runner_cmd(kind, name, src, image):
     elif kind == "compose":
         args = [src]
     else:
-        args = [synth_dir(kind, src, image)]
+        args = [synth_dir(kind, src, image, ports)]
     return ["bash", os.path.join(SCRIPTS, "oci-run.sh"), "--yes",
             "--name", name] + args, env
 
@@ -223,7 +230,7 @@ def main(argv):
             cand = "%s-c%d" % (base, i)
             lp = os.path.join(logdir, "%s.log" % cand)
             with open(lp, "w") as log:
-                ok = satisfiable(a["kind"], src, a.get("image"), log)
+                ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log)
             if ok:
                 alive += 1
             else:
@@ -243,10 +250,10 @@ def main(argv):
         cand = "%s-c%d" % (base, i)
         lp = os.path.join(logdir, "%s.log" % cand)
         with open(lp, "w") as log:
-            ok = satisfiable(a["kind"], src, a.get("image"), log)
+            ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log)
         if ok:
             keep.append({"i": i, "kind": a["kind"], "cand": cand, "lp": lp,
-                         "image": a.get("image")})
+                         "image": a.get("image"), "ports": a.get("ports") or []})
         else:
             say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
     if not keep:
@@ -275,7 +282,7 @@ def main(argv):
         if (queue and len(running) < PARALLEL
                 and now - last_event >= STAGGER):
             k = queue.pop(0)
-            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"])
+            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"], k["ports"])
             log = open(k["lp"], "a")
             log.write("\n===== boot =====\n")
             proc = subprocess.Popen(cmd, env=env, stdout=log,
@@ -375,7 +382,7 @@ def main(argv):
     # Let the reaped VMs release their host ports before the canonical
     # boot claims them (otherwise pick_host_port bumps the app port).
     time.sleep(3)
-    cmd, env = runner_cmd(w["kind"], base, src, w["image"])
+    cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"])
     env["VMF_NAME"] = base
     log = open(w["lp"], "a")
     log.write("\n===== promotion (%s) =====\n" % base)

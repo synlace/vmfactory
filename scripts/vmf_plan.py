@@ -1771,6 +1771,28 @@ def _base_approaches(found):
     return out
 
 
+def _clamp_image_ref(raw):
+    # A container image reference: registry/repo[:tag][@digest]. Bare
+    # library names are allowed; junk is not.
+    s = str(raw or "").strip()
+    if not s or len(s) > 200 or any(c in s for c in " \t\n\"'"):
+        return ""
+    return s
+
+
+def _clamp_int_ports(raw):
+    # Serving ports the docs declare: 1-8 distinct ints.
+    out = []
+    for x in (raw or [])[:8]:
+        try:
+            p = int(str(x).strip())
+        except ValueError:
+            continue
+        if 1 <= p <= 65535 and p not in out:
+            out.append(p)
+    return out[:8]
+
+
 def enumerate_cmd(src, out, verbose=False):
     found, skipped, total = read_repo_files(src)
     print_reading_phase(found, skipped, src, verbose=verbose)
@@ -1783,9 +1805,12 @@ def enumerate_cmd(src, out, verbose=False):
         'Reply ONE JSON object: {"approaches": [{"kind": "compose|'
         'dockerfile|prebuilt_image|install_script|source_build", '
         '"evidence": "<file: reason, max 12 words>", '
-        '"cost": "fast|slow|slowest"}]}\n'
+        '"cost": "fast|slow|slowest", '
+        '"image": "<container ref, prebuilt_image only>", '
+        '"ports": [<int serving ports, when the docs state them>]}]}\n'
         "Rules: kinds from the vocabulary only; at most 4; cheapest first; "
-        "evidence names a real file.\n\n")
+        "evidence names a real file; for prebuilt_image the ref is exact "
+        "(e.g. ghcr.io/org/app:latest); ports only when documented.\n\n")
     for rel, _, content in found:
         prompt += "===== %s =====\n%s\n" % (rel, content)
     role = os.environ.get("VMF_ENUMERATE_ROLE", "gapfill")
@@ -1800,11 +1825,18 @@ def enumerate_cmd(src, out, verbose=False):
                 kind = a.get("kind")
                 if kind not in APPROACH_KINDS:
                     continue
-                got.append({"kind": kind,
-                            "evidence": str(a.get("evidence") or kind)[:120],
-                            "cost": a.get("cost") if a.get("cost")
-                                    in ("fast", "slow", "slowest")
-                                    else APPROACH_COST[kind]})
+                entry = {"kind": kind,
+                         "evidence": str(a.get("evidence") or kind)[:120],
+                         "cost": a.get("cost") if a.get("cost")
+                                 in ("fast", "slow", "slowest")
+                                 else APPROACH_COST[kind]}
+                img = _clamp_image_ref(a.get("image"))
+                if img and kind == "prebuilt_image":
+                    entry["image"] = img
+                ports = _clamp_int_ports(a.get("ports"))
+                if ports:
+                    entry["ports"] = ports
+                got.append(entry)
         except Exception:
             got = []
     # Clamp: dedupe by kind, first occurrence wins (the model's order);
