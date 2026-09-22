@@ -58,14 +58,17 @@ def scripts():
 
 
 def load_hostfwd(path):
-    # hostfwd lines: "proto hport gport" (or legacy "hport gport" tcp).
+    # hostfwd lines: "proto bind hport gport" (bind-aware, matches
+    # vmf_fwd_parse), "proto hport gport", or legacy "hport gport" tcp.
     # The check speaks against the PUBLISHED host port; the plan speaks
     # guest ports (intent publishes 1:1, compose may remap).
     fwd = {}
     try:
         for line in open(path):
             parts = line.split()
-            if len(parts) == 3:
+            if len(parts) == 4:
+                fwd[int(parts[3])] = int(parts[2])
+            elif len(parts) == 3:
                 fwd[int(parts[2])] = int(parts[1])
             elif len(parts) == 2:
                 fwd[int(parts[1])] = int(parts[0])

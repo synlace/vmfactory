@@ -482,6 +482,19 @@ class OomFloor(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class FwdParsePy(unittest.TestCase):
+    """load_hostfwd: the bash writer emits 4-field bind-aware lines."""
+
+    def test_four_field_bind_line(self):
+        import tempfile
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".fwd", delete=False)
+        f.write("tcp 0.0.0.0 36485 8080\ntcp 127.0.0.1 23348 22\n")
+        f.close()
+        fwd = vmf_verify.load_hostfwd(f.name)
+        os.unlink(f.name)
+        self.assertEqual(fwd, {8080: 36485, 22: 23348})
+
+
 class TargetRender(unittest.TestCase):
     """render_target: the published deliverable from passing checks."""
 
