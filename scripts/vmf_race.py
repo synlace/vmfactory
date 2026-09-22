@@ -16,7 +16,7 @@
 #
 # Env: VMF_RACE_MODE=plan  — table only, boot nothing (exit 0/1)
 #      VMF_RACE_APPROACH / VMF_RACE_SKIP — name or number filters (csv)
-#      VMF_RACE_STAGGER (90) VMF_RACE_PARALLEL (2) VMF_RACE_DEADLINE (1800)
+#      VMF_RACE_STAGGER (90) VMF_RACE_PARALLEL (2) VMF_RACE_DEADLINE (2700)
 #      VMF_RACE_CHILD=1    — candidate runners must not re-enter the race
 import json
 import os
@@ -32,7 +32,7 @@ SCRIPTS = os.environ.get("VMF_SCRIPTS_DIR") or os.path.dirname(
     os.path.abspath(__file__))
 STAGGER = int(os.environ.get("VMF_RACE_STAGGER") or 90)
 PARALLEL = int(os.environ.get("VMF_RACE_PARALLEL") or 2)
-DEADLINE = int(os.environ.get("VMF_RACE_DEADLINE") or 1800)
+DEADLINE = int(os.environ.get("VMF_RACE_DEADLINE") or 2700)
 
 
 def _plan_interp():
