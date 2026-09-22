@@ -24,8 +24,17 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-[[ $# -ge 1 ]] || { echo "llm.sh: no prompt given" >&2; exit 2; }
-prompt="$1"
+if [[ $# -lt 1 ]]; then
+  echo "llm.sh: no prompt given" >&2
+  exit 2
+fi
+# "-" reads the prompt from stdin: grounded prompts exceed the per-arg
+# exec limit (E2BIG).
+if [[ "$1" == "-" ]]; then
+  prompt=$(cat)
+else
+  prompt="$1"
+fi
 
 ENV_FILE="${VMF_ENV_FILE:-$HOME/.vmf/env}"
 if [[ -f "$ENV_FILE" ]]; then

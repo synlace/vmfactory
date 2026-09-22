@@ -34,7 +34,7 @@ def _scripts():
     return os.environ.get("VMF_SCRIPTS_DIR") or os.path.dirname(os.path.abspath(__file__))
 
 
-def run(cmd, timeout=90, env=None):
+def run(cmd, timeout=90, env=None, stdin=None):
     # env REPLACES the environment at the subprocess level; callers pass
     # overrides, so merge them over the inherited environment here.
     full_env = None
@@ -43,15 +43,18 @@ def run(cmd, timeout=90, env=None):
         full_env.update(env)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=full_env)
+                           timeout=timeout, env=full_env, input=stdin)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 99, "", "timeout"
 
 
 def llm_call(role, prompt, timeout=90, env=None):
+    # The prompt rides stdin ("-"): grounded prompts (repo evidence +
+    # doc facts) exceed the per-arg exec limit (E2BIG: "Argument list
+    # too long") and silently killed the gap-fill before a plan existed.
     return run(["bash", os.path.join(_scripts(), "llm.sh"), "--role", role,
-                prompt], timeout, env)
+                "-"], timeout, env, stdin=prompt)
 
 
 def c7_search(topic, timeout=30):
