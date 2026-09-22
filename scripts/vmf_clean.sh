@@ -30,7 +30,22 @@ want_pins=0
 keep_age=0
 
 usage() {
-  sed -n '2,25p' "$0"
+  cat <<'EOF'
+usage: just clean [--yes] [--vms] [--drives] [--plans] [--race] [--pins]
+                  [--keep-age AGE]
+
+Groups:
+  vms     terminated VMs: conf, console log, rundirs
+  drives  compose data drives (a drive held by a running VM is kept)
+  plans   generated plan caches (~/.vmf/generated)
+  race    race artifacts: logs, verdict markers, enum/plan scratch
+  pins    registry pin store (listed always; removed only with --pins)
+
+Default: dry run + the gate (a = all, n = abort, or a group list).
+--yes executes the selected groups (all except pins without flags).
+--keep-age AGE keeps items younger than AGE (30m, 12h, 2d).
+Running VMs are never touched.
+EOF
   exit 2
 }
 

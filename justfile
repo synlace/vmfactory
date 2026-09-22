@@ -132,13 +132,15 @@ revert label lab=lab:
     qemu-img snapshot -a "{{ label }}" "build/{{ lab }}/image/vmf-{{ lab }}"
     echo "ok: reverted {{ lab }} to {{ label }}"
 
-# With no argument: inventory and remove run artifacts (terminated VMs,
-# data drives, plan caches, race artifacts). Dry run + gate; --yes
-# executes. With a lab argument: the old build-output clean.
-clean target="":
+# Inventory and remove run artifacts: terminated VMs, data drives, plan
+# caches, race artifacts. Dry run + gate by default; --yes executes.
+clean *args:
     #!/bin/sh
-    if [ -z "{{ target }}" ]; then exec bash scripts/vmf_clean.sh "$@"; fi
-    rm -rf build/{{ target }}
+    exec bash scripts/vmf_clean.sh "$@"
+
+# Remove generated build output for a box
+clean-lab lab:
+    rm -rf build/{{ lab }}
 
 # Remove all generated build output
 clean-all:
