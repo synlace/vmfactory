@@ -216,6 +216,8 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
         if compose_file:
             env["VMF_COMPOSE_HINT_FILE"] = compose_file
         args = [src]
+        say("spawn %s: VMF_COMPOSE_HINT_FILE=%r" % (
+            name, env.get("VMF_COMPOSE_HINT_FILE")))
     else:
         args = [synth_dir(kind, src, image, ports)]
     return ["bash", os.path.join(SCRIPTS, "oci-run.sh"), "--yes",
@@ -287,7 +289,8 @@ def main(argv):
             ok = satisfiable(a["kind"], src, a.get("image"), a.get("ports") or [], log, a.get("compose_file"))
         if ok:
             keep.append({"i": i, "kind": a["kind"], "cand": cand, "lp": lp,
-                         "image": a.get("image"), "ports": a.get("ports") or []})
+                         "image": a.get("image"), "ports": a.get("ports") or [],
+                         "compose_file": a.get("compose_file")})
         else:
             say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
     if not keep:
@@ -345,6 +348,13 @@ def main(argv):
                     winner = cand
             elif rc is not None and rc != 0:
                 verdicts[cand] = "fail (runner exit %d)" % rc
+                try:
+                    with open(r["log"].name, errors="replace") as f:
+                        tail = [l.rstrip() for l in f.readlines()[-3:]]
+                    say("%s last: %s" % (cand, " | ".join(t[-90:] for t in tail
+                                                         if t.strip()) or "(no output)"))
+                except OSError:
+                    say("%s last: (log unreadable)" % cand)
             elif rc == 0:
                 # Runner done without a verdict: brief grace for the
                 # marker write, then judge.
