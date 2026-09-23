@@ -138,6 +138,12 @@ clean *args:
     #!/bin/sh
     exec bash scripts/vmf_clean.sh "$@"
 
+# Delete winner-cache entries (forces a fresh race next run; for tests).
+# --tree H limits to one tree prefix; --plans also clears plan caches.
+cache-clean *args:
+    #!/bin/sh
+    exec bash scripts/vmf_clean.sh --yes --cache "$@"
+
 # Docker-ps view of VM instances: id, ref, approach, status, target.
 # --all shows race candidates; --json for scripts.
 ps *args:

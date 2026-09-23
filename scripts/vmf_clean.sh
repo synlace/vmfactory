@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # vmf_clean.sh — inventory and remove run artifacts.
 #
-# usage: vmf_clean.sh [--yes] [--vms] [--drives] [--plans] [--race] [--pins]
-#                     [--keep-age AGE]
+# usage: vmf_clean.sh [--yes] [--vms] [--drives] [--plans] [--race] [--cache]
+#                     [--tree HASH] [--pins] [--keep-age AGE]
 #
 # Groups:
 #   vms     terminated VMs: conf + console log + rundirs + ssh host keys
@@ -10,6 +10,9 @@
 #           a running VM is never a candidate)
 #   plans   generated plan caches (~/.vmf/generated)
 #   race    race artifacts: logs, verdict markers, enum/plan scratch
+#   cache   winner cache entries (winner.json per tree; --tree H limits
+#           to one tree prefix). Never in the default set and never
+#           age-guarded: deleting it forces a fresh race for testing.
 #   pins    registry pin store (listed always, removed only with --pins)
 #
 # Default: dry run + the gate (a = all, n = abort, or a group list).
@@ -23,27 +26,31 @@ GEN_DIR="${VMF_GENERATED:-$HOME/.vmf/generated}"
 PINS="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 SSH_DIR="${VMF_SSH_DIR:-$HOME/.vmf/ssh}"
 
-GROUP_NAMES="vms drives plans race"
+GROUP_NAMES="vms drives plans race cache"
+DEFAULT_GROUPS="vms drives plans race"
 yes_flag=0
 want=""
 want_pins=0
+cache_tree=""
 keep_age=0
 
 usage() {
   cat <<'EOF'
-usage: just clean [--yes] [--vms] [--drives] [--plans] [--race] [--pins]
-                  [--keep-age AGE]
+usage: just clean [--yes] [--vms] [--drives] [--plans] [--race] [--cache]
+                  [--tree HASH] [--pins] [--keep-age AGE]
 
 Groups:
   vms     terminated VMs: conf, console log, rundirs
   drives  compose data drives (a drive held by a running VM is kept)
   plans   generated plan caches (~/.vmf/generated)
   race    race artifacts: logs, verdict markers, enum/plan scratch
+  cache   winner cache entries (winner.json; --tree H limits to one tree)
   pins    registry pin store (listed always; removed only with --pins)
 
 Default: dry run + the gate (a = all, n = abort, or a group list).
---yes executes the selected groups (all except pins without flags).
---keep-age AGE keeps items younger than AGE (30m, 12h, 2d).
+--yes executes the selected groups (default groups without flags; cache
+and pins only with their flags). --cache ignores --keep-age. --keep-age
+AGE keeps items younger than AGE (30m, 12h, 2d) in the other groups.
 Running VMs are never touched.
 EOF
   exit 2
@@ -66,6 +73,8 @@ while [[ $# -gt 0 ]]; do
     --drives) want="$want drives"; shift ;;
     --plans) want="$want plans"; shift ;;
     --race) want="$want race"; shift ;;
+    --cache) want="$want cache"; shift ;;
+    --tree) [[ $# -ge 2 ]] || usage; cache_tree="$2"; shift 2 ;;
     --pins) want_pins=1; shift ;;
     --keep-age) [[ $# -ge 2 ]] || usage; keep_age=$(age_secs "$2"); shift 2 ;;
     -h|--help) usage ;;
@@ -197,8 +206,8 @@ drive_map() { # drive basename -> owner name
 }
 
 # --- inventory ------------------------------------------------------------
-declare -a ACT_VMS=() ACT_DRIVES=() ACT_PLANS=() ACT_RACE=()
-sz_vms=0 sz_drives=0 sz_plans=0 sz_race=0
+declare -a ACT_VMS=() ACT_DRIVES=() ACT_PLANS=() ACT_RACE=() ACT_CACHE=()
+sz_vms=0 sz_drives=0 sz_plans=0 sz_race=0 sz_cache=0
 running_list=""
 
 inv_vms() {
@@ -282,6 +291,21 @@ inv_race() {
   done
 }
 
+inv_cache() {
+  local w sz tree
+  for w in "$GEN_DIR"/*/winner.json; do
+    [[ -f "$w" ]] || continue
+    tree=$(basename "$(dirname "$w")")
+    if [[ -n "$cache_tree" && "$tree" != "$cache_tree"* ]]; then continue; fi
+    sz=$(stat -c %s "$w")
+    printf '  tree %-12s %10s  age %sd  %s\n' "${tree:0:12}" \
+      "$(fmt_size "$sz")" "$(( $(age_of "$w") / 86400 ))" \
+      "$(python3 -c "import json,sys; d=json.load(open('$w')); print(d.get('approach','?'))" 2>/dev/null || printf '?')"
+    ACT_CACHE+=("$w")
+    sz_cache=$(( sz_cache + sz ))
+  done
+}
+
 inv_pins() {
   [[ -f "$PINS" ]] || return 0
   printf '  %-16s %10s  %s pin(s)\n' "$(basename "$PINS")" \
@@ -293,22 +317,23 @@ inv_vms
 inv_drives
 inv_plans
 inv_race
+inv_cache
 inv_pins
-total=$(( sz_vms + sz_drives + sz_plans + sz_race ))
-echo "clean: dry run — vms $(fmt_size "$sz_vms"), drives $(fmt_size "$sz_drives"), plans $(fmt_size "$sz_plans"), race $(fmt_size "$sz_race")"
+total=$(( sz_vms + sz_drives + sz_plans + sz_race + sz_cache ))
+echo "clean: dry run — vms $(fmt_size "$sz_vms"), drives $(fmt_size "$sz_drives"), plans $(fmt_size "$sz_plans"), race $(fmt_size "$sz_race"), cache $(fmt_size "$sz_cache")"
 
 # --- selection ------------------------------------------------------------
 chosen=""
 if [[ "$yes_flag" == "1" ]]; then
   chosen="$want"
-  [[ -n "$chosen" ]] || chosen="$GROUP_NAMES"
+  [[ -n "$chosen" ]] || chosen="$DEFAULT_GROUPS"
 else
   if [[ -t 0 ]]; then
     printf 'gate: what to remove? [a = all above, n = abort, or list: %s] ' \
       "$(printf '%s,' "$GROUP_NAMES" | sed 's/,$//')"
     read -r ans
     case "$ans" in
-      a|A) chosen="$GROUP_NAMES" ;;
+      a|A) chosen="$DEFAULT_GROUPS" ;;
       ""|n|N) echo "clean: abort; nothing deleted"; exit 0 ;;
       *) chosen="$ans" ;;
     esac
@@ -327,7 +352,7 @@ fi
 
 # --- execute ----------------------------------------------------------------
 reclaimed=0
-for g in vms drives plans race; do
+for g in vms drives plans race cache; do
   case " $chosen " in *" $g "*) ;; *) continue ;; esac
   n=0
   case "$g" in
@@ -372,6 +397,13 @@ for g in vms drives plans race; do
       for p in "${ACT_RACE[@]:-}"; do
         [[ -n "$p" ]] || continue
         rm -rf "$p"
+        n=$((n+1))
+      done
+      ;;
+    cache)
+      for w in "${ACT_CACHE[@]:-}"; do
+        [[ -n "$w" ]] || continue
+        rm -f "$w"
         n=$((n+1))
       done
       ;;

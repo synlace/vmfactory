@@ -165,5 +165,53 @@ class InstanceNumbering(unittest.TestCase):
         self.assertEqual(out, "web")
 
 
+class CleanCache(unittest.TestCase):
+    """vmf_clean.sh --cache: removes winner.json (per-tree via --tree),
+    never touches other trees, and stays out of the default set."""
+
+    def _setup(self):
+        import tempfile, json
+        self.gen = os.path.join(
+            tempfile.mkdtemp(prefix="vmf-clean-"), "generated")
+        for tree in ("aaaa1111bbbb", "cccc2222dddd"):
+            d = os.path.join(self.gen, tree)
+            os.makedirs(d)
+            with open(os.path.join(d, "winner.json"), "w") as f:
+                json.dump({"approach": "compose"}, f)
+
+    def _run(self, *flags):
+        env = dict(os.environ)
+        env["VMF_GENERATED"] = self.gen
+        env["VMF_RUNS"] = os.path.join(self.gen, ".runs-empty")
+        return subprocess.run(
+            ["bash", os.path.join(SCRIPTS, "vmf_clean.sh"), *flags],
+            env=env, capture_output=True, text=True)
+
+    def _winner(self, tree):
+        return os.path.join(self.gen, tree, "winner.json")
+
+    def test_tree_flag_removes_one(self):
+        self._setup()
+        p = self._run("--yes", "--cache", "--tree", "aaaa")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(os.path.exists(self._winner("aaaa1111bbbb")))
+        self.assertTrue(os.path.exists(self._winner("cccc2222dddd")))
+        self.assertIn("cache", p.stdout)
+
+    def test_no_tree_removes_all_cache(self):
+        self._setup()
+        p = self._run("--yes", "--cache")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(os.path.exists(self._winner("aaaa1111bbbb")))
+        self.assertFalse(os.path.exists(self._winner("cccc2222dddd")))
+
+    def test_default_yes_never_touches_cache(self):
+        self._setup()
+        p = self._run("--yes", "--vms")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(os.path.exists(self._winner("aaaa1111bbbb")))
+        self.assertTrue(os.path.exists(self._winner("cccc2222dddd")))
+
+
 if __name__ == "__main__":
     unittest.main()
