@@ -123,12 +123,15 @@ cmd_claim() {
   [[ -n "$mac" ]] || { echo "usage: vmf-net.sh claim <mac>" >&2; return 2; }
   for i in $(seq 0 $((POOL - 1))); do
     t=$(tap_name "$i")
+    # Existence first: after a host reboot the pool is gone, and handing
+    # out a phantom name makes qemu die on /dev/net/tun (unprivileged).
+    ip -o link show "$t" >/dev/null 2>&1 || continue
     if ! tap_busy "$t"; then
       printf '%s\n' "$t"
       return 0
     fi
   done
-  echo "net: no free tap in the pool ($POOL); raise VMF_NET_POOL" >&2
+  echo "net: no free tap in the pool ($POOL); run 'just lab-init' or raise VMF_NET_POOL" >&2
   return 1
 }
 

@@ -477,3 +477,28 @@ class ClampImages(unittest.TestCase):
         self.assertEqual(
             vmf_plan._clamp_images(["localhost/vmf-fat-base:1"]),
             ["localhost/vmf-fat-base:1"])
+
+
+class SynthChecks(unittest.TestCase):
+    def test_ports_give_tcp_and_probe(self):
+        out = vmf_plan._synth_checks([2368, 2369])
+        self.assertEqual(out, [
+            {"tcp": {"port": 2368}}, {"tcp": {"port": 2369}},
+            {"probe": {"port": 2368, "path": "/", "expect_status_max": 399}}])
+
+    def test_junk_ports_clamped(self):
+        out = vmf_plan._synth_checks(["8080", "junk"])
+        self.assertEqual([c["tcp"]["port"] for c in out[:1]], [8080])
+        self.assertTrue(any("probe" in c for c in out))
+
+    def test_command_only_gives_exec(self):
+        out = vmf_plan._synth_checks([], ["ghost", "version"])
+        self.assertEqual(out, [{"exec": {"cmd": "sh -c 'command -v ghost'"}}])
+
+    def test_declared_checks_win(self):
+        out = vmf_plan._synth_checks([], [])
+        self.assertEqual(out, [])
+
+    def test_absolute_path_skipped(self):
+        out = vmf_plan._synth_checks([], ["/usr/local/bin/app", "serve"])
+        self.assertEqual(out, [])

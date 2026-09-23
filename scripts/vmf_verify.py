@@ -7,7 +7,8 @@
 # Commands:
 #   run <plan.json> --name N --hostfwd F [--deadline S] [--evidence-out P]
 #       Runs every runnable check until it passes or the deadline
-#       expires. Exit 0 all pass · 1 failures · 2 ssh never came up.
+#       expires. Exit 0 all pass · 1 failures · 2 nothing runnable ·
+#       3 ssh never came up.
 #       The deadline default (180s) must outlast the app's own boot:
 #       an OOM kill lands inside the window, becomes evidence, and
 #       drives the memory revision (measured RSS + 1024 MB headroom).
@@ -335,7 +336,10 @@ def run_cmd(args):
             print("verdict: %s" % ev["actual"])
             return 1
         print("verify: ssh never came up; no verdict possible")
-        return 2
+        # Distinct exit code: rc=2 stays "plan declares nothing" (the
+        # race reads the marker, but the marker text must not lie about
+        # which wall was hit). The boot never produced a reachable VM.
+        return 3
     results = [False] * len(runnable)
     failed = {}
     last_progress = time.time()

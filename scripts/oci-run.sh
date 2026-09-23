@@ -952,6 +952,10 @@ vmf_verify_stage() {
     _verdict "unverified (plan declares no checks)"
     return 0
   fi
+  if [[ "$vrc" -eq 3 ]]; then
+    _verdict "fail (ssh never came up)"
+    return 0
+  fi
   if [[ "$vrc" -ne 1 ]]; then
     _verdict "fail (verify infra error rc=$vrc)"
     return 0

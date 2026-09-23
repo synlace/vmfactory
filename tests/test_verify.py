@@ -252,7 +252,7 @@ class RunFlow(unittest.TestCase):
                 os.environ["VMF_VERIFY_SSH"] = "true"
             else:
                 os.environ["VMF_VERIFY_SSH"] = self.old_ssh
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 3)
         self.assertIn("ssh never came up", out.getvalue())
 
     def test_oom_console_becomes_evidence(self):

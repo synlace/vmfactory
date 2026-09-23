@@ -350,11 +350,14 @@ def gapfill(root, plan_out):
             if not base or not cmd:
                 sys.stderr.write("error: gap-fill direct plan lacks base_image or command\n")
                 sys.exit(1)
+            clamped_ports = _clamp_ports(pj.get("ports"))
+            clamped_checks = _clamp_checks(pj.get("checks")) \
+                or _synth_checks(clamped_ports, cmd)
             dtext = json.dumps({"base_image": base,
                                 "install": [str(x) for x in (pj.get("install") or [])][:20],
                                 "command": [str(x) for x in cmd][:16],
-                                "ports": _clamp_ports(pj.get("ports")),
-                                "checks": _clamp_checks(pj.get("checks")),
+                                "ports": clamped_ports,
+                                "checks": clamped_checks,
                                 "images": _clamp_images(pj.get("images")),
                                 "env": {str(k): str(v) for k, v in (pj.get("env") or {}).items()},
                                 "needs_docker": bool(pj.get("needs_docker")),
@@ -1426,6 +1429,24 @@ def base_image_note():
     return (
         "The base image is minimal: include prerequisite installs in "
         "the install list (e.g. 'pip install uv' before 'uv sync').")
+
+
+def _synth_checks(ports, command=None):
+    # Every plan carries a verify step. Ports → tcp per port + one
+    # lenient HTTP probe on the first port. No ports but a command →
+    # one exec check proving the entry binary exists on PATH (the
+    # "ssh in and check the binary" shape for non-serving artifacts).
+    # Deterministic: same plan in, same checks out.
+    cp = _clamp_ports(ports)
+    out = [{"tcp": {"port": p}} for p in cp]
+    if cp:
+        out.append({"probe": {"port": cp[0], "path": "/",
+                              "expect_status_max": 399}})
+    if not out and command:
+        a0 = str(command[0]).strip() if command else ""
+        if a0 and "/" not in a0:
+            out.append({"exec": {"cmd": "sh -c 'command -v %s'" % a0}})
+    return out
 
 
 def _clamp_ports(raw):
