@@ -364,6 +364,20 @@ mkdir -p "$stage/images" "$stage/docker/bin"
 cp "$plan_tmp/compose.yaml" "$stage/compose.yaml"
 cp "$plan_tmp/ports.txt" "$stage/ports.txt"
 cp "$DOCKER_BUNDLE"/bin/* "$stage/docker/bin/"
+# Relative bind mounts: the plan parsed them clone-relative; the guest
+# compose mounts /data/repo/<rel>. Without the sources, a bind-backed
+# entrypoint dies at exec ("stat /entrypoint.sh: no such file").
+mkdir -p "$stage/repo"
+while IFS= read -r rel; do
+  [[ -n "$rel" ]] || continue
+  src_path="$VMF_COMPOSE_SRC/$rel"
+  if [[ -e "$src_path" ]]; then
+    mkdir -p "$stage/repo/$(dirname "$rel")"
+    cp -r "$src_path" "$stage/repo/$rel"
+  else
+    echo "note: bind source missing: $rel (mount will be empty)" >&2
+  fi
+done < <("${JQ[@]}" -r '.services[]?.binds[]?.host' "$plan_tmp/plan.json" 2>/dev/null)
 while IFS=$'\t' read -r name kind rest; do
   # Built services push their local tag; pulled services push by digest
   # ref (the store only has the upstream name). Either way the tar

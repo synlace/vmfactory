@@ -639,7 +639,18 @@ def translate(compose_path, src, root):
         sys.exit(1)
     plan = {"compose_file": os.path.basename(compose_path), "services": [],
             "project_dir": os.path.relpath(src, root), "checks": []}
+    dropped = set()
     for name, s in svcs.items():
+        prof = s.get("profiles") or []
+        if prof:
+            # Profile-gated services are opt-in by compose semantics; the
+            # default stack never starts them. Booting one anyway wastes
+            # an image load and can break the stack on its extras.
+            sys.stderr.write(
+                "note: service '%s' is profile-gated (%s); skipped\n"
+                % (name, ",".join(str(p) for p in prof)))
+            dropped.add(name)
+            continue
         e = {"name": name}
         if s.get("command"):
             e["command"] = s["command"]
@@ -704,6 +715,37 @@ def translate(compose_path, src, root):
             exp.append(pv)
         if exp:
             e["expose"] = exp
+        # Relative bind mounts: the guest has no clone on disk. The plan
+        # records them clone-relative; the stage copies the sources into
+        # /data/repo and the flatten mounts from there. Named volumes
+        # (bare names) and absolute host paths pass through untouched.
+        binds = []
+        for v in s.get("volumes") or []:
+            if isinstance(v, dict):
+                hp = str(v.get("source") or "")
+                cp = str(v.get("target") or "")
+                mode = "ro" if v.get("read_only") else ""
+            else:
+                parts = str(v).split(":")
+                if len(parts) < 2:
+                    continue
+                hp, cp = parts[0], parts[1]
+                mode = parts[2] if len(parts) > 2 else ""
+            if hp.startswith("./") or hp.startswith("../"):
+                rel = os.path.relpath(
+                    os.path.normpath(os.path.join(src, hp)), root)
+            elif hp and not hp.startswith(("/", "$")) and "/" in hp:
+                # A bare relative path ("docker/stripe/x.sh") with a
+                # slash is a host path, not a named volume.
+                rel = os.path.relpath(
+                    os.path.normpath(os.path.join(src, hp)), root)
+            else:
+                continue
+            if any(b["host"] == rel for b in binds):
+                continue
+            binds.append({"host": rel, "container": cp, "mode": mode})
+        if binds:
+            e["binds"] = binds
         env_raw = s.get("environment")
         env = {}
         if isinstance(env_raw, dict):
@@ -785,6 +827,12 @@ def translate(compose_path, src, root):
                 checks_entry = {"exec": {"cmd": cmd}}
                 if checks_entry not in plan["checks"]:
                     plan["checks"].append(checks_entry)
+    # Profile-gated services are gone: depends_on must not reference
+    # them (compose would refuse "service depends on undefined service").
+    if dropped:
+        for e in plan["services"]:
+            e["depends_on"] = [d for d in e["depends_on"]
+                               if d not in dropped]
     if len(plan["services"]) > 12:
         sys.stderr.write("error: more than 12 services not supported\n")
         sys.exit(1)
@@ -1085,6 +1133,12 @@ def flatten_cmd(manifest_path, compose_out, ports_out, refines_path=None):
         n = e["name"]
         tag = m["tags"].get(n) or e.get("image")
         entry = {"image": tag}
+        for b in e.get("binds") or []:
+            # The stage carries the repo files the compose file binds;
+            # the guest mounts them from the data drive.
+            entry.setdefault("volumes", []).append(
+                "/data/repo/%s:%s:%s" % (b["host"], b["container"],
+                                         b.get("mode") or "rw"))
         if cmd_over.get(n):
             entry["command"] = cmd_over[n]
         elif e.get("command"):

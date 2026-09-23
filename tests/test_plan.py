@@ -502,3 +502,92 @@ class SynthChecks(unittest.TestCase):
     def test_absolute_path_skipped(self):
         out = vmf_plan._synth_checks([], ["/usr/local/bin/app", "serve"])
         self.assertEqual(out, [])
+
+
+class BindsAndProfiles(Tmp):
+    """translate: relative bind mounts become clone-relative binds,
+
+    profile-gated services drop out (with depends_on cleaned), and the
+    flatten mounts them from /data/repo."""
+
+    def _write(self, name, text):
+        p = self.path(name)
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        open(p, "w").write(text)
+        return p
+
+    def test_binds_parsed_and_profiles_dropped(self):
+        compose = self._write("compose.yaml", """
+services:
+  stripe:
+    image: docker.io/stripe/stripe-cli:latest
+    entrypoint: ['/entrypoint.sh']
+    profiles: ['stripe']
+    volumes: ['./docker/stripe/entrypoint.sh:/entrypoint.sh:ro']
+  web:
+    image: docker.io/library/nginx
+    ports: ['8080:80']
+    volumes:
+      - ./docker/dev/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./apps:/srv/apps:ro
+      - shared:/mnt/shared
+      - /var/run/x:/var/run/x
+  db:
+    image: docker.io/library/mariadb:11.8
+    depends_on: [stripe]
+""")
+        self._write("docker/stripe/entrypoint.sh", "#!/bin/sh\n")
+        os.makedirs(self.path("apps"))
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        names = [s["name"] for s in plan["services"]]
+        # The profile-gated opt-in service is not part of the stack.
+        self.assertNotIn("stripe", names)
+        web = next(s for s in plan["services"] if s["name"] == "web")
+        self.assertEqual(web["binds"], [
+            {"host": "docker/dev/Caddyfile", "container": "/etc/caddy/Caddyfile",
+             "mode": "ro"},
+            {"host": "apps", "container": "/srv/apps", "mode": "ro"}])
+        # Named and absolute paths pass through untouched.
+        self.assertNotIn("binds", next(
+            s for s in plan["services"] if s["name"] == "db")) or None
+
+    def test_depends_on_dropped_profile_cleaned(self):
+        compose = self._write("compose.yaml", """
+services:
+  stripe:
+    image: docker.io/stripe/stripe-cli:latest
+    profiles: ['stripe']
+  web:
+    image: docker.io/library/nginx
+    depends_on: [stripe]
+""")
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        web = plan["services"][0]
+        self.assertEqual(web["depends_on"], [])
+        self.assertEqual(plan["primary"], "web")
+
+    def test_flatten_mounts_binds_from_repo(self):
+        compose = self._write("compose.yaml", """
+services:
+  web:
+    image: docker.io/library/nginx
+    ports: ['8080:80']
+    volumes: ['./docker/ep.sh:/ep.sh:ro']
+""")
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        manifest = {"services": plan["services"], "tags": {"web": "localhost/x:0"}}
+        out = self.path("flat.yaml")
+        ports = self.path("ports.txt")
+        with redirect_stdout(io.StringIO()):
+            vmf_plan.flatten_cmd(
+                self._manifest(manifest), out, ports)
+        doc = yaml.safe_load(open(out))
+        self.assertEqual(doc["services"]["web"]["volumes"],
+                         ["/data/repo/docker/ep.sh:/ep.sh:ro"])
+
+    def _manifest(self, plan):
+        p = self.path("manifest.json")
+        open(p, "w").write(json.dumps(plan))
+        return p
