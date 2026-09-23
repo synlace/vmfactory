@@ -297,9 +297,8 @@ def gapfill(root, plan_out):
         "multi-service dependencies; mode=docker when the repo is "
         "container-native (compose, Dockerfile-only, multi-service). For "
         "direct, install the app from the repo source (staged at "
-        "/workspace) unless the README pins an external package. The "
-        "base image is minimal: include prerequisite installs in the "
-        "install list (e.g. 'pip install uv' before 'uv sync'). List "
+        "/workspace) unless the README pins an external package. "
+        + base_image_note() + " List "
         "every guest TCP port the app will listen on (from the README "
         "evidence or the app's defaults); the host publishes each one "
         "1:1. If the app itself needs a docker daemon at runtime "
@@ -1394,6 +1393,39 @@ def profile_cmd(kind, path):
     sys.stderr.write("\n")
     print("%s %s" % (name, row.get("ram", "")))
     return 0
+
+
+def fat_base_ref():
+    # The fat base tag: VMF_BASE_IMAGE wins; else the ready marker that
+    # scripts/build-fat-base.sh writes after a successful host build.
+    ref = (os.environ.get("VMF_BASE_IMAGE") or "").strip()
+    if ref:
+        return ref
+    try:
+        with open(os.path.join(
+                os.path.expanduser("~"),
+                ".local", "share", "vmf", "fat-base.ready")) as f:
+            return f.read().split("\n")[0].strip()
+    except OSError:
+        return ""
+
+
+def base_image_note():
+    # Vocabulary for the gap-fill: with a fat base present, plans stop
+    # provisioning the common runtimes (the apt/npm window disappears).
+    fat = fat_base_ref()
+    if fat:
+        return (
+            'Prefer the fat base "%s" when the evidence matches its '
+            "runtime set (node 22, python3, pip, sqlite3, nginx, git, "
+            "curl, ca-certificates preinstalled): set base_image to it "
+            "and never install those packages. Otherwise use a stock "
+            "oci ref: the base image is minimal, so include "
+            "prerequisite installs in the install list "
+            "(e.g. 'pip install uv' before 'uv sync')." % fat)
+    return (
+        "The base image is minimal: include prerequisite installs in "
+        "the install list (e.g. 'pip install uv' before 'uv sync').")
 
 
 def _clamp_ports(raw):

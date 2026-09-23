@@ -144,6 +144,12 @@ cache-clean *args:
     #!/bin/sh
     exec bash scripts/vmf_clean.sh --yes --cache "$@"
 
+# Build the fat base once: node 22 + python3 + pip + sqlite3 + nginx,
+# frozen host-side. The gap-fill prefers it when the marker exists.
+fat-base *args:
+    #!/bin/sh
+    exec bash scripts/build-fat-base.sh "$@"
+
 # Docker-ps view of VM instances: id, ref, approach, status, target.
 # --all shows race candidates; --json for scripts.
 ps *args:

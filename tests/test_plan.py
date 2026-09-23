@@ -405,5 +405,54 @@ class ClampComposeFile(unittest.TestCase):
         self.assertEqual(vmf_plan._clamp_memory("junk", True), 2048)
 
 
+class FatBase(unittest.TestCase):
+    """fat_base_ref reads the env override, then the ready marker;
+    base_image_note switches the gap-fill vocabulary accordingly."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vmf-fat-")
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self._old = {k: os.environ.get(k)
+                     for k in ("HOME", "VMF_BASE_IMAGE")}
+        os.environ["HOME"] = self.tmp
+        os.environ.pop("VMF_BASE_IMAGE", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _marker(self, text):
+        d = os.path.join(self.tmp, ".local", "share", "vmf")
+        os.makedirs(d)
+        open(os.path.join(d, "fat-base.ready"), "w").write(text)
+
+    def test_env_override_wins(self):
+        self._marker("localhost/from-marker:1")
+        os.environ["VMF_BASE_IMAGE"] = "localhost/from-env:2"
+        self.assertEqual(vmf_plan.fat_base_ref(), "localhost/from-env:2")
+
+    def test_marker_read(self):
+        self._marker("localhost/vmf-fat-base:1\n2026-09-23T09:00:00")
+        self.assertEqual(vmf_plan.fat_base_ref(), "localhost/vmf-fat-base:1")
+
+    def test_absent_is_empty(self):
+        self.assertEqual(vmf_plan.fat_base_ref(), "")
+
+    def test_note_prefers_fat(self):
+        os.environ["VMF_BASE_IMAGE"] = "localhost/vmf-fat-base:1"
+        note = vmf_plan.base_image_note()
+        self.assertIn("localhost/vmf-fat-base:1", note)
+        self.assertIn("never install those packages", note)
+
+    def test_note_without_fat_is_minimal(self):
+        note = vmf_plan.base_image_note()
+        self.assertIn("minimal", note)
+        self.assertNotIn("never install", note)
+
+
 if __name__ == "__main__":
     unittest.main()
