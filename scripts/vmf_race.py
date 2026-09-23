@@ -18,6 +18,8 @@
 #      VMF_RACE_APPROACH / VMF_RACE_SKIP — name or number filters (csv)
 #      VMF_RACE_STAGGER (10) VMF_RACE_PARALLEL (2) VMF_RACE_DEADLINE (2700)
 #      VMF_RACE_CHILD=1    — candidate runners must not re-enter the race
+#      VMF_RACE_SKIP_CACHE=1 — ignore the winner cache for this run
+import hashlib
 import json
 import os
 import re
@@ -28,11 +30,84 @@ import tempfile
 import time
 
 RUNS = os.environ.get("VMF_RUNS") or os.path.expanduser("~/.vmf/runs")
+GEN = os.environ.get("VMF_GENERATED") \
+    or os.path.join(os.path.expanduser("~"), ".vmf", "generated")
 SCRIPTS = os.environ.get("VMF_SCRIPTS_DIR") or os.path.dirname(
     os.path.abspath(__file__))
 STAGGER = int(os.environ.get("VMF_RACE_STAGGER") or 10)
 PARALLEL = int(os.environ.get("VMF_RACE_PARALLEL") or 2)
 DEADLINE = int(os.environ.get("VMF_RACE_DEADLINE") or 2700)
+
+
+def tree_key(src):
+    # Stable per repo tree: git identity (remote + HEAD) when the source
+    # is a clone; else a bounded content hash (relpath + size). Any repo
+    # change moves the key, so a stale winner never replays.
+    r = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        u = subprocess.run(["git", "-C", src, "remote", "get-url", "origin"],
+                           capture_output=True, text=True)
+        seed = "git:%s:%s" % (u.stdout.strip(), r.stdout.strip())
+    else:
+        parts = []
+        for dp, dns, fns in os.walk(src):
+            dns[:] = [d for d in dns
+                      if d not in (".git", "node_modules", "__pycache__",
+                                   ".venv", "dist")]
+            for f in fns:
+                p = os.path.join(dp, f)
+                try:
+                    parts.append("%s/%d" % (os.path.relpath(p, src),
+                                            os.path.getsize(p)))
+                except OSError:
+                    pass
+        seed = "files:" + hashlib.sha256(
+            "\n".join(sorted(parts)).encode()).hexdigest()
+    return hashlib.sha256(seed.encode()).hexdigest()[:12]
+
+
+def winner_path(src):
+    return os.path.join(GEN, tree_key(src), "winner.json")
+
+
+def load_winner(src):
+    try:
+        with open(winner_path(src)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_winner(src, w, cand):
+    rec = {"approach": w["kind"], "image": w.get("image"),
+           "ports": w.get("ports") or [],
+           "compose_file": w.get("compose_file"),
+           "by": cand, "url": os.environ.get("VMF_COMPOSE_URL", ""),
+           "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    d = os.path.join(GEN, tree_key(src))
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, "winner.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(rec, f, indent=2)
+        os.replace(tmp, os.path.join(d, "winner.json"))
+    except OSError as e:
+        say("warning: winner cache write failed: %s" % e)
+        return
+    say("winner cache: %s" % os.path.join(d, "winner.json"))
+
+
+def cache_allowed():
+    # Plan-table mode and explicit filters want the full field, not a
+    # one-candidate replay; VMF_RACE_SKIP_CACHE bypasses for testing.
+    if os.environ.get("VMF_RACE_MODE") == "plan":
+        return False
+    if os.environ.get("VMF_RACE_SKIP_CACHE") == "1":
+        return False
+    if os.environ.get("VMF_RACE_APPROACH") or os.environ.get("VMF_RACE_SKIP"):
+        return False
+    return True
 
 
 def _plan_interp():
@@ -278,6 +353,30 @@ def main(argv):
         say("no approach allowed; nothing to race")
         return 1
 
+    # Winner cache: a solved repo replays its winning approach as a
+    # single candidate. A failed replay drops the entry and races the
+    # full field (self-healing).
+    if cache_allowed():
+        w = load_winner(src)
+        if w:
+            logdir = os.path.join(RUNS, "race-logs")
+            os.makedirs(logdir, exist_ok=True)
+            cand = "%s-c1" % base
+            keep = [{"i": 1, "kind": w["approach"], "cand": cand,
+                     "lp": os.path.join(logdir, "%s.log" % cand),
+                     "image": w.get("image"), "ports": w.get("ports") or [],
+                     "compose_file": w.get("compose_file"), "cached": True}]
+            say("winner cache: replay %s (%s)" % (
+                w["approach"], w.get("url") or "same tree"))
+            rc = race(keep, src, base)
+            if rc == 0:
+                return 0
+            try:
+                os.unlink(winner_path(src))
+            except OSError:
+                pass
+            say("winner cache: replay failed; racing the full field")
+
     # Satisfiability prune before any boot.
     keep = []
     logdir = os.path.join(RUNS, "race-logs")
@@ -297,6 +396,13 @@ def main(argv):
         say("all approaches pruned at plan time")
         return 1
 
+    return race(keep, src, base)
+
+
+
+def race(keep, src, base):
+    # The staggered boot loop, the crown, and the promotion. Keep
+    # entries carry i/kind/cand/lp/image/ports/compose_file.
     running = {}
     verdicts = {}
     winner = None
@@ -481,7 +587,11 @@ def main(argv):
                     break
     except OSError:
         pass
+    if status == "pass":
+        save_winner(src, w, winner)
     return 0 if status == "pass" else 1
+
+
 
 
 if __name__ == "__main__":
