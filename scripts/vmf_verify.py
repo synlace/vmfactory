@@ -535,7 +535,8 @@ def revise_cmd(args):
                "install": install,
                "command": cmd,
                "ports": vmf_plan._clamp_ports(j.get("ports")),
-               "checks": vmf_plan._clamp_checks(j.get("checks")),
+               "checks": vmf_plan._clamp_checks(j.get("checks")) or
+               vmf_plan._synth_checks(j.get("ports"), cmd),
                "images": vmf_plan._clamp_images(j.get("images")),
                "env": {str(k): str(v)
                        for k, v in (j.get("env") or {}).items()},

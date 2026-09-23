@@ -250,7 +250,8 @@ def validate_spec(raw, plan):
             "install": install,
             "command": cmd,
             "ports": vmf_plan._clamp_ports(raw.get("ports")),
-            "checks": vmf_plan._clamp_checks(raw.get("checks")),
+            "checks": vmf_plan._clamp_checks(raw.get("checks")) or
+            vmf_plan._synth_checks(raw.get("ports"), cmd),
             "images": vmf_plan._clamp_images(raw.get("images")),
             "env": {str(k): str(v)
                     for k, v in (raw.get("env") or {}).items()},
@@ -473,8 +474,9 @@ def agent_cmd(args):
                 print("agent:   → empty install cannot replay; re-asking")
                 continue
             runnable_ports = vmf_plan._clamp_ports(raw_plan.get("ports"))
-            runnable_checks = vmf_plan._clamp_checks(raw_plan.get("checks"))
-            if not runnable_ports and not runnable_checks:
+            runnable_checks = vmf_plan._clamp_checks(raw_plan.get("checks")) \
+                or vmf_plan._synth_checks(runnable_ports, cmd)
+            if not runnable_checks:
                 note = ("The plan declares no ports and no checks; the "
                         "acceptance has nothing to verify. Declare the "
                         "guest tcp port(s) the app serves and one probe "

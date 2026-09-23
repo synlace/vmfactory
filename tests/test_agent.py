@@ -118,6 +118,18 @@ class ValidateSpec(unittest.TestCase):
     def test_no_command_refused(self):
         self.assertIsNone(vmf_agent.validate_spec({"command": []}, {}))
 
+    def test_ports_without_checks_get_synth(self):
+        spec = vmf_agent.validate_spec(
+            {"command": ["srv"], "ports": [8021]}, {})
+        self.assertEqual(spec["checks"], [
+            {"tcp": {"port": 8021}},
+            {"probe": {"port": 8021, "path": "/", "expect_status_max": 399}}])
+
+    def test_command_only_gets_exec_synth(self):
+        spec = vmf_agent.validate_spec({"command": ["ghost", "version"]}, {})
+        self.assertEqual(spec["checks"],
+                         [{"exec": {"cmd": "sh -c 'command -v ghost'"}}])
+
 
 class AgentLoop(unittest.TestCase):
     def setUp(self):
