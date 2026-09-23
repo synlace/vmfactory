@@ -456,3 +456,24 @@ class FatBase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ClampImages(unittest.TestCase):
+    def test_short_name_normalized(self):
+        self.assertEqual(
+            vmf_plan._clamp_images(["ghost:5"]),
+            ["docker.io/library/ghost:5"])
+
+    def test_user_repo_qualified(self):
+        self.assertEqual(
+            vmf_plan._clamp_images(["bitnami/redis:7"]),
+            ["docker.io/bitnami/redis:7"])
+
+    def test_explicit_registry_kept(self):
+        self.assertEqual(
+            vmf_plan._clamp_images(["ghcr.io/app/web:1"]),
+            ["ghcr.io/app/web:1"])
+
+    def test_local_tags_kept(self):
+        self.assertEqual(
+            vmf_plan._clamp_images(["localhost/vmf-fat-base:1"]),
+            ["localhost/vmf-fat-base:1"])

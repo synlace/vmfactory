@@ -15,7 +15,9 @@
 set -euo pipefail
 
 TAG="${VMF_BASE_IMAGE:-localhost/vmf-fat-base:1}"
-FROM="${VMF_FAT_FROM:-node:22-bookworm-slim}"
+# Fully qualified: buildah refuses short names without a registries.conf
+# (the compose builder patches FROM refs the same way).
+FROM="${VMF_FAT_FROM:-docker.io/library/node:22-bookworm-slim}"
 READY="$HOME/.local/share/vmf/fat-base.ready"
 
 mkdir -p "$(dirname "$READY")"

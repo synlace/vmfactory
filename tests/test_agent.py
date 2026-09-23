@@ -141,7 +141,7 @@ class AgentLoop(unittest.TestCase):
                           "-h", "/srv"])
         self.assertEqual(spec["ports"], [8021])
         # the seed turn: the host supplied ghost:5 into the VM inputs
-        self.assertEqual(spec["images"], ["ghost:5"])
+        self.assertEqual(spec["images"], ["docker.io/library/ghost:5"])
         self.assertTrue(os.path.isfile(os.path.join(
             self.tmp, "images-seed-0.tar")))
         self.assertIn("agent: spec written", err.getvalue())

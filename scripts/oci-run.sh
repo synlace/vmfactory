@@ -831,13 +831,22 @@ if [[ "${VMF_WANT_DOCKER:-0}" == "1" ]]; then
     fi
   done < <(python3 -c "
 import json, os, sys
+
+def norm(ref):
+    if ref.startswith('localhost/') or ref.startswith('vmf-'):
+        return ref
+    if '/' in ref:
+        head = ref.split('/', 1)[0]
+        return ref if ('.' in head or ':' in head) else 'docker.io/' + ref
+    return 'docker.io/library/' + ref
+
 p = os.environ.get('VMF_VERIFY_PLAN') or ''
 try:
     plan = json.load(open(p))
 except Exception:
     sys.exit(0)
 for r in (plan.get('images') or [])[:4]:
-    print(r)" 2>/dev/null)
+    print(norm(r))" 2>/dev/null)
 fi
 # Host port pick: 1:1 when the unprivileged slirp bind can take it,
 # otherwise a stable high port (hash of name+want, probed upward). The

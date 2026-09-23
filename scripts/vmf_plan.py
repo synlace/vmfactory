@@ -1444,13 +1444,23 @@ def _clamp_ports(raw):
 def _clamp_images(raw):
     # Direct-plan image refs the HOST supplies (pull with the host's
     # trust, pin TOFU, archive for the guest's docker load). Junk is
-    # dropped, not guessed.
+    # dropped, not guessed. Short names are normalized the same way the
+    # boot path does (oci-run): the host builders refuse them (no
+    # containers-registries.conf — buildah rc=125).
     out = []
     for x in (raw or [])[:4]:
         s = str(x).strip()
-        if s and " " not in s and "\n" not in s and len(s) < 200 \
-                and s not in out:
-            out.append(s)
+        if s and " " not in s and "\n" not in s and len(s) < 200:
+            if s.startswith("localhost/") or s.startswith("vmf-"):
+                pass
+            elif "/" in s:
+                head = s.split("/", 1)[0]
+                if "." not in head and ":" not in head:
+                    s = "docker.io/" + s
+            else:
+                s = "docker.io/library/" + s
+            if s not in out:
+                out.append(s)
     return out
 
 

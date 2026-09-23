@@ -16,6 +16,15 @@ vmf_tool buildah
 BUILD_BIN=("${TOOL[@]}")
 
 ref="$1"
+# Normalize short names: the host builders refuse them without a
+# containers-registries.conf (buildah rc=125, "short-name ... did not
+# resolve"). Same rules as the boot path's docker normalization.
+case "$ref" in
+  localhost/*|vmf-*) ;;
+  */*) head="${ref%%/*}"
+       [[ "$head" == *.* || "$head" == *:* ]] || ref="docker.io/$ref" ;;
+  *) ref="docker.io/library/$ref" ;;
+esac
 out="$2"
 PINS="${VMF_OCI_PINS:-$HOME/.vmf/oci-pins}"
 mkdir -p "$(dirname "$PINS")" "$(dirname "$out")"
