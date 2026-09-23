@@ -67,10 +67,25 @@ cmd_init() {
   sudo ip link set "$BRIDGE" up 2>/dev/null || true
   local i base
   base=$(echo "${SUBNET%/*}" | cut -d. -f1-3)
+  # Owner by uid, never $USER: an init under sudo (or with $USER unset)
+  # must not mint root-owned taps — qemu is unprivileged and TUNSETIFF
+  # on a persistent tap only succeeds for the owner uid.
+  local uid
+  uid=$(id -u)
   for i in $(seq 0 $((POOL - 1))); do
     local t
     t=$(tap_name "$i")
-    sudo ip tuntap add dev "$t" mode tap user "$USER" 2>/dev/null || true
+    if ip -o link show "$t" >/dev/null 2>&1; then
+      # Existing tap with the wrong owner (a previous sudo init): replace.
+      if ! ip tuntap show | grep -q "^$t:.* user $uid$"; then
+        echo "net: replacing $t (owner $(ip tuntap show | grep "^$t:" \
+          | sed 's/.* user //;s/ .*//') != $uid)" >&2
+        sudo ip tuntap del dev "$t" mode tap 2>/dev/null || true
+      fi
+    fi
+    if ! ip -o link show "$t" >/dev/null 2>&1; then
+      sudo ip tuntap add dev "$t" mode tap user "$uid" 2>/dev/null || true
+    fi
     sudo ip link set "$t" master "$BRIDGE" 2>/dev/null || true
     sudo ip link set "$t" up 2>/dev/null || true
   done
@@ -86,7 +101,18 @@ cmd_init() {
       --dhcp-leasefile="$LEASES" --pid-file="$PIDF" \
       </dev/null >"$NET_DIR/dnsmasq.log" 2>&1 &
     echo $! > "$NET_DIR/launch.pid"
-    sleep 1
+    # Watchdog: a dnsmasq that dies at startup (bind conflict, bad
+    # config) must fail the init loudly, not leave "stopped" silently.
+    local tries=0
+    while ! dnsmasq_alive && (( tries < 10 )); do
+      sleep 0.5
+      tries=$((tries + 1))
+    done
+    if ! dnsmasq_alive; then
+      echo "net: dnsmasq did not come up; last log lines:" >&2
+      tail -5 "$NET_DIR/dnsmasq.log" >&2 2>/dev/null || true
+      return 1
+    fi
   fi
   cmd_status
 }
