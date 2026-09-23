@@ -797,7 +797,11 @@ if [[ -n "${VMF_INSTALL_CMD:-}" ]]; then
   printf '%s\n' "$VMF_INSTALL_CMD" > "$rundir/install.sh"
   chmod 755 "$rundir/install.sh"
 fi
-if [[ -n "${VMF_REPO_DIR:-}" && -d "${VMF_REPO_DIR:-}" ]]; then
+# Every boot carries the repo: the direct flow untars it to /workspace
+# for the install, and an in-guest compose build resolves its contexts
+# against it. Callers that only know the compose source get it here.
+[[ -n "${VMF_REPO_DIR:-}" ]] || VMF_REPO_DIR="${VMF_COMPOSE_SRC:-}"
+if [[ -n "$VMF_REPO_DIR" && -d "$VMF_REPO_DIR" ]]; then
   echo "staging repo ($VMF_REPO_DIR) into the inputs..."
   tar -czf "$rundir/repo.tar.gz" -C "$VMF_REPO_DIR" \
     --exclude=.git --exclude=node_modules --exclude=__pycache__ \
