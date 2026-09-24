@@ -2194,14 +2194,20 @@ def fanout_cmd(src, out):
             with open(os.path.join(gen, "plan-%s.json" % m), "w") as f:
                 json.dump({"method": m, "approach": ap,
                            "context7": c7_ids}, f, indent=2)
-        else:
-            blocked[m] = (why or err or "blocked")[:40]
+        elif isinstance(j, dict) \
+                and str(j.get("status") or "").lower() == "blocked":
+            # An honest model verdict: cached, so the method stays off
+            # until the bundle changes.
+            blocked[m] = (why or "blocked")[:40]
             with open(os.path.join(gen, "plan-%s.json.blocked" % m),
                       "w") as f:
                 json.dump({"why": blocked[m]}, f, indent=2)
-        if ap and "direct" in ap:
-            runnable[m] = ap
-        elif ap:
+        else:
+            # Transport or parse failure: NOT the model's verdict —
+            # never cached; the next run retries the method.
+            blocked[m] = ((why or err or "blocked")
+                          + " (transient; will retry)")[:40]
+        if ap:
             runnable[m] = ap
 
     # The pkg/source plan doubles as the gap-fill cache entry: the boot

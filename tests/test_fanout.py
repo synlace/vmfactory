@@ -171,6 +171,26 @@ class FanoutPlan(Tmp):
                 directs.append(d)
         self.assertEqual(len(directs), 1)
 
+    def test_transient_failure_retries_next_run(self):
+        # A parse failure is not the model's verdict: no .blocked file,
+        # and the next run replans the method.
+        src = self._repo_with_compose_variant()
+        old = vmf_llm.llm_call
+        vmf_llm.llm_call = lambda role, prompt, timeout=90, env=None: (
+            0, "this is not json at all", "")
+        try:
+            out = os.path.join(self.tmp, "fanout.json")
+            rc = vmf_plan.fanout_cmd(src, out)
+        finally:
+            vmf_llm.llm_call = old
+        self.assertEqual(rc, 1)
+        gen = os.path.join(self.tmp, "generated")
+        keydir = os.path.join(gen, os.listdir(gen)[0])
+        self.assertEqual([f for f in os.listdir(keydir)
+                          if f.endswith(".blocked")], [])
+        vmf_plan.fanout_cmd(src, out)
+        self.assertGreater(len(self.calls), 0)
+
     def _src(self, files):
         return self._repo(files)
 
