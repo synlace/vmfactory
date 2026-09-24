@@ -106,6 +106,17 @@ AWK=("${TOOL[@]}")
 # per-run inputs (the guest installs at boot, before the app).
 if [[ -f "$plan_tmp/direct.json" ]]; then
   base=$("${JQ[@]}" -r '.base_image' "$plan_tmp/direct.json")
+  # An empty base means the generic guest sandbox: the frozen fat base
+  # when it exists (node 22 + python3 + sqlite3 + nginx), else a plain
+  # alpine. The scout's routes leave base_image empty on purpose; the
+  # gap-fill's plans name their base explicitly.
+  if [[ -z "$base" ]]; then
+    if [[ -f "$HOME/.local/share/vmf/fat-base.ready" ]]; then
+      base="${VMF_FAT_BASE_TAG:-localhost/vmf-fat-base:1}"
+    else
+      base="docker.io/library/alpine:3"
+    fi
+  fi
   mapfile -t gcmd < <("${JQ[@]}" -r '.command[]' "$plan_tmp/direct.json")
   ginst=$("${JQ[@]}" -r '.install | join("\n")' "$plan_tmp/direct.json")
   genv_args=()

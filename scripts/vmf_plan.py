@@ -2607,12 +2607,14 @@ def _clamp_route(r, root):
     return route, None
 
 
-def _scout_scan(root, out, routes):
+def _scout_scan(root, out, raw, routes):
     # The bounded scout loop. Turn 1 emits the obvious routes (official
     # image, release asset, compose stack); later turns keep reading
     # for OTHER routes until the model says exhausted or the turn
-    # budget lapses. Every honest route lands in `out` the moment it
-    # clamps; the race drains the file while the scout still reads.
+    # budget lapses. `raw` collects the model's routes verbatim (the
+    # cache); `routes` collects the clamped ones — each lands in `out`
+    # the moment it clamps, so the race drains the file while the
+    # scout still reads.
     bundle = _gapfill_bundle(root)
     if not bundle.strip():
         return {"skipped": [], "llm": 0, "transient": False}
@@ -2706,6 +2708,7 @@ def _scout_scan(root, out, routes):
             break
         new = 0
         for r in (j.get("routes") or [])[:6]:
+            raw.append(r)
             route, why = _clamp_route(r, root)
             if not route:
                 sys.stderr.write("scout: dropped %-9s .. %s\n"
@@ -2758,22 +2761,43 @@ def _scout_cache_direct(root, routes):
 def scout_cmd(src, out):
     # Emissions stream to `out` as JSONL: one route object per line in
     # emission order, then a final {"summary": ...} line. The race
-    # drains the file while the scout still reads. Results cache under
-    # the winner key: a replay dumps the routes instantly, zero LLM.
+    # drains the file while the scout still reads. The cache stores
+    # the RAW model routes under the winner key (scout-v2): a replay
+    # costs zero LLM calls and RE-CLAMPS them under the CURRENT
+    # validators — registry facts, asset URLs — so a cached route
+    # never outlives its evidence.
     root = src
     gen = os.path.join(_gen_root(), winner_key(root))
     os.makedirs(gen, exist_ok=True)
-    cache = os.path.join(gen, "scout.json")
+    cache = os.path.join(gen, "scout-v2.json")
     if os.path.isfile(cache):
         try:
             c = json.load(open(cache))
-            routes = c.get("routes") or []
+            raw = c.get("routes") or []
             summary = c.get("summary") or {}
-            with open(out, "a") as f:
-                for r in routes:
-                    f.write(json.dumps(r) + "\n")
-                f.write(json.dumps({"summary": summary}) + "\n")
+            routes = []
+            emitted = set()
+            for r in raw:
+                route, why = _clamp_route(r, root)
+                if not route:
+                    sys.stderr.write("scout: dropped %-9s .. %s\n"
+                                     % (str(r.get("method") or "?")[:9],
+                                        (why or "")[:50]))
+                    continue
+                if route["method"] in emitted:
+                    continue
+                emitted.add(route["method"])
+                routes.append(route)
+                with open(out, "a") as f:
+                    f.write(json.dumps(route) + "\n")
+                sys.stderr.write("scout: %-9s .. %-9s %-40s %s/T%d\n"
+                                 % (route["method"], route["kind"],
+                                    _route_detail(route)[:40],
+                                    route["cost"],
+                                    COST_RANK[route["cost"]]))
             _scout_cache_direct(root, routes)
+            with open(out, "a") as f:
+                f.write(json.dumps({"summary": summary}) + "\n")
             sys.stderr.write("scout: cache replay %d route(s), %d skipped, "
                              "0 llm call(s)\n"
                              % (len(routes),
@@ -2781,15 +2805,16 @@ def scout_cmd(src, out):
             return 0 if routes else 1
         except (OSError, ValueError):
             pass
+    raw = []
     routes = []
-    summary = _scout_scan(root, out, routes)
+    summary = _scout_scan(root, out, raw, routes)
     if not summary.get("transient"):
         # An honest exhausted/blocked answer caches; a transport or
         # parse failure is NOT the model's verdict — never cached, the
         # next run scouts again.
         try:
             with open(cache, "w") as f:
-                json.dump({"routes": routes, "summary": summary}, f,
+                json.dump({"routes": raw, "summary": summary}, f,
                           indent=2)
         except OSError:
             pass

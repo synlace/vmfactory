@@ -297,6 +297,30 @@ class Clamps(Tmp):
                                                "direct-release.json"))]
         self.assertEqual(len(hits), 1)
 
+    def test_cache_replay_reclamps_with_current_validators(self):
+        # The cache stores RAW model routes; a replay re-clamps them
+        # under the CURRENT validators — a pre-fix cached route with a
+        # guessed port gets the registry's measured ExposedPorts.
+        src = self._repo({"README.md": "# app\nnpm start\n",
+                          "package.json": "{}"})
+        gen = os.path.join(self.tmp, "generated",
+                           vmf_plan.winner_key(src))
+        os.makedirs(gen, exist_ok=True)
+        raw = {"method": "prebuilt", "why": "official image",
+               "cost": "fast", "image": "ghcr.io/o/r:1", "ports": [8080]}
+        with open(os.path.join(gen, "scout-v2.json"), "w") as f:
+            json.dump({"routes": [raw], "summary": {"skipped": [], "llm": 1}},
+                      f)
+        self._stub_which({"skopeo": "/usr/bin/skopeo"})
+        self._stub_run(skopeo=json.dumps(
+            {"config": {"ExposedPorts": {"80/tcp": {}}}}))
+        out = os.path.join(self.tmp, "scout.jsonl")
+        rc = vmf_plan.scout_cmd(src, out)
+        self.assertEqual(rc, 0)
+        lines = [json.loads(l) for l in open(out) if l.strip()]
+        self.assertEqual(lines[0]["ports"], [80])
+        self.assertEqual(lines[-1]["summary"]["llm"], 1)
+
 
 class ScoutFeed(Tmp):
     def setUp(self):
