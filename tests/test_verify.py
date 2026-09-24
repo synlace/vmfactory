@@ -255,6 +255,49 @@ class RunFlow(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("ssh never came up", out.getvalue())
 
+    def test_ssh_unreachable_snapshots_console(self):
+        # rc=3 without a snapshot leaves the "ssh never came up" wall
+        # undiagnosable once teardown deletes the console log.
+        console = os.path.join(self.tmp, "console.log")
+        open(console, "w").write("boot\nkernel panic - not syncing\n")
+        os.environ["VMF_VERIFY_SSH"] = "exit 255"
+        try:
+            ev_path = os.path.join(self.tmp, "ev.json")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                a = self.args({"ports": [1337]}, deadline=2,
+                              evidence_out=ev_path)
+                a.console = console
+                rc = vmf_verify.run_cmd(a)
+        finally:
+            if self.old_ssh is None:
+                os.environ["VMF_VERIFY_SSH"] = "true"
+            else:
+                os.environ["VMF_VERIFY_SSH"] = self.old_ssh
+        self.assertEqual(rc, 3)
+        snap = os.path.join(self.tmp, "verify-console.txt")
+        self.assertTrue(os.path.isfile(snap))
+        self.assertIn("kernel panic", open(snap).read())
+
+    def test_fail_snapshots_console_tail(self):
+        s, port = free_port()
+        s.close()
+        console = os.path.join(self.tmp, "console.log")
+        lines = ["line-%d" % i for i in range(250)]
+        open(console, "w").write("\n".join(lines) + "\n")
+        ev_path = os.path.join(self.tmp, "ev.json")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            a = self.args({"ports": [port]}, deadline=3,
+                          evidence_out=ev_path)
+            a.console = console
+            rc = vmf_verify.run_cmd(a)
+        self.assertEqual(rc, 1)
+        snap = os.path.join(self.tmp, "verify-console.txt")
+        self.assertTrue(os.path.isfile(snap))
+        got = open(snap).read().splitlines()
+        self.assertEqual(got, lines[-200:])
+
     def test_oom_console_becomes_evidence(self):
         console = os.path.join(self.tmp, "console.log")
         open(console, "w").write(

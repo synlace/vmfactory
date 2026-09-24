@@ -308,6 +308,25 @@ def write_evidence(path, evidence):
     open(path, "w").write(json.dumps(evidence, indent=2))
 
 
+def snapshot_console(console, evidence_out, lines=200):
+    # The console log lives in the instance dir and teardown removes it
+    # with everything else; a failed verdict must stay diagnosable, so
+    # the tail lands beside the evidence (a dir that survives --rm).
+    if not console or not evidence_out:
+        return
+    try:
+        text = open(console, errors="replace").read()
+    except OSError:
+        return
+    d = os.path.dirname(os.path.abspath(evidence_out))
+    try:
+        os.makedirs(d, exist_ok=True)
+        tail = "\n".join(text.splitlines()[-lines:])
+        open(os.path.join(d, "verify-console.txt"), "w").write(tail + "\n")
+    except OSError:
+        pass
+
+
 def run_cmd(args):
     plan = json.load(open(args.plan))
     fwd = load_hostfwd(args.hostfwd) if args.hostfwd else {}
@@ -336,6 +355,9 @@ def run_cmd(args):
             print("verdict: %s" % ev["actual"])
             return 1
         print("verify: ssh never came up; no verdict possible")
+        # The console is the only diagnostic for this wall, and teardown
+        # is about to delete it: snapshot before the exit code.
+        snapshot_console(args.console, args.evidence_out)
         # Distinct exit code: rc=2 stays "plan declares nothing" (the
         # race reads the marker, but the marker text must not lie about
         # which wall was hit). The boot never produced a reachable VM.
@@ -396,6 +418,9 @@ def run_cmd(args):
                 except OSError:
                     pass
         return 0
+    # Failed checks: the console tail rides with the evidence so the
+    # failure stays diagnosable after teardown deletes the console.
+    snapshot_console(args.console, args.evidence_out)
     print("verdict: %d/%d checks pass%s; %d failed"
           % (passed, len(runnable), skipped_note,
              len(runnable) - passed))
