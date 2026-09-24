@@ -175,7 +175,37 @@ def conf_path(name):
     return os.path.join(RUNS, "%s.conf" % name)
 
 
+def fanout_approaches(src):
+    # The per-method fan-out plans on paper first (blocked methods
+    # never boot). Returns approaches or None when the fan-out is off
+    # or yields nothing runnable (the enumerate stays as fallback).
+    if os.environ.get("VMF_RACE_FANOUT", "1") == "0":
+        return None
+    out = os.path.join(RUNS, ".race-fanout.json")
+    try:
+        rc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "vmf_plan.py"),
+             "fanout", src, out], capture_output=True, text=True,
+            timeout=1200)
+    except (OSError, subprocess.SubprocessError) as e:
+        say("plan fan-out failed (%s); falling back to enumerate" % e)
+        return None
+    sys.stderr.write(rc.stderr or "")
+    if rc.returncode != 0:
+        say("plan fan-out: nothing runnable; falling back to enumerate")
+        return None
+    try:
+        with open(out) as f:
+            fa = json.load(f).get("approaches") or []
+    except (OSError, ValueError):
+        return None
+    return fa or None
+
+
 def load_approaches(src):
+    fa = fanout_approaches(src)
+    if fa:
+        return fa
     enum = os.path.join(RUNS, ".race-enum.json")
     rc = subprocess.run(
         [sys.executable, os.path.join(SCRIPTS, "vmf_plan.py"),

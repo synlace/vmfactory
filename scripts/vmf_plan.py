@@ -99,13 +99,14 @@ def _gapfill_bundle(root):
 
 
 def winner_key(root):
-    # The winner-cache key: the gap-fill bundle plus the root compose
-    # files (the bundle never reads compose; a compose edit is
-    # plan-relevant). Content-only — a HEAD move that changes nothing
-    # plan-relevant keeps the key, so a solved fast-moving repo replays.
+    # The winner-cache key: the gap-fill bundle plus every root-level
+    # compose file (the bundle never reads compose; a compose edit is
+    # plan-relevant, dev overlays included). Content-only — a HEAD move
+    # that changes nothing plan-relevant keeps the key, so a solved
+    # fast-moving repo replays.
     bundle = _gapfill_bundle(root)
     parts = [bundle]
-    for cand in sorted(NAMES):
+    for cand in sorted(set(NAMES) | set(_root_compose_variants(root))):
         p = os.path.join(root, cand)
         if os.path.isfile(p):
             try:
@@ -1225,7 +1226,8 @@ def usage():
         "  classify <input> [--as KIND]    what vmf thinks the input is\n"
         "  profile <kind> <path-or-ref>    evidence-based VM profile\n"
         "  intent <image> <phrase> <out>   plain-image --intent setup plan\n"
-        "  cache-key <src>                 winner-cache key (bundle+compose)\n")
+        "  cache-key <src>                 winner-cache key (bundle+compose)\n"
+        "  fanout <src> <out.json>         parallel per-method planners\n")
 
 
 KINDS = ("git-url", "dir", "image", "image-tar", "compose-file", "dockerfile",
@@ -1976,6 +1978,294 @@ def _clamp_compose_file(raw, src):
     return s
 
 
+FANOUT_METHODS = ("prebuilt", "compose", "build", "pkg", "source")
+FANOUT_KIND = {"prebuilt": "prebuilt_image", "compose": "compose",
+               "build": "dockerfile", "pkg": "install_script",
+               "source": "source_build"}
+FANOUT_COST = {"prebuilt": "fast", "compose": "medium", "build": "medium",
+               "pkg": "slow", "source": "slowest"}
+COST_RANK = {"fast": 0, "medium": 1, "slow": 2, "slowest": 3}
+FANOUT_GOAL = {
+    "prebuilt": "an official container image: name the exact ref; the "
+                "host pulls it and the guest runs it with docker",
+    "compose": "the repo's compose stack: name the compose file that is "
+               "COMPLETE (its services declare build or image); an "
+               "overlay variant that only patches a base file is "
+               "blocked, not runnable",
+    "build": "building the repo's ROOT Dockerfile host-side; nested "
+             "Dockerfiles are blocked",
+    "pkg": "installing runtime packages in the guest (apt/apk/npm/pip) "
+           "and exec'ing the app",
+    "source": "building from source in the guest (make/cargo/go build) "
+              "and exec'ing the built artifact",
+}
+
+
+def _gen_root():
+    return os.environ.get("VMF_GENERATED") or os.path.join(
+        os.path.expanduser("~"), ".vmf", "generated")
+
+
+def _root_compose_variants(root):
+    # Every root-level compose*.y*ml (dev overlays included) — the
+    # fan-out's compose evidence and part of the winner key.
+    out = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for n in names:
+        if n.startswith("compose") and n.endswith((".yaml", ".yml")) \
+                and n not in NAMES:
+            out.append(n)
+    return out[:6]
+
+
+def fanout_cmd(src, out):
+    # Parallel per-method planners over one shared evidence bundle.
+    # Every method answers plan-or-blocked on paper; the race boots
+    # only runnable plans. Per-method results cache under the bundle
+    # key: a rerun costs zero LLM calls.
+    root = src
+    gen = os.path.join(_gen_root(), winner_key(root))
+    has_compose = bool(_root_compose_variants(root)) or \
+        any(os.path.isfile(os.path.join(root, n)) for n in NAMES) or \
+        bool(scan(root))
+    has_dockerfile = os.path.isfile(os.path.join(root, "Dockerfile"))
+    has_make = any(os.path.isfile(os.path.join(root, f))
+                   for f in ("Makefile", "go.mod", "Cargo.toml"))
+    slots, skipped = [], {}
+    for m in FANOUT_METHODS:
+        if m == "compose" and not has_compose:
+            skipped[m] = "no compose file"
+        elif m == "build" and not has_dockerfile:
+            skipped[m] = "no root Dockerfile"
+        elif m == "source" and not has_make:
+            skipped[m] = "no build manifest"
+        else:
+            slots.append(m)
+
+    plans, blocked = {}, {}
+    for m in slots:
+        pj = os.path.join(gen, "plan-%s.json" % m)
+        bj = pj + ".blocked"
+        if os.path.isfile(pj):
+            try:
+                plans[m] = json.load(open(pj)).get("approach") or {}
+            except (OSError, ValueError):
+                pass
+        elif os.path.isfile(bj):
+            try:
+                blocked[m] = str(json.load(open(bj)).get("why") or "blocked")
+            except (OSError, ValueError):
+                blocked[m] = "blocked"
+    todo = [m for m in slots if m not in plans and m not in blocked]
+
+    grounded, c7_ids = "", []
+    if todo:
+        bundle = _gapfill_bundle(root)
+        variants = _root_compose_variants(root)
+        for n in variants:
+            try:
+                bundle += "\n=== compose variant: %s ===\n%s" % (
+                    n, open(os.path.join(root, n),
+                            errors="replace").read(6144))
+            except OSError:
+                pass
+        draft = (
+            "Draft a run plan for this repository inside a disposable "
+            "microVM. List up to 3 topics whose CURRENT facts matter "
+            "(package names, install steps, official images). Reply ONE "
+            'JSON object: {"lookup": ["<doc topic>"], '
+            '"why": "<max 8 words>"}\nEvidence:\n' + bundle[:16384])
+        rc, o, _e = vmf_llm.llm_call("gapfill", draft, timeout=180)
+        lookup = []
+        if rc == 0:
+            try:
+                lookup = [str(x) for x in
+                          (vmf_llm.parse_llm_json(o).get("lookup") or [])[:3]]
+            except Exception:
+                lookup = []
+        grounded, c7_ids = vmf_llm.ground(lookup)
+
+    def plan_method(m):
+        prompt = (
+            "Plan how to run this repository inside a disposable microVM "
+            "(the VM is the sandbox) using ONE install approach: %s.\n"
+            "Use ONLY the evidence below and the grounded facts; never "
+            "invent versions, ports, or env values. When this approach "
+            "cannot work for this repo, reply status=blocked with a "
+            "short why (max 8 words) instead of a guess.\n"
+            "Reply with ONE JSON object:\n" % FANOUT_GOAL[m])
+        if m == "prebuilt":
+            prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
+                       '"image": "<exact ref, e.g. docker.io/library/ghost:5>", '
+                       '"ports": [<guest tcp ports>], "notes": "<max 8 words>"}\n')
+        elif m == "compose":
+            prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
+                       '"compose_file": "<compose file in the repo ROOT>", '
+                       '"ports": [<guest tcp ports of the primary>], '
+                       '"notes": "<max 8 words>"}\n')
+        elif m == "build":
+            prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
+                       '"dockerfile": "Dockerfile", '
+                       '"ports": [<guest tcp ports>], "notes": "<max 8 words>"}\n')
+        else:
+            prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
+                       '"install": ["<shell commands run once>"], '
+                       '"command": ["<argv that starts the app>"], '
+                       '"ports": [<guest tcp ports>], '
+                       '"checks": [{"probe": {"port": N, "path": "/", '
+                       '"expect_status_max": 399}}], '
+                       '"images": ["<container image the app needs>"], '
+                       '"env": {"K": "V"}, "needs_docker": <bool>, '
+                       '"memory_mb": <1024-8192>, "notes": "<max 8 words>"}\n')
+        prompt += "Grounding:\n%s\nEvidence:\n%s" % (grounded, bundle[:32768]) \
+            if grounded else "Evidence:\n%s" % bundle[:32768]
+        rc, o, _e = vmf_llm.llm_call(
+            "gapfill", prompt,
+            timeout=int(os.environ.get("VMF_PLAN_DEADLINE") or 240))
+        if rc != 0:
+            return m, None, "model unavailable"
+        try:
+            return m, vmf_llm.parse_llm_json(o), None
+        except Exception:
+            return m, None, "unparseable output"
+
+    results = {}
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor
+        workers = max(1, int(os.environ.get("VMF_PLAN_PARALLEL")
+                             or len(todo)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for m, j, err in ex.map(plan_method, todo):
+                results[m] = (j, err)
+
+    def clamp_method(m, j):
+        if not isinstance(j, dict):
+            return None, "bad output shape"
+        if str(j.get("status") or "").lower() == "blocked":
+            return None, str(j.get("why") or "model blocked it")[:40]
+        ports = _clamp_ports(j.get("ports"))
+        notes = str(j.get("notes") or "")[:40]
+        if m == "prebuilt":
+            img = _clamp_images(j.get("images") or
+                                ([j.get("image")] if j.get("image") else []))
+            if not img:
+                return None, "no exact image ref"
+            return {"kind": FANOUT_KIND[m], "image": img[0],
+                    "ports": ports, "notes": notes}, None
+        if m == "compose":
+            cf = _clamp_compose_file(j.get("compose_file"), root)
+            if not cf:
+                return None, "no standalone compose file"
+            return {"kind": FANOUT_KIND[m], "compose_file": cf,
+                    "ports": ports, "notes": notes}, None
+        if m == "build":
+            df = str(j.get("dockerfile") or "Dockerfile")
+            if "/" in df or not os.path.isfile(os.path.join(root, df)):
+                return None, "no root Dockerfile"
+            return {"kind": FANOUT_KIND[m], "ports": ports,
+                    "notes": notes}, None
+        cmd = [str(x) for x in (j.get("command") or [])][:16]
+        if not cmd:
+            return None, "no command"
+        payload = {"base_image": "",
+                   "install": [str(x) for x in (j.get("install") or [])][:20],
+                   "command": cmd, "ports": ports,
+                   "checks": _clamp_checks(j.get("checks")),
+                   "images": _clamp_images(j.get("images")),
+                   "env": {str(k): str(v)
+                           for k, v in (j.get("env") or {}).items()},
+                   "needs_docker": bool(j.get("needs_docker")),
+                   "memory_mb": _clamp_memory(j.get("memory_mb"),
+                                              j.get("needs_docker")),
+                   "notes": str(j.get("notes") or "")[:120]}
+        return {"kind": FANOUT_KIND[m], "ports": ports,
+                "direct": payload, "notes": notes}, None
+
+    os.makedirs(gen, exist_ok=True)
+    runnable = {}
+    for m in todo:
+        j, err = results.get(m, (None, "no result"))
+        ap, why = clamp_method(m, j)
+        if ap:
+            plans[m] = ap
+            with open(os.path.join(gen, "plan-%s.json" % m), "w") as f:
+                json.dump({"method": m, "approach": ap,
+                           "context7": c7_ids}, f, indent=2)
+        else:
+            blocked[m] = (why or err or "blocked")[:40]
+            with open(os.path.join(gen, "plan-%s.json.blocked" % m),
+                      "w") as f:
+                json.dump({"why": blocked[m]}, f, indent=2)
+        if ap and "direct" in ap:
+            runnable[m] = ap
+        elif ap:
+            runnable[m] = ap
+
+    # The pkg/source plan doubles as the gap-fill cache entry: the boot
+    # (VMF_PLAN_SKIP_COMPOSE=1) then replays it with zero LLM calls.
+    # Only in a non-interactive context — the interactive gate stays.
+    if vmf_llm.accepted():
+        for m in ("pkg", "source"):
+            ap = runnable.get(m)
+            if not ap or "direct" not in ap:
+                continue
+            gdir = os.path.join(
+                _gen_root(),
+                hashlib.sha256((PROMPT_V + "\n" + _gapfill_bundle(root)
+                                ).encode()).hexdigest()[:12])
+            os.makedirs(gdir, exist_ok=True)
+            with open(os.path.join(gdir, "direct.json"), "w") as f:
+                json.dump(ap["direct"], f, indent=2)
+            with open(os.path.join(gdir, "direct.json.meta.json"),
+                      "w") as f:
+                json.dump({"model": os.environ.get("VMF_GAPFILL_MODEL")
+                           or os.environ.get("VMF_LLM_MODEL", ""),
+                           "notes": ap["notes"], "created": "",
+                           "context7": c7_ids, "refined": False,
+                           "turns": 0, "fanout": m}, f, indent=2)
+            sys.stderr.write("fanout: %s plan cached as the gap-fill "
+                             "direct plan\n" % m)
+            break
+
+    out_approaches = []
+    for m in FANOUT_METHODS:
+        if m in skipped:
+            sys.stderr.write("fanout: %-9s .. skipped   %s\n"
+                             % (m, skipped[m]))
+        elif m in blocked:
+            sys.stderr.write("fanout: %-9s .. blocked   %s\n"
+                             % (m, blocked[m]))
+        elif m in plans:
+            ap = plans[m]
+            detail = ap.get("notes") or ap.get("image") \
+                or ap.get("compose_file") or ""
+            sys.stderr.write("fanout: %-9s .. plan      %-40s %s/T%d\n"
+                             % (m, detail[:40], FANOUT_COST[m],
+                                COST_RANK[FANOUT_COST[m]]))
+            e = {"kind": ap["kind"],
+                 "evidence": ("fanout: %s %s" % (m, detail))[:120],
+                 "cost": FANOUT_COST[m], "method": m}
+            if ap.get("image"):
+                e["image"] = ap["image"]
+            if ap.get("compose_file"):
+                e["compose_file"] = ap["compose_file"]
+            if ap.get("ports"):
+                e["ports"] = ap["ports"]
+            out_approaches.append(e)
+    with open(out, "w") as f:
+        json.dump({"approaches": out_approaches}, f, indent=2)
+    n_blocked = len(blocked) + len(skipped)
+    sys.stderr.write("fanout: %d runnable, %d blocked/skipped, %d llm "
+                     "call(s)%s\n" % (len(out_approaches), n_blocked,
+                                      len(todo) + (1 if todo else 0),
+                                      (", grounded: %s"
+                                       % ", ".join(c7_ids[:2])) if c7_ids else ""))
+    return 0 if out_approaches else 1
+
+
 def enumerate_cmd(src, out, verbose=False):
     found, skipped, total = read_repo_files(src)
     print_reading_phase(found, skipped, src, verbose=verbose)
@@ -2093,6 +2383,8 @@ def main(argv):
             return 2
         print(winner_key(rest[0]))
         return 0
+    elif cmd == "fanout" and len(rest) >= 2:
+        return fanout_cmd(rest[0], rest[1])
     else:
         usage()
         return 2
