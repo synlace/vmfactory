@@ -251,6 +251,37 @@ class Promotion(Tmp):
         with open(os.path.join(self.runs, "web.verdict")) as f:
             self.assertEqual(f.read().strip(), "pass")
 
+    def test_symlink_repoint_verdict_found(self):
+        # The pre-boot symlink points at an OLD instance with no
+        # verdict, so verdict_path() freezes on the flat fallback; the
+        # boot repoints the symlink to a new id dir and the chain
+        # writes the verdict THERE. The wait loop re-resolves the path
+        # every poll and finds it (regression: 900s spin, then the
+        # retry killed the healthy instance).
+        olddir = os.path.join(self.runs, "cafe00000000")
+        newdir = os.path.join(self.runs, "cafe00011111")
+        os.makedirs(olddir)
+        os.makedirs(newdir)
+        os.environ["VMF_PROMOTION_TRIES"] = "1"
+        os.symlink("cafe00000000", os.path.join(self.runs, "web"))
+
+        def popen(cmd, env=None, stdout=None, stderr=None, **_kw):
+            # The boot repoints the symlink, then the chain writes the
+            # verdict inside the new id dir (as oci-run's chain does).
+            link = os.path.join(self.runs, "web")
+            tmp = link + ".tmp"
+            os.symlink("cafe00011111", tmp)
+            os.replace(tmp, link)
+            open(os.path.join(newdir, "verdict"), "w").write("pass")
+
+            class P:
+                def wait(self):
+                    return 0
+            return P()
+        vmf_race.subprocess.Popen = popen
+        rc = vmf_race.promote(self._w(), self.src, "web", "web-c1")
+        self.assertEqual(rc, 0)
+
     def test_board_rides_through_promotion(self):
         # The winning lane goes promoting -> pass (canonical target) on
         # the board; the plain final render is suppressed while the

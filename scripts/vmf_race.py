@@ -1157,16 +1157,24 @@ def promote(w, src, base, winner, board=None):
         # for the marker instead of defaulting to pass on a missing verdict.
         # The wait must outlast the winner's verify window (a compose
         # candidate verifies for 1200s; a 900s wait would call it dead).
+        # The path re-resolves EVERY poll: the boot repointed the name
+        # symlink to the new instance dir, so the verdict_path computed
+        # before the boot (flat fallback, old instance) is a different
+        # file than the one the chain writes.
         vw = 1200 if w["kind"] == "compose" else 420
         deadline = time.time() + max(
             int(os.environ.get("VMF_PROMOTION_WAIT") or "900"), vw + 120)
-        while not os.path.isfile(vpath) and time.time() < deadline:
+        while time.time() < deadline:
+            vpath = verdict_path(base)
+            if os.path.isfile(vpath):
+                break
             time.sleep(2)
             if board:
                 el = int(time.time() - t_promote)
                 board.stage("promote · booting canonical · %d:%02d"
                             % (el // 60, el % 60))
         status = "fail (no verdict)"
+        vpath = verdict_path(base)
         if os.path.isfile(vpath):
             with open(vpath) as f:
                 status = f.read().strip() or "pass"
