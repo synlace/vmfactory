@@ -162,10 +162,12 @@ services:
         self.assertEqual(plan["services"][2]["build"],
                          {"context": "./svc", "dockerfile": "Dockerfile"})
         # checks lift: published tcp ports get connect checks, the
-        # healthcheck rides through verbatim as an exec check
+        # healthcheck rides through as an exec check named to its
+        # container (the verify runner execs it inside that container)
         self.assertEqual(plan["checks"], [
             {"tcp": {"port": 8080}},
-            {"exec": {"cmd": "curl -f http://localhost/ || exit 1"}}])
+            {"exec": {"cmd": "curl -f http://localhost/ || exit 1",
+                      "container": "web"}}])
         schema = json.load(open(os.path.join(SCRIPTS, "..", "schemas", "plan.schema.json")))
         jsonschema.validate(plan, schema)
 
@@ -552,6 +554,31 @@ services:
         # Named and absolute paths pass through untouched.
         self.assertNotIn("binds", next(
             s for s in plan["services"] if s["name"] == "db")) or None
+
+    def test_healthcheck_lifts_container_check(self):
+        compose = self._write("compose.yaml", """
+services:
+  web:
+    image: docker.io/library/nginx
+    ports: ['8080:80']
+  db:
+    image: docker.io/library/mysql:8
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+""")
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        self.assertIn(
+            {"exec": {"cmd": "mysqladmin ping -h localhost",
+                      "container": "db"}},
+            plan["checks"])
+
+    def test_clamp_keeps_container(self):
+        out = vmf_plan._clamp_checks(
+            [{"exec": {"cmd": "redis-cli ping", "container": "redis"}},
+             {"exec": {"cmd": "  true  ", "container": "  "}}])
+        self.assertEqual(out, [
+            {"exec": {"cmd": "redis-cli ping", "container": "redis"}},
+            {"exec": {"cmd": "true"}}])
 
     def test_depends_on_dropped_profile_cleaned(self):
         compose = self._write("compose.yaml", """

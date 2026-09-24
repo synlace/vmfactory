@@ -155,6 +155,52 @@ class ExecChecks(unittest.TestCase):
         self.assertIn("boom", ev["actual"])
 
 
+class ContainerExec(unittest.TestCase):
+    # Lifted compose healthchecks exec INSIDE their container: the first
+    # transport call resolves the compose service, the second runs the
+    # healthcheck in it.
+    def test_container_resolved_and_executed(self):
+        os.environ["VMF_VERIFY_SSH"] = (
+            "case {cmd} in *'docker ps'*) echo abc123def ;; "
+            "*) echo ran ;; esac")
+        try:
+            ok, ev = vmf_verify.check_exec(
+                "mysqladmin ping", "vm",
+                {"exec": {"cmd": "mysqladmin ping", "container": "db"}})
+        finally:
+            del os.environ["VMF_VERIFY_SSH"]
+        self.assertTrue(ok)
+        self.assertIsNone(ev)
+
+    def test_missing_container_is_evidence(self):
+        # docker ps succeeds but prints no id: the stack is partial.
+        os.environ["VMF_VERIFY_SSH"] = "true"
+        try:
+            ok, ev = vmf_verify.check_exec(
+                "mysqladmin ping", "vm",
+                {"exec": {"cmd": "mysqladmin ping", "container": "db"}})
+        finally:
+            del os.environ["VMF_VERIFY_SSH"]
+        self.assertFalse(ok)
+        self.assertIn("no running container for service db", ev["actual"])
+        self.assertEqual(ev["expected"], "container up")
+
+    def test_plain_exec_ignores_absent_container(self):
+        os.environ["VMF_VERIFY_SSH"] = "echo ran {cmd}"
+        try:
+            ok, ev = vmf_verify.check_exec("true", "vm", None)
+        finally:
+            del os.environ["VMF_VERIFY_SSH"]
+        self.assertTrue(ok)
+
+    def test_spec_key_names_container(self):
+        self.assertEqual(
+            vmf_verify.spec_key("exec", None,
+                                {"exec": {"cmd": "mysqladmin ping -h x",
+                                          "container": "db"}}),
+            "exec:db:mysqladmin ping -h x")
+
+
 class DeriveChecks(unittest.TestCase):
     def test_tcp_from_ports_plus_model_checks(self):
         plan = {"ports": [1337, 1338],

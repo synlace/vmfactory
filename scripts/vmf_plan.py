@@ -848,10 +848,18 @@ def translate(compose_path, src, root):
         if isinstance(hc, dict):
             test = hc.get("test")
             if isinstance(test, list) and test:
-                cmd = " ".join(str(x) for x in test)
-                if str(test[0]) in ("CMD", "CMD-SHELL") and len(test) > 1:
+                if str(test[0]) == "CMD-SHELL" and len(test) > 1:
                     cmd = str(test[1])
-                checks_entry = {"exec": {"cmd": cmd}}
+                elif str(test[0]) == "CMD" and len(test) > 1:
+                    # CMD form is an argv list; the whole argv is the
+                    # command (str(test[1]) alone drops the args).
+                    cmd = " ".join(str(x) for x in test[1:])
+                else:
+                    cmd = " ".join(str(x) for x in test)
+                # The check rides the service name: the verify runner
+                # execs it INSIDE the service's container (compose label
+                # lookup), never in the guest shell.
+                checks_entry = {"exec": {"cmd": cmd, "container": e["name"]}}
                 if checks_entry not in plan["checks"]:
                     plan["checks"].append(checks_entry)
     # Profile-gated services are gone: depends_on must not reference
@@ -1618,6 +1626,9 @@ def _clamp_checks(raw):
             cmd = c["exec"].get("cmd")
             if isinstance(cmd, str) and cmd.strip():
                 e = {"exec": {"cmd": cmd.strip()[:300]}}
+                cont = c["exec"].get("container")
+                if isinstance(cont, str) and cont.strip():
+                    e["exec"]["container"] = cont.strip()[:100]
                 if e not in out:
                     out.append(e)
             else:

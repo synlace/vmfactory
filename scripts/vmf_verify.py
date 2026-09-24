@@ -189,7 +189,9 @@ def check_probe(spec, fwd, _name, host="127.0.0.1"):
     return ok, ev
 
 
-def check_exec(cmd, name, spec):
+def _run_exec(cmd, name):
+    # Run one guest command over the ssh transport and judge the exit
+    # code. Shared by the plain and the container exec paths.
     try:
         p = subprocess.run(exec_transport(name, cmd), capture_output=True,
                            text=True, timeout=EXEC_TIMEOUT)
@@ -202,6 +204,37 @@ def check_exec(cmd, name, spec):
     return False, {"check": "exec", "expected": "exit 0",
                    "actual": "exit %d: %s" % (rc,
                                               ((out + err).strip()[:200]))}
+
+
+def check_container_exec(cmd, name, container):
+    # A lifted compose healthcheck runs INSIDE its container, not in
+    # the guest shell (the guest has no mysql or redis-cli binaries;
+    # the container does). The service resolves by compose label; an
+    # empty result is honest evidence the stack is partial.
+    ps = ("docker ps -q --filter label=com.docker.compose.service=%s "
+          "--format '{{.ID}}'" % shlex.quote(container))
+    try:
+        p = subprocess.run(exec_transport(name, ps), capture_output=True,
+                           text=True, timeout=EXEC_TIMEOUT)
+        cid = (p.stdout or "").strip().splitlines()
+    except subprocess.TimeoutExpired:
+        return False, {"check": "exec", "expected": "container up",
+                       "actual": "timeout resolving %s" % container}
+    if not cid:
+        actual = "no running container for service %s" % container
+        if p.returncode != 0:
+            actual += ": %s" % ((p.stdout + p.stderr).strip()[:120])
+        return False, {"check": "exec", "expected": "container up",
+                       "actual": actual}
+    return _run_exec("docker exec %s sh -c %s"
+                     % (cid[0], shlex.quote(cmd)), name)
+
+
+def check_exec(cmd, name, spec=None):
+    container = ((spec or {}).get("exec") or {}).get("container")
+    if container:
+        return check_container_exec(cmd, name, container)
+    return _run_exec(cmd, name)
 
 
 # Specific app-failure markers: trustworthy anywhere in the console
@@ -450,7 +483,10 @@ def spec_key(kind, port, spec):
     if kind == "probe":
         p = spec["probe"]
         return "probe:%d%s" % (p["port"], p.get("path", "/"))
-    return "exec:%s" % spec["exec"]["cmd"][:40]
+    e = spec["exec"]
+    if e.get("container"):
+        return "exec:%s:%s" % (e["container"], e["cmd"][:30])
+    return "exec:%s" % e["cmd"][:40]
 
 
 def oom_floor_mb(evidence):
