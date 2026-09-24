@@ -13,6 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(HERE, "..", "scripts")
 sys.path.insert(0, SCRIPTS)
 
+import vmf_plan  # noqa: E402
 import vmf_race  # noqa: E402
 
 
@@ -23,47 +24,69 @@ class Tmp(unittest.TestCase):
         vmf_race.GEN = os.path.join(self.tmp, "generated")
 
 
-class TreeKey(Tmp):
-    def _dir(self, name=None, content="hello"):
-        d = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
-        if name:
-            n = os.path.join(d, name)
-            os.makedirs(n)
-            d = n
-        with open(os.path.join(d, "f.txt"), "w") as f:
+class WinnerKey(unittest.TestCase):
+    def _dir(self, content="hello", compose=None):
+        d = tempfile.mkdtemp(prefix="vmf-src-")
+        self.addCleanup(shutil.rmtree, d)
+        with open(os.path.join(d, "README.md"), "w") as f:
             f.write(content)
+        if compose is not None:
+            with open(os.path.join(d, "docker-compose.yml"), "w") as f:
+                f.write(compose)
         return d
 
     def test_same_content_same_key(self):
-        self.assertEqual(vmf_race.tree_key(self._dir()),
-                         vmf_race.tree_key(self._dir()))
+        self.assertEqual(vmf_plan.winner_key(self._dir()),
+                         vmf_plan.winner_key(self._dir()))
 
     def test_content_change_moves_key(self):
-        a = vmf_race.tree_key(self._dir())
-        b = vmf_race.tree_key(self._dir(content="changed"))
+        a = vmf_plan.winner_key(self._dir())
+        b = vmf_plan.winner_key(self._dir(content="changed"))
         self.assertNotEqual(a, b)
 
-    def test_git_head_and_url_drive_key(self):
+    def test_compose_change_moves_key(self):
+        a = vmf_plan.winner_key(self._dir(compose="services: {}"))
+        b = vmf_plan.winner_key(self._dir(compose="services: {app: {image: x}}"))
+        self.assertNotEqual(a, b)
+
+    def test_git_head_moves_keep_key(self):
+        # The fix vs the old tree_key: an upstream commit that changes
+        # nothing plan-relevant must NOT rotate the winner cache key.
         d = self._dir()
+
         def git(*args):
             subprocess.run(["git", "-C", d, *args],
                            capture_output=True, check=True)
         git("init", "-q")
         git("add", ".")
         git("-c", "user.email=t@t", "-c", "user.name=t",
-            "commit", "-qm", "init")
-        git("remote", "add", "origin", "https://example.com/app.git")
-        k1 = vmf_race.tree_key(d)
-        # Same tree state: the key is stable.
-        self.assertEqual(k1, vmf_race.tree_key(d))
-        # A new commit moves the key even though the files match
-        # relpath+size (git identity is the primary signal).
-        with open(os.path.join(d, "g.txt"), "w") as f:
-            f.write("x")
-        git("add", ".")
+            "commit", "-qm", "init", "--allow-empty")
+        k1 = vmf_plan.winner_key(d)
         git("-c", "user.email=t@t", "-c", "user.name=t",
-            "commit", "-qm", "second")
-        self.assertNotEqual(k1, vmf_race.tree_key(d))
+            "commit", "-qm", "hourly upstream move", "--allow-empty")
+        self.assertEqual(k1, vmf_plan.winner_key(d))
+
+    def test_subcommand_prints_key(self):
+        d = self._dir()
+        py = sys.executable
+        r = subprocess.run([py, os.path.join(SCRIPTS, "vmf_plan.py"),
+                            "cache-key", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertRegex(r.stdout.strip(), r"^[0-9a-f]{12}$")
+        self.assertEqual(r.stdout.strip(), vmf_plan.winner_key(d))
+
+
+class BundleKey(Tmp):
+    def test_wrapper_matches_plan_key(self):
+        src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        with open(os.path.join(src, "package.json"), "w") as f:
+            f.write('{"name": "app"}')
+        self.assertEqual(vmf_race.bundle_key(src),
+                         vmf_plan.winner_key(src))
+
+    def test_wrapper_none_on_failure(self):
+        self.assertIsNone(vmf_race.bundle_key(
+            os.path.join(self.tmp, "does-not-exist")))
 
 
 class WinnerRoundTrip(Tmp):
@@ -130,9 +153,9 @@ class Promotion(Tmp):
         self.boots = []
         self.old_stop, self.old_cmd = vmf_race.stop_vm, vmf_race.runner_cmd
         self.old_popen = vmf_race.subprocess.Popen
-        self.old_key = vmf_race.tree_key
+        self.old_key = vmf_race.bundle_key
         vmf_race.stop_vm = lambda name: self.stops.append(name)
-        vmf_race.tree_key = lambda src: "testkey"
+        vmf_race.bundle_key = lambda src: "testkey"
         self.old_tries = os.environ.pop("VMF_PROMOTION_TRIES", None)
         self.old_wait = os.environ.pop("VMF_PROMOTION_WAIT", None)
         os.environ["VMF_PROMOTION_WAIT"] = "1"
@@ -141,7 +164,7 @@ class Promotion(Tmp):
         vmf_race.stop_vm = self.old_stop
         vmf_race.runner_cmd = self.old_cmd
         vmf_race.subprocess.Popen = self.old_popen
-        vmf_race.tree_key = self.old_key
+        vmf_race.bundle_key = self.old_key
         if self.old_tries is None:
             os.environ.pop("VMF_PROMOTION_TRIES", None)
         else:
@@ -211,6 +234,60 @@ class Promotion(Tmp):
         # The marker read after boot is the new one, not the stale one.
         with open(os.path.join(self.runs, "web.verdict")) as f:
             self.assertEqual(f.read().strip(), "pass")
+
+
+class CacheBeforeEnumerate(Tmp):
+    # The rekey contract: a winner-cache hit replays without ever
+    # calling load_approaches (the enumerate LLM call).
+    def setUp(self):
+        super().setUp()
+        self.runs = tempfile.mkdtemp(prefix="vmf-runs-", dir=self.tmp)
+        self.src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        with open(os.path.join(self.src, "package.json"), "w") as f:
+            f.write('{"name": "app"}')
+        vmf_race.RUNS = self.runs
+        self.old = (vmf_race.bundle_key, vmf_race.load_winner,
+                    vmf_race.load_approaches, vmf_race.race)
+        self.raced = []
+        self.enum_calls = []
+        vmf_race.bundle_key = lambda src: "abc123def456"
+        vmf_race.load_winner = lambda src: {
+            "approach": "install_script", "image": None, "ports": [],
+            "compose_file": None}
+        vmf_race.load_approaches = self._enum
+        vmf_race.race = lambda keep, src, base: (
+            self.raced.append((keep, base)) or 0)
+        self.env_backup = {}
+        for k in ("VMF_RACE_MODE", "VMF_RACE_SKIP_CACHE",
+                  "VMF_RACE_APPROACH", "VMF_RACE_SKIP", "VMF_NAME"):
+            self.env_backup[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        (vmf_race.bundle_key, vmf_race.load_winner,
+         vmf_race.load_approaches, vmf_race.race) = self.old
+        for k, v in self.env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _enum(self, src):
+        self.enum_calls.append(src)
+        return []
+
+    def test_cache_hit_skips_enumerate(self):
+        rc = vmf_race.main(["race", self.src])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.enum_calls, [])
+        self.assertEqual(len(self.raced), 1)
+        self.assertTrue(self.raced[0][0][0].get("cached"))
+
+    def test_cache_miss_runs_enumerate(self):
+        vmf_race.load_winner = lambda src: None
+        rc = vmf_race.main(["race", self.src])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.enum_calls, [self.src])
+        self.assertEqual(self.raced, [])
 
 
 if __name__ == "__main__":

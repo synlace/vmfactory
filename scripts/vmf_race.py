@@ -19,7 +19,6 @@
 #      VMF_RACE_STAGGER (10) VMF_RACE_PARALLEL (2) VMF_RACE_DEADLINE (2700)
 #      VMF_RACE_CHILD=1    — candidate runners must not re-enter the race
 #      VMF_RACE_SKIP_CACHE=1 — ignore the winner cache for this run
-import hashlib
 import json
 import os
 import re
@@ -39,53 +38,53 @@ PARALLEL = int(os.environ.get("VMF_RACE_PARALLEL") or 2)
 DEADLINE = int(os.environ.get("VMF_RACE_DEADLINE") or 2700)
 
 
-def tree_key(src):
-    # Stable per repo tree: git identity (remote + HEAD) when the source
-    # is a clone; else a bounded content hash (relpath + size). Any repo
-    # change moves the key, so a stale winner never replays.
-    r = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"],
-                       capture_output=True, text=True)
-    if r.returncode == 0:
-        u = subprocess.run(["git", "-C", src, "remote", "get-url", "origin"],
-                           capture_output=True, text=True)
-        seed = "git:%s:%s" % (u.stdout.strip(), r.stdout.strip())
-    else:
-        parts = []
-        for dp, dns, fns in os.walk(src):
-            dns[:] = [d for d in dns
-                      if d not in (".git", "node_modules", "__pycache__",
-                                   ".venv", "dist")]
-            for f in fns:
-                p = os.path.join(dp, f)
-                try:
-                    parts.append("%s/%d" % (os.path.relpath(p, src),
-                                            os.path.getsize(p)))
-                except OSError:
-                    pass
-        seed = "files:" + hashlib.sha256(
-            "\n".join(sorted(parts)).encode()).hexdigest()
-    return hashlib.sha256(seed.encode()).hexdigest()[:12]
+def bundle_key(src):
+    # The winner cache keys on the plan-relevant content bundle
+    # (vmf_plan.py cache-key: gap-fill evidence + root compose files +
+    # prompt version), not on git HEAD. Fast-moving repos change HEAD
+    # hourly; a solved tree must keep replaying its winner.
+    try:
+        r = subprocess.run(PLAN_PY + [
+            os.path.join(SCRIPTS, "vmf_plan.py"), "cache-key", src],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    k = (r.stdout or "").strip()
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{12}", k):
+        say("warning: cache-key failed (%s); winner cache disabled"
+            % (r.stderr or "").strip()[-120:])
+        return None
+    return k
 
 
 def winner_path(src):
-    return os.path.join(GEN, tree_key(src), "winner.json")
+    k = bundle_key(src)
+    if not k:
+        return None
+    return os.path.join(GEN, k, "winner.json")
 
 
 def load_winner(src):
+    p = winner_path(src)
+    if not p:
+        return None
     try:
-        with open(winner_path(src)) as f:
+        with open(p) as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
 
 
 def save_winner(src, w, cand):
+    k = bundle_key(src)
+    if not k:
+        return
     rec = {"approach": w["kind"], "image": w.get("image"),
            "ports": w.get("ports") or [],
            "compose_file": w.get("compose_file"),
            "by": cand, "url": os.environ.get("VMF_COMPOSE_URL", ""),
            "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
-    d = os.path.join(GEN, tree_key(src))
+    d = os.path.join(GEN, k)
     try:
         os.makedirs(d, exist_ok=True)
         tmp = os.path.join(d, "winner.json.tmp")
@@ -330,10 +329,10 @@ def main(argv):
     base = os.environ.get("VMF_NAME") or os.path.basename(src)
     plan_only = os.environ.get("VMF_RACE_MODE") == "plan"
 
-    approaches = apply_filters(load_approaches(src))
     if plan_only:
         # Satisfiability without booting: pruned candidates print and
         # any survivor means the run would race.
+        approaches = apply_filters(load_approaches(src))
         logdir = os.path.join(RUNS, "race-logs")
         os.makedirs(logdir, exist_ok=True)
         alive = 0
@@ -349,13 +348,10 @@ def main(argv):
         say("plan only: %d/%d approach(es) satisfiable; nothing booted"
             % (alive, len(approaches)))
         return 0 if alive else 1
-    if not approaches:
-        say("no approach allowed; nothing to race")
-        return 1
 
-    # Winner cache: a solved repo replays its winning approach as a
-    # single candidate. A failed replay drops the entry and races the
-    # full field (self-healing).
+    # Winner cache FIRST: a hit replays as one candidate and costs no
+    # enumerate call, no gap-fill, no LLM. The check must precede
+    # load_approaches or every replay still pays the enumeration.
     if cache_allowed():
         w = load_winner(src)
         if w:
@@ -376,6 +372,11 @@ def main(argv):
             except OSError:
                 pass
             say("winner cache: replay failed; racing the full field")
+
+    approaches = apply_filters(load_approaches(src))
+    if not approaches:
+        say("no approach allowed; nothing to race")
+        return 1
 
     # Satisfiability prune before any boot.
     keep = []

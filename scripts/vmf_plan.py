@@ -45,6 +45,77 @@ import vmf_llm
 
 NAMES = ("compose.yaml", "docker-compose.yaml", "compose.yml", "docker-compose.yml")
 SKIP_DIRS = {".git", "node_modules", ".github", "__pycache__", ".idea", ".vscode"}
+# Prompt version: part of the cache keys, so improved prompts
+# invalidate stale cached plans. v7 adds the memory_mb field to
+# direct plans (an under-sized VM OOM-kills the app: dockerd,
+# containerd and the app share one 1024 MB VM otherwise).
+PROMPT_V = "7"
+
+
+def _gapfill_bundle(root):
+    # Deterministic, content-only evidence for the gap-fill prompt
+    # (readme, Dockerfiles, manifests, systemd units) — the same bytes
+    # the gap-fill cache key hashes. No LLM, no git, no compose read.
+    inputs = []
+    for rn in ("README.md", "README.rst", "README.txt"):
+        if os.path.isfile(os.path.join(root, rn)):
+            inputs.append(("readme", rn,
+                           open(os.path.join(root, rn), errors="replace").read(8192)))
+            break
+    dfs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if rel != "." and rel.count(os.sep) >= 2:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            if f.startswith("Dockerfile") and len(dfs) < 3:
+                dfs.append(os.path.join(dirpath, f))
+    for p in dfs:
+        rel = os.path.relpath(p, root)
+        inputs.append(("dockerfile", rel, open(p, errors="replace").read(4096)))
+    for f, cap in (("manifest.yaml", 4096), ("pyproject.toml", 4096),
+                   ("requirements.txt", 2048), ("package.json", 4096),
+                   ("go.mod", 2048), ("Cargo.toml", 2048), ("Gemfile", 2048),
+                   ("Makefile", 4096)):
+        p = os.path.join(root, f)
+        if os.path.isfile(p):
+            inputs.append(("manifest", f, open(p, errors="replace").read(4096)))
+    units = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if rel != "." and rel.count(os.sep) >= 2:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            if f.endswith(".service") and len(units) < 3:
+                units.append(os.path.join(dirpath, f))
+    for p in units:
+        rel = os.path.relpath(p, root)
+        inputs.append(("systemd-unit", rel, open(p, errors="replace").read(4096)))
+    return "\n".join("=== %s: %s ===\n%s" % (k, rp, t) for k, rp, t in inputs)
+
+
+def winner_key(root):
+    # The winner-cache key: the gap-fill bundle plus the root compose
+    # files (the bundle never reads compose; a compose edit is
+    # plan-relevant). Content-only — a HEAD move that changes nothing
+    # plan-relevant keeps the key, so a solved fast-moving repo replays.
+    bundle = _gapfill_bundle(root)
+    parts = [bundle]
+    for cand in sorted(NAMES):
+        p = os.path.join(root, cand)
+        if os.path.isfile(p):
+            try:
+                parts.append("=== compose: %s ===\n%s"
+                             % (cand, open(p, errors="replace").read(8192)))
+            except OSError:
+                pass
+    return hashlib.sha256(
+        ("winner-v1\n%s\n" % PROMPT_V + "\n".join(parts)).encode()
+    ).hexdigest()[:12]
 
 
 def parse_llm_json(raw):
@@ -156,59 +227,15 @@ def resolve_intent(root, hits, phrase):
 
 def gapfill(root, plan_out):
     # Compose-less repo: collect deterministic evidence (readme,
-    # Dockerfiles, manifests, systemd units, package files), ask the
-    # gap-fill model for a strict-JSON plan, render compose.yaml HERE
-    # (the model never writes YAML), and gate behind an approval.
-    # Approved proposals cache by input hash; later runs replay.
-    inputs = []
-    for rn in ("README.md", "README.rst", "README.txt"):
-        if os.path.isfile(os.path.join(root, rn)):
-            inputs.append(("readme", rn,
-                           open(os.path.join(root, rn), errors="replace").read(8192)))
-            break
-    dfs = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel = os.path.relpath(dirpath, root)
-        if rel != "." and rel.count(os.sep) >= 2:
-            dirnames[:] = []
-            continue
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for f in filenames:
-            if f.startswith("Dockerfile") and len(dfs) < 3:
-                dfs.append(os.path.join(dirpath, f))
-    for p in dfs:
-        rel = os.path.relpath(p, root)
-        inputs.append(("dockerfile", rel, open(p, errors="replace").read(4096)))
-    for f, cap in (("manifest.yaml", 4096), ("pyproject.toml", 4096),
-                   ("requirements.txt", 2048), ("package.json", 4096),
-                   ("go.mod", 2048), ("Cargo.toml", 2048), ("Gemfile", 2048),
-                   ("Makefile", 4096)):
-        p = os.path.join(root, f)
-        if os.path.isfile(p):
-            inputs.append(("manifest", f, open(p, errors="replace").read(4096)))
-    units = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel = os.path.relpath(dirpath, root)
-        if rel != "." and rel.count(os.sep) >= 2:
-            dirnames[:] = []
-            continue
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for f in filenames:
-            if f.endswith(".service") and len(units) < 3:
-                units.append(os.path.join(dirpath, f))
-    for p in units:
-        rel = os.path.relpath(p, root)
-        inputs.append(("systemd-unit", rel, open(p, errors="replace").read(4096)))
-    bundle = "\n".join("=== %s: %s ===\n%s" % (k, rp, t) for k, rp, t in inputs)
+    # Dockerfiles, manifests, systemd units), ask the gap-fill model for
+    # a strict-JSON plan, render compose.yaml HERE (the model never
+    # writes YAML), and gate behind an approval. Approved proposals
+    # cache by input hash; later runs replay.
+    bundle = _gapfill_bundle(root)
     if not bundle.strip():
         sys.stderr.write("error: no compose file and nothing to infer from "
                          "(no README/Dockerfile/manifests)\n")
         sys.exit(1)
-    # Prompt version: part of the cache key, so improved prompts
-    # invalidate stale cached plans. v7 adds the memory_mb field to
-    # direct plans (an under-sized VM OOM-kills the app: dockerd,
-    # containerd and the app share one 1024 MB VM otherwise).
-    PROMPT_V = "7"
     key = hashlib.sha256((PROMPT_V + "\n" + bundle).encode()).hexdigest()[:12]
     gen = os.path.join(os.path.expanduser("~"), ".vmf", "generated", key)
     cache = os.path.join(gen, "compose.yaml")
@@ -1189,7 +1216,8 @@ def usage():
         "  ports <plan.json> [refines.json]\n"
         "  classify <input> [--as KIND]    what vmf thinks the input is\n"
         "  profile <kind> <path-or-ref>    evidence-based VM profile\n"
-        "  intent <image> <phrase> <out>   plain-image --intent setup plan\n")
+        "  intent <image> <phrase> <out>   plain-image --intent setup plan\n"
+        "  cache-key <src>                 winner-cache key (bundle+compose)\n")
 
 
 KINDS = ("git-url", "dir", "image", "image-tar", "compose-file", "dockerfile",
@@ -2046,6 +2074,14 @@ def main(argv):
         return profile_cmd(rest[0], rest[1])
     elif cmd == "intent" and len(rest) >= 3:
         return intent_cmd(rest[0], rest[1], rest[2])
+    elif cmd == "cache-key" and len(rest) >= 1:
+        # No yaml import, no LLM: the race reads this before the
+        # enumerate and must not pay the interpreter's yaml dance.
+        if not os.path.isdir(rest[0]):
+            sys.stderr.write("error: no such directory: %s\n" % rest[0])
+            return 2
+        print(winner_key(rest[0]))
+        return 0
     else:
         usage()
         return 2
