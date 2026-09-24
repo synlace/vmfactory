@@ -1047,6 +1047,9 @@ sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
   # fresh rundir, and the old teardown race disappears. The child
   # replays the FIRST pass's argv (decoded from VMF_ORIG_ARGS_B64), so
   # the revised plan is re-planned from the user's original input.
+  # --name "$name" rides last: in a race the outer argv carries the
+  # canonical (held) name, and the revise must boot the candidate or
+  # the race loses its verdict.
   child_args=()
   if [[ -n "${VMF_ORIG_ARGS_B64:-}" ]]; then
     while IFS= read -r -d '' a; do
@@ -1054,7 +1057,7 @@ sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
     done < <(printf '%s' "$VMF_ORIG_ARGS_B64" | base64 -d)
   fi
   VMF_VERIFY_TURN=$((turn + 1)) VMF_RUN_YES=1 bash "$0" \
-    ${child_args[@]+"${child_args[@]}"}
+    ${child_args[@]+"${child_args[@]}"} --name "$name"
   exit $?
 }
 
