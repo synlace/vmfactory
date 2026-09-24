@@ -54,6 +54,20 @@ def _clock(t0):
     return "t+%d:%02d" % (el // 60, el % 60)
 
 
+class _SelfRender:
+    # rich's Live re-renders the last object passed to update(); a
+    # static Group would freeze the braille frame and the clock. This
+    # wrapper re-renders the board on every auto-refresh tick.
+    def __init__(self, board):
+        self.board = board
+
+    def __rich_console__(self, console, options):
+        try:
+            yield self.board._render()
+        except Exception:
+            yield Text("")
+
+
 class Board:
     # Live lane board. `file` is injectable for tests; the default
     # stderr matches every other writer (say, status events).
@@ -77,6 +91,7 @@ class Board:
             self._live = Live(console=console, auto_refresh=True,
                               refresh_per_second=6, transient=False)
             self._live.start()
+            self._live.update(_SelfRender(self))
         except Exception:
             self._live = None
             self.dead = True
@@ -125,7 +140,7 @@ class Board:
     def _push(self):
         if self.ok:
             try:
-                self._live.update(self._render(), refresh=True)
+                self._live.update(_SelfRender(self), refresh=True)
             except Exception:
                 self.dead = True
                 try:

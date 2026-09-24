@@ -94,6 +94,7 @@ def save_winner(src, w, cand):
            "ports": w.get("ports") or [],
            "compose_file": w.get("compose_file"),
            "method": w.get("method") or "",
+           "cost": w.get("cost") or "",
            "by": cand, "url": os.environ.get("VMF_COMPOSE_URL", ""),
            "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     d = os.path.join(GEN, k)
@@ -560,7 +561,11 @@ def main(argv):
                      "lp": os.path.join(logdir, "%s.log" % cand),
                      "image": w.get("image"), "ports": w.get("ports") or [],
                      "compose_file": w.get("compose_file"),
-                     "method": w.get("method") or "", "cached": True}]
+                     "method": w.get("method") or "",
+                     "cost": w.get("cost") or "",
+                     "detail": w.get("image") or w.get("compose_file")
+                     or "cached winner",
+                     "cite": "", "cached": True}]
             say("winner cache: replay %s (%s)" % (
                 w["approach"], w.get("url") or "same tree"))
             vmf_status.event(base, "replay", w["approach"])
@@ -568,8 +573,8 @@ def main(argv):
             if board:
                 board.stage("replay " + (w.get("method") or w["approach"]))
                 board.lane(w.get("method") or w["approach"], "plan",
-                           w.get("image") or w.get("compose_file") or "cached",
-                           "", "replay")
+                           w.get("image") or w.get("compose_file")
+                           or "cached winner", "", "replay")
             rc = race(keep, src, base, board=board)
             _board_close()
             if rc == 0:
@@ -677,7 +682,7 @@ def race_scout(feed, first, src, base):
         for k in keep:
             board.lane(k["method"] or k["kind"], "plan",
                        k["detail"], k["cite"],
-                       "%s/T%d" % (k["cost"], band_of(k)))
+                       _band_label(k, band_of(k)))
     if not tranche_mode():
         say("scout: %d route(s) in flight; the scout keeps reading"
             % len(keep))
@@ -702,6 +707,13 @@ def band_of(k):
     if c in COST_BAND:
         return COST_BAND[c]
     return KIND_BAND.get(k.get("kind"), 3)
+
+
+def _band_label(k, band):
+    # Lane label: cost/T-band when the cost word exists, else just the
+    # band. Legacy and replayed entries may have no cost word.
+    c = (k.get("cost") or "").strip().lower()
+    return "%s/T%d" % (c, band) if c in COST_BAND else "T%d" % band
 
 
 def tranche_mode():
@@ -785,7 +797,7 @@ def race(keep, src, base, feed=None, board=None):
                 if board:
                     board.lane(k["method"] or k["kind"], "plan",
                                k["detail"], k["cite"],
-                               "%s/T%d" % (k["cost"], band_of(k)))
+                               _band_label(k, band_of(k)))
             if not feed.alive() and not feed.summary_taken:
                 feed.summary_taken = True
                 s = feed.summary or {}
@@ -820,7 +832,7 @@ def race(keep, src, base, feed=None, board=None):
             if board:
                 board.lane(k["method"] or k["kind"], "booting",
                            k.get("detail"), k.get("cite"),
-                           "%s/T%d" % (k.get("cost"), band))
+                           _band_label(k, band))
                 board.stage(("scout + boot " if feed and feed.alive()
                              else "boot ") + (k["method"] or k["kind"]))
             last_event = now
