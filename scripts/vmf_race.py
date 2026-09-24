@@ -325,8 +325,9 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
     # verify deadline (built for fast images) expires mid-install.
     # Compose dev stacks boot even slower: ghost's first-run
     # migrations finished ~2 min AFTER a 660s window expired
-    # (measured 13:26-13:39). 900s covers image loads + migrations.
-    env.setdefault("VMF_VERIFY_SECS", "900" if kind == "compose" else "420")
+    # (measured 13:26-13:39). 1200s covers image loads + migrations
+    # with margin; the winner cache makes solved trees cheap again.
+    env.setdefault("VMF_VERIFY_SECS", "1200" if kind == "compose" else "420")
     # The detached runner chains python subprocesses; without this the
     # verify's progress lines sit in the block buffer and a healthy
     # run looks wedged in the logs.
@@ -743,7 +744,11 @@ def promote(w, src, base, winner):
         # The detached runner returns before its verify chain finishes: the
         # verdict marker (and the rendered target) land minutes later. Wait
         # for the marker instead of defaulting to pass on a missing verdict.
-        deadline = time.time() + int(os.environ.get("VMF_PROMOTION_WAIT", "900"))
+        # The wait must outlast the winner's verify window (a compose
+        # candidate verifies for 1200s; a 900s wait would call it dead).
+        vw = 1200 if w["kind"] == "compose" else 420
+        deadline = time.time() + max(
+            int(os.environ.get("VMF_PROMOTION_WAIT") or "900"), vw + 120)
         while not os.path.isfile(vpath) and time.time() < deadline:
             time.sleep(2)
         status = "fail (no verdict)"

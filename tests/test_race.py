@@ -15,6 +15,7 @@ sys.path.insert(0, SCRIPTS)
 
 import vmf_plan  # noqa: E402
 import vmf_race  # noqa: E402
+import vmf_status  # noqa: E402
 
 
 class Tmp(unittest.TestCase):
@@ -22,6 +23,11 @@ class Tmp(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="vmf-race-")
         self.addCleanup(shutil.rmtree, self.tmp)
         vmf_race.GEN = os.path.join(self.tmp, "generated")
+        # main()/race() emit one-line status events; keep them out of
+        # the real ~/.vmf/runs/.status.
+        self.old_status_runs = vmf_status.RUNS
+        vmf_status.RUNS = self.tmp
+        self.addCleanup(setattr, vmf_status, "RUNS", self.old_status_runs)
 
 
 class WinnerKey(unittest.TestCase):

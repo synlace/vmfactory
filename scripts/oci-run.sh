@@ -923,9 +923,12 @@ vmf_verify_stage() {
   # kill the stage under set -e + pipefail.
   probe_host=$(grep -oE '^IP=.*' "$inst_dir/conf" 2>/dev/null | cut -d= -f2- || true)
   probe_host="${probe_host:-127.0.0.1}"
+  # Evidence lands FLAT under $RUNS_DIR (like the legacy verdict
+  # markers): the race's loser reap rm -rf's the whole instance dir,
+  # and a failed candidate's evidence must survive it.
   python3 "$SCRIPTS_DIR/vmf_verify.py" run "$vplan" --name "$name" \
     --hostfwd "$rundir/hostfwd" --console "$inst_dir/log" \
-    --evidence-out "$rundir/verify-evidence.json" \
+    --evidence-out "$RUNS_DIR/$name.verify-evidence.json" \
     --probe-host "$probe_host" \
     --target-out "$rundir/target" || vrc=$?
   # Verdict marker for the race coordinator: the final state of this
