@@ -279,7 +279,15 @@ if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   fi
   [[ -z "$approach_list" ]] || export VMF_RACE_APPROACH="$approach_list"
   [[ -z "$skip_list" ]] || export VMF_RACE_SKIP="$skip_list"
-  exec python3 "$(cd "$(dirname "$0")" && pwd)/vmf_race.py" "$VMF_COMPOSE_SRC"
+  # The race owns the terminal; the rich board needs rich importable by
+  # the race interpreter. Bare python3 when rich imports; otherwise the
+  # uv-provisioned interpreter (same ladder as vmf_race._plan_interp's
+  # pyyaml dance).
+  if python3 -c 'import rich' 2>/dev/null || ! command -v uv >/dev/null 2>&1; then
+    exec python3 "$(cd "$(dirname "$0")" && pwd)/vmf_race.py" "$VMF_COMPOSE_SRC"
+  fi
+  exec env -u VIRTUAL_ENV uv run --no-project --with rich python3 \
+    "$(cd "$(dirname "$0")" && pwd)/vmf_race.py" "$VMF_COMPOSE_SRC"
 fi
 
 # Docker-compatible normalization: unprefixed names imply docker.io

@@ -564,7 +564,14 @@ def main(argv):
             say("winner cache: replay %s (%s)" % (
                 w["approach"], w.get("url") or "same tree"))
             vmf_status.event(base, "replay", w["approach"])
-            rc = race(keep, src, base)
+            board = _open_board(base)
+            if board:
+                board.stage("replay " + (w.get("method") or w["approach"]))
+                board.lane(w.get("method") or w["approach"], "plan",
+                           w.get("image") or w.get("compose_file") or "cached",
+                           "", "replay")
+            rc = race(keep, src, base, board=board)
+            _board_close()
             if rc == 0:
                 return 0
             try:
@@ -630,6 +637,19 @@ def main(argv):
     return race(keep, src, base)
 
 
+def _open_board(base):
+    # The board owns the terminal when it can (TTY, rich importable,
+    # not VMF_LOUD); status files stay the source of truth either way.
+    if os.environ.get("VMF_LOUD") == "1" or not vmf_ui.available():
+        return None
+    board = vmf_ui.Board(base)
+    if not board.ok:
+        return None
+    vmf_status.set_quiet(True)
+    _board_ref["b"] = board
+    return board
+
+
 def race_scout(feed, first, src, base):
     # The scout fast path: the first scouted route(s) enter the race
     # immediately; the feed keeps streaming later routes into the boot
@@ -651,17 +671,13 @@ def race_scout(feed, first, src, base):
     if not keep:
         feed.kill()
         return None
-    board = None
-    if vmf_ui.available() and os.environ.get("VMF_LOUD") != "1":
-        board = vmf_ui.Board(base)
-        if board.ok:
-            vmf_status.set_quiet(True)
-            _board_ref["b"] = board
-            board.stage("scout · reading repo + releases")
-            for k in keep:
-                board.lane(k["method"] or k["kind"], "plan",
-                           k["detail"], k["cite"],
-                           "%s/T%d" % (k["cost"], band_of(k)))
+    board = _open_board(base)
+    if board:
+        board.stage("scout · reading repo + releases")
+        for k in keep:
+            board.lane(k["method"] or k["kind"], "plan",
+                       k["detail"], k["cite"],
+                       "%s/T%d" % (k["cost"], band_of(k)))
     if not tranche_mode():
         say("scout: %d route(s) in flight; the scout keeps reading"
             % len(keep))

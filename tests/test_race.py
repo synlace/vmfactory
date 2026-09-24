@@ -271,7 +271,7 @@ class CacheBeforeEnumerate(Tmp):
             "approach": "install_script", "image": None, "ports": [],
             "compose_file": None}
         vmf_race.load_approaches = self._enum
-        vmf_race.race = lambda keep, src, base: (
+        vmf_race.race = lambda keep, src, base, feed=None, board=None: (
             self.raced.append((keep, base)) or 0)
         self.env_backup = {}
         for k in ("VMF_RACE_MODE", "VMF_RACE_SKIP_CACHE",
