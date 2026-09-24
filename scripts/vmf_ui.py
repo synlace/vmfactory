@@ -33,6 +33,23 @@ except Exception:
     _RICH = False
 
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# The board speaks the scout's short method vocabulary; runner kinds
+# (the fallback identity on replays) map to the same short words. The
+# detail line carries the specifics either way.
+DISPLAY_METHOD = {"prebuilt_image": "prebuilt", "dockerfile": "build",
+                  "source_build": "source", "compose": "compose",
+                  "install_script": "pkg"}
+
+
+def _display(text):
+    # Shorten runner-kind words inside arbitrary stage strings
+    # ("boot prebuilt_image" -> "boot prebuilt"); scout method words
+    # pass through untouched.
+    out = text
+    for kind, short in DISPLAY_METHOD.items():
+        if kind != short:
+            out = out.replace(kind, short)
+    return out
 STATE_STYLE = {"plan": "cyan", "booting": "magenta", "pass": "green",
                "parked": "bright_black", "blocked": "yellow",
                "skipped": "yellow"}
@@ -150,18 +167,18 @@ class Board:
                 self._live = None
 
     def stage(self, text, note=""):
-        self._stage_text = (text or "")[:48]
+        self._stage_text = _display(text or "")[:48]
         if note:
             self.note_text = note
         self._push()
 
     def lane(self, method, state, detail="", cite="", band=""):
-        m = (method or "?")[:10]
+        m = _display((method or "?").strip())[:10]
         if m not in self.lanes:
             self.lanes[m] = {}
             self.order.append(m)
         self.lanes[m].update({"state": (state or "plan")[:9],
-                              "detail": (detail or "")[:40],
+                              "detail": _display((detail or ""))[:40],
                               "cite": (cite or "")[:24],
                               "band": (band or "")[:9]})
         self._push()

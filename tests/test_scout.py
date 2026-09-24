@@ -414,6 +414,18 @@ class Board(unittest.TestCase):
         finally:
             vmf_ui._RICH = old
 
+    def test_kind_words_map_to_short_methods(self):
+        if not vmf_ui._RICH:
+            self.skipTest("rich not installed")
+        b = vmf_ui.Board("web", file=io.StringIO())
+        b.lane("prebuilt_image", "booting", "ghcr.io/gchq/cyberchef",
+               "", "T0")
+        b.stage("boot prebuilt_image")
+        self.assertIn("prebuilt", b.lanes)
+        self.assertNotIn("prebuilt_image", b.lanes)
+        self.assertEqual(b._stage_text, "boot prebuilt")
+        b.close()
+
 
 class QuietStatus(unittest.TestCase):
     def test_quiet_suppresses_nonfinal_render(self):
