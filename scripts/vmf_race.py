@@ -323,7 +323,9 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
     env["VMF_RUN_SSH"] = "1"
     # Candidates pay boot + in-guest install latency; the default
     # verify deadline (built for fast images) expires mid-install.
-    env.setdefault("VMF_VERIFY_SECS", "420")
+    # Compose dev stacks boot even slower: ghost's first-run
+    # migrations finished AFTER a 420s window expired (measured).
+    env.setdefault("VMF_VERIFY_SECS", "660" if kind == "compose" else "420")
     env.pop("VMF_RUN_INTENT", None)
     if kind in ("source_build", "install_script"):
         # Repo-install kinds run the gap-fill direct flow on the real

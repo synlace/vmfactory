@@ -341,10 +341,12 @@ def write_evidence(path, evidence):
     open(path, "w").write(json.dumps(evidence, indent=2))
 
 
-def snapshot_console(console, evidence_out, lines=200):
+def snapshot_console(console, evidence_out, lines=600):
     # The console log lives in the instance dir and teardown removes it
     # with everything else; a failed verdict must stay diagnosable, so
     # the tail lands beside the evidence (a dir that survives --rm).
+    # 600 lines: a compose boot's console rolls fast (image loads,
+    # compose progress, ssh probes) and 200 hid the stack output.
     if not console or not evidence_out:
         return
     try:

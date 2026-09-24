@@ -184,6 +184,12 @@ if [ "$mode" = "compose" ]; then
   $BB mkdir -p /data/docker-data
   $BB mkdir -p /root/.docker/cli-plugins
   $BB ln -sf /data/docker/bin/docker-compose /root/.docker/cli-plugins/docker-compose
+  # PATH shims: ssh sessions (the verify's container exec checks) see
+  # `docker` on the default PATH; the static binaries live in
+  # /data/docker/bin. Same shims the direct-mode branch creates.
+  $BB mkdir -p /usr/local/bin
+  $BB ln -sf /data/docker/bin/docker /usr/local/bin/docker
+  $BB ln -sf /data/docker/bin/docker-compose /usr/local/bin/docker-compose
   dockerd --iptables=false --ip6tables=false \
     --data-root /data/docker-data --storage-driver=overlay2 \
     >/data/dockerd.log 2>&1 &

@@ -329,7 +329,7 @@ class RunFlow(unittest.TestCase):
         s, port = free_port()
         s.close()
         console = os.path.join(self.tmp, "console.log")
-        lines = ["line-%d" % i for i in range(250)]
+        lines = ["line-%d" % i for i in range(700)]
         open(console, "w").write("\n".join(lines) + "\n")
         ev_path = os.path.join(self.tmp, "ev.json")
         out = io.StringIO()
@@ -342,7 +342,7 @@ class RunFlow(unittest.TestCase):
         snap = os.path.join(self.tmp, "verify-console.txt")
         self.assertTrue(os.path.isfile(snap))
         got = open(snap).read().splitlines()
-        self.assertEqual(got, lines[-200:])
+        self.assertEqual(got, lines[-600:])
 
     def test_oom_console_becomes_evidence(self):
         console = os.path.join(self.tmp, "console.log")
