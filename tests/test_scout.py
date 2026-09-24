@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +24,24 @@ import vmf_ui  # noqa: E402
 
 
 class Tmp(unittest.TestCase):
+    def _turn1(self):
+        return ('{"routes": ['
+                '{"method": "prebuilt", "why": "official image", '
+                '"cost": "fast", "cite": "docs: install", '
+                '"image": "ghcr.io/gchq/cyberchef:10", "ports": [8080]},'
+                '{"method": "release", "why": "static zip", '
+                '"cost": "fast", "cite": "releases v10.19.2", '
+                '"install": ["curl -L -o /tmp/a.zip <url>", '
+                '"unzip /tmp/a.zip"], "command": ["node", "web/"], '
+                '"ports": [8080]}], "more": true}')
+
+    def _turn2(self):
+        return ('{"routes": ['
+                '{"method": "pkg", "why": "node stack", "cost": "slow", '
+                '"install": ["apt-get install -y nodejs"], '
+                '"command": ["npm", "start"], "ports": [8080]}], '
+                '"more": false}')
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="vmf-scout-")
         self.addCleanup(shutil.rmtree, self.tmp)
@@ -30,6 +49,12 @@ class Tmp(unittest.TestCase):
         os.environ.pop("VMF_RUN_YES", None)
         self.calls = []
         self.old_call = vmf_llm.llm_call
+        # Clamp-time validators stay offline by default: no skopeo in
+        # the unit tests unless a test opts in.
+        self.old_which = vmf_plan.shutil.which
+        vmf_plan.shutil.which = lambda n: None if n == "skopeo" \
+            else self.old_which(n)
+        self.addCleanup(setattr, vmf_plan.shutil, "which", self.old_which)
 
     def tearDown(self):
         vmf_llm.llm_call = self.old_call
@@ -54,24 +79,6 @@ class Tmp(unittest.TestCase):
 
 
 class ScoutPlan(Tmp):
-    def _turn1(self):
-        return ('{"routes": ['
-                '{"method": "prebuilt", "why": "official image", '
-                '"cost": "fast", "cite": "docs: install", '
-                '"image": "ghcr.io/gchq/cyberchef:10", "ports": [8080]},'
-                '{"method": "release", "why": "static zip", '
-                '"cost": "fast", "cite": "releases v10.19.2", '
-                '"install": ["curl -L -o /tmp/a.zip <url>", '
-                '"unzip /tmp/a.zip"], "command": ["node", "web/"], '
-                '"ports": [8080]}], "more": true}')
-
-    def _turn2(self):
-        return ('{"routes": ['
-                '{"method": "pkg", "why": "node stack", "cost": "slow", '
-                '"install": ["apt-get install -y nodejs"], '
-                '"command": ["npm", "start"], "ports": [8080]}], '
-                '"more": false}')
-
     def test_routes_stream_in_emission_order(self):
         src = self._repo({"README.md": "# app\nnpm start\n",
                           "package.json": "{}"})
@@ -172,6 +179,123 @@ class ScoutPlan(Tmp):
         hints = vmf_plan._install_hints(src)
         self.assertLessEqual(len(hints), 24)
         self.assertTrue(any("curl" in h for h in hints))
+
+
+class Clamps(Tmp):
+    # Clamp-time validators: registry facts for prebuilt refs, one HEAD
+    # request for release asset URLs. Offline by default (Tmp stubs
+    # skopeo away); these tests opt in with canned tool output.
+    def _stub_which(self, paths):
+        real = vmf_plan.shutil.which
+        vmf_plan.shutil.which = lambda n: paths.get(n)
+        self.addCleanup(setattr, vmf_plan.shutil, "which", real)
+
+    def _stub_run(self, skopeo=None, skopeo_err="manifest unknown",
+                  curl_code="200"):
+        real = vmf_plan.subprocess.run
+
+        def fake(cmd, **kw):
+            exe = os.path.basename(cmd[0]) if cmd else ""
+            if exe == "skopeo":
+                if skopeo is None:
+                    return types.SimpleNamespace(returncode=1, stdout="",
+                                                 stderr=skopeo_err)
+                return types.SimpleNamespace(returncode=0, stdout=skopeo,
+                                             stderr="")
+            if exe == "curl":
+                return types.SimpleNamespace(returncode=0, stdout=curl_code,
+                                             stderr="")
+            return real(cmd, **kw)
+        vmf_plan.subprocess.run = fake
+        self.addCleanup(setattr, vmf_plan.subprocess, "run", real)
+
+    def test_prebuilt_ports_measured_from_registry(self):
+        self._stub_which({"skopeo": "/usr/bin/skopeo"})
+        self._stub_run(skopeo=json.dumps(
+            {"config": {"ExposedPorts": {"80/tcp": {}}}}))
+        route, why = vmf_plan._clamp_route(
+            {"method": "prebuilt", "why": "official", "cost": "fast",
+             "image": "ghcr.io/o/r:1", "ports": [8080]}, self.tmp)
+        self.assertIsNone(why)
+        self.assertEqual(route["ports"], [80])
+
+    def test_prebuilt_unknown_ref_dropped(self):
+        self._stub_which({"skopeo": "/usr/bin/skopeo"})
+        self._stub_run()  # rc 1, stderr "manifest unknown"
+        route, why = vmf_plan._clamp_route(
+            {"method": "prebuilt", "why": "x", "cost": "fast",
+             "image": "ghcr.io/o/r:1", "ports": [80]}, self.tmp)
+        self.assertIsNone(route)
+        self.assertIn("registry", why)
+
+    def test_registry_transport_keeps_route(self):
+        self._stub_which({"skopeo": "/usr/bin/skopeo"})
+        self._stub_run(
+            skopeo_err='Get "https://x": dial tcp: i/o timeout')
+        route, why = vmf_plan._clamp_route(
+            {"method": "prebuilt", "why": "x", "cost": "fast",
+             "image": "ghcr.io/o/r:1", "ports": [8080]}, self.tmp)
+        self.assertIsNone(why)
+        self.assertEqual(route["ports"], [8080])
+
+    def test_no_skopeo_keeps_model_ports(self):
+        self._stub_which({})  # Tmp-level stub already: no skopeo
+        route, why = vmf_plan._clamp_route(
+            {"method": "prebuilt", "why": "x", "cost": "fast",
+             "image": "ghcr.io/o/r:1", "ports": [8080]}, self.tmp)
+        self.assertIsNone(why)
+        self.assertEqual(route["ports"], [8080])
+
+    def test_release_dead_url_dropped(self):
+        self._stub_which({"curl": "/usr/bin/curl"})
+        self._stub_run(curl_code="404")
+        route, why = vmf_plan._clamp_route(
+            {"method": "release", "why": "static", "cost": "fast",
+             "install": ["curl -fL -o /tmp/a.tgz "
+                         "https://github.com/o/r/releases/download/v1/a.tgz"],
+             "command": ["./a"], "ports": [80]}, self.tmp)
+        self.assertIsNone(route)
+        self.assertIn("404", why)
+
+    def test_release_live_url_kept(self):
+        self._stub_which({"curl": "/usr/bin/curl"})
+        self._stub_run(curl_code="200")
+        route, why = vmf_plan._clamp_route(
+            {"method": "release", "why": "static", "cost": "fast",
+             "install": ["curl -fL -o /tmp/a.tgz "
+                         "https://github.com/o/r/releases/download/v1/a.tgz"],
+             "command": ["./a"], "ports": [80]}, self.tmp)
+        self.assertIsNone(why)
+        self.assertEqual(route["kind"], "install_script")
+
+    def test_release_urlless_route_skips_check(self):
+        self._stub_which({"curl": "/usr/bin/curl"})
+
+        def boom(cmd, **kw):
+            self.fail("no url, no HEAD request")
+        real = vmf_plan.subprocess.run
+        vmf_plan.subprocess.run = boom
+        self.addCleanup(setattr, vmf_plan.subprocess, "run", real)
+        route, why = vmf_plan._clamp_route(
+            {"method": "release", "why": "static", "cost": "fast",
+             "install": ["tar xzf /tmp/a.tgz"], "command": ["./a"],
+             "ports": [80]}, self.tmp)
+        self.assertIsNone(why)
+        self.assertEqual(route["direct"]["command"], ["./a"])
+
+    def test_direct_cache_written_without_yes(self):
+        src = self._repo({"README.md": "# app\nnpm start\n",
+                          "package.json": "{}"})
+        out = os.path.join(self.tmp, "scout.jsonl")
+        vmf_llm.llm_call = lambda *a, **k: (0, self._turn1(), "")
+        rc = vmf_plan.scout_cmd(src, out)
+        self.assertEqual(rc, 0)
+        gen = os.path.join(self.tmp, "generated")
+        hits = [os.path.join(gen, d, "direct-release.json")
+                for d in os.listdir(gen)
+                if os.path.isfile(os.path.join(gen, d,
+                                               "direct-release.json"))]
+        self.assertEqual(len(hits), 1)
 
 
 class ScoutFeed(Tmp):

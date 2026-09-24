@@ -2450,8 +2450,10 @@ def _release_manifest(root, timeout=15, max_releases=3, max_assets=8):
         for a in (rel.get("assets") or [])[:max_assets]:
             if not isinstance(a, dict):
                 continue
-            lines.append("  asset %s (%s bytes)" % (
-                str(a.get("name") or "?")[:60], a.get("size") or 0))
+            url = str(a.get("browser_download_url") or "")
+            lines.append("  asset %s (%s bytes)%s" % (
+                str(a.get("name") or "?")[:60], a.get("size") or 0,
+                (" " + url) if url else ""))
         body = str(rel.get("body") or "").strip().replace("\n", " ")
         if body:
             lines.append("  notes: %s" % body[:160])
@@ -2470,6 +2472,78 @@ def _route_detail(route):
     if d.get("command"):
         return " ".join(str(x) for x in d["command"])[:40]
     return (route.get("evidence") or "")[:40]
+
+
+def _scout_image_ports(ref, fallback):
+    # Registry facts beat guesses: the ref's existence is proven and
+    # the image config's ExposedPorts are MEASURED (skopeo inspect
+    # --config). A manifest-unknown or denied ref drops the route; a
+    # transport failure or a config without EXPOSE keeps the model's
+    # ports — the boot arbitrates honestly either way.
+    exe = shutil.which("skopeo")
+    if not exe:
+        return fallback, None
+    try:
+        r = subprocess.run([exe, "inspect", "--config", "docker://%s" % ref],
+                           capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.SubprocessError):
+        return fallback, None
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        err = err.splitlines()[-1] if err else "inspect failed"
+        if re.search(r"manifest unknown|name unknown|not found|denied"
+                     r"|unauthorized", err, re.I):
+            return None, ("registry: %s" % err[:60])
+        return fallback, None
+    try:
+        cfg = (json.loads(r.stdout or "{}").get("config") or {})
+    except ValueError:
+        return fallback, None
+    ports = []
+    for k in (cfg.get("ExposedPorts") or {}):
+        p = str(k).split("/", 1)[0].strip()
+        if p.isdigit() and 1 <= int(p) <= 65535 and int(p) not in ports:
+            ports.append(int(p))
+    return (ports or fallback), None
+
+
+def _scout_asset_url(r):
+    # The release route's download link: the explicit asset_url field
+    # wins; else the first releases/download link in the install
+    # commands.
+    u = str(r.get("asset_url") or "").strip()
+    if u.startswith("http"):
+        return u
+    for cmd in (r.get("install") or []):
+        for tok in str(cmd).split():
+            if tok.startswith("http") and ("/releases/" in tok
+                                           or "/download/" in tok):
+                return tok.rstrip("'\"),;")
+    return ""
+
+
+def _url_alive(url):
+    # One HEAD request at plan time: a dead asset (404/410) drops the
+    # route before any boot. Transport failures are NOT a verdict —
+    # the boot arbitrates.
+    if not url:
+        return True, None
+    exe = shutil.which("curl")
+    if not exe:
+        return True, None
+    try:
+        r = subprocess.run([exe, "-sIL", "--max-time", "10", "-o",
+                            "/dev/null", "-w", "%{http_code}", url],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return True, None
+    out = (r.stdout or "").strip()
+    code = out.splitlines()[-1] if out else ""
+    if code.isdigit() and int(code) < 400:
+        return True, None
+    if code in ("404", "410"):
+        return False, ("release asset %s" % code)
+    return True, None
 
 
 def _clamp_route(r, root):
@@ -2496,6 +2570,9 @@ def _clamp_route(r, root):
                             ([r.get("image")] if r.get("image") else []))
         if not img:
             return None, "no exact image ref"
+        ports, why = _scout_image_ports(img[0], ports)
+        if why:
+            return None, why
         if not ports:
             return None, "no ports to verify"
         route["image"] = img[0]
@@ -2521,6 +2598,10 @@ def _clamp_route(r, root):
     direct = _clamp_direct(r, ports)
     if not direct:
         return None, "no command"
+    if m == "release":
+        ok, why = _url_alive(_scout_asset_url(r))
+        if not ok:
+            return None, why
     route["direct"] = direct
     route["ports"] = direct["ports"]
     return route, None
@@ -2585,6 +2666,8 @@ def _scout_scan(root, out, routes):
             '"image": "<prebuilt only: exact ref>", '
             '"compose_file": "<compose only: repo ROOT file>", '
             '"dockerfile": "<build only>", '
+            '"asset_url": "<release only: browser_download_url of the '
+            'exact asset>", '
             '"install": ["<pkg/release/source: shell commands run once>"], '
             '"command": ["<pkg/release/source: argv that starts the app>"], '
             '"ports": [<guest tcp ports>], '
@@ -2624,7 +2707,12 @@ def _scout_scan(root, out, routes):
         new = 0
         for r in (j.get("routes") or [])[:6]:
             route, why = _clamp_route(r, root)
-            if not route or route["method"] in emitted:
+            if not route:
+                sys.stderr.write("scout: dropped %-9s .. %s\n"
+                                 % (str(r.get("method") or "?")[:9],
+                                    (why or "")[:50]))
+                continue
+            if route["method"] in emitted:
                 continue
             emitted.add(route["method"])
             routes.append(route)
@@ -2643,10 +2731,10 @@ def _scout_scan(root, out, routes):
 def _scout_cache_direct(root, routes):
     # Each direct route doubles as the runner's replay plan: the boot
     # (VMF_PLAN_SKIP_COMPOSE=1 + VMF_PLAN_DIRECT=<method>) replays
-    # direct-<method>.json with zero LLM calls. Same non-interactive
-    # gate as the fan-out's direct warming.
-    if not vmf_llm.accepted():
-        return
+    # direct-<method>.json with zero LLM calls. The scout is a
+    # race-only stage, never interactive — the write is UNCONDITIONAL.
+    # (A gate here starved the runners: "no direct plan for method
+    # 'release'".)
     gdir = os.path.join(
         _gen_root(),
         hashlib.sha256((PROMPT_V + "\n" + _gapfill_bundle(root)
