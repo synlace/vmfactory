@@ -930,7 +930,20 @@ vmf_verify_stage() {
     --target-out "$rundir/target" || vrc=$?
   # Verdict marker for the race coordinator: the final state of this
   # stage per VM. Recursions overwrite; the last writer wins.
-  _verdict() { printf '%s\n' "$1" > "$inst_dir/verdict"; }
+  _verdict() {
+    printf '%s\n' "$1" > "$inst_dir/verdict"
+    # One-line status: standalone runs settle their line here (race
+    # children skip — the coordinator owns the run's line).
+    if [[ -z "${VMF_RACE_CHILD:-}" ]]; then
+      if [[ "$1" == "pass" && -f "$rundir/target" ]]; then
+        python3 "$SCRIPTS_DIR/vmf_status.py" final "$name" pass \
+          "$(head -1 "$rundir/target")" 2>/dev/null || true
+      else
+        python3 "$SCRIPTS_DIR/vmf_status.py" final "$name" fail \
+          "${1:0:40}" 2>/dev/null || true
+      fi
+    fi
+  }
   if [[ "$vrc" -eq 0 ]]; then
     _verdict pass
     # The rendered deliverable rides the conf; `just ps` and the race
@@ -1079,6 +1092,12 @@ if [[ "$ENGINE" == "qemu" ]]; then
   if [[ "$detach" -eq 1 ]]; then
     echo "microVM '$name' detached; console log: $inst_dir/log"
     echo "ssh: just ssh $name   stop: just stop $name"
+    # One-line status for standalone boots (race children skip: the
+    # coordinator owns the run's line).
+    if [[ -z "${VMF_RACE_CHILD:-}" ]]; then
+      python3 "$SCRIPTS_DIR/vmf_status.py" begin "$name" 2>/dev/null || true
+      python3 "$SCRIPTS_DIR/vmf_status.py" event "$name" boot "booting" 2>/dev/null || true
+    fi
     vmf_verify_stage
   fi
   exit 0

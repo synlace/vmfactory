@@ -156,6 +156,12 @@ ps *args:
     #!/bin/sh
     exec python3 scripts/vmf_ps.py "$@"
 
+# One line per active run, from the status files. Works over pipes and
+# in tmux; settled lines age out after 10 minutes.
+watch *args:
+    #!/bin/sh
+    exec python3 scripts/vmf_status.py watch
+
 # One-time host bridge stack for ip mode: bridge, tap pool, dnsmasq.
 # Needs sudo once; boots never do (they claim a free tap).
 lab-init:

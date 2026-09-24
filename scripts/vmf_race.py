@@ -28,6 +28,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vmf_status
+
 RUNS = os.environ.get("VMF_RUNS") or os.path.expanduser("~/.vmf/runs")
 GEN = os.environ.get("VMF_GENERATED") \
     or os.path.join(os.path.expanduser("~"), ".vmf", "generated")
@@ -137,9 +140,23 @@ def plan_stage(src, out, compose_file=None):
         capture_output=True, text=True, env=env)
 
 
+RACE_LOG = None
+# Plan-only mode keeps the old firehose (the table IS the artifact);
+# run mode sends the firehose to the race log and the terminal gets
+# the one status line (VMF_LOUD=1 mirrors the firehose for debugging).
+SAY_STDERR = True
+
+
 def say(msg):
-    sys.stderr.write("race: %s\n" % msg)
-    sys.stderr.flush()
+    if RACE_LOG:
+        try:
+            with open(RACE_LOG, "a") as f:
+                f.write("race: %s\n" % msg)
+        except OSError:
+            pass
+    if SAY_STDERR or os.environ.get("VMF_LOUD") == "1":
+        sys.stderr.write("race: %s\n" % msg)
+        sys.stderr.flush()
 
 
 def verdict_path(name):
@@ -315,10 +332,14 @@ def _die(signum, _frame):
             pass
         r["proc"].terminate()
         stop_vm(cand)
+    vmf_status.clear(_die_base)
+    vmf_status.event(_die_base, "fail", "killed (signal %d)" % signum,
+                     final=True)
     sys.exit(128 + signum)
 
 
 running_state = {}
+_die_base = ""
 
 
 def main(argv):
@@ -328,6 +349,17 @@ def main(argv):
     src = os.path.abspath(argv[1])
     base = os.environ.get("VMF_NAME") or os.path.basename(src)
     plan_only = os.environ.get("VMF_RACE_MODE") == "plan"
+    global RACE_LOG, SAY_STDERR, _die_base
+    if plan_only:
+        SAY_STDERR = True
+    else:
+        SAY_STDERR = False
+        _die_base = base
+        logdir = os.path.join(RUNS, "race-logs")
+        os.makedirs(logdir, exist_ok=True)
+        RACE_LOG = os.path.join(logdir, "%s.race.log" % base)
+        vmf_status.begin(base)
+        vmf_status.event(base, "plan", "evidence bundle")
 
     if plan_only:
         # Satisfiability without booting: pruned candidates print and
@@ -364,6 +396,7 @@ def main(argv):
                      "compose_file": w.get("compose_file"), "cached": True}]
             say("winner cache: replay %s (%s)" % (
                 w["approach"], w.get("url") or "same tree"))
+            vmf_status.event(base, "replay", w["approach"])
             rc = race(keep, src, base)
             if rc == 0:
                 return 0
@@ -376,6 +409,7 @@ def main(argv):
     approaches = apply_filters(load_approaches(src))
     if not approaches:
         say("no approach allowed; nothing to race")
+        vmf_status.event(base, "fail", "no approach allowed", final=True)
         return 1
 
     # Satisfiability prune before any boot.
@@ -395,6 +429,7 @@ def main(argv):
             say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
     if not keep:
         say("all approaches pruned at plan time")
+        vmf_status.event(base, "fail", "all approaches pruned", final=True)
         return 1
 
     return race(keep, src, base)
@@ -471,9 +506,13 @@ def race(keep, src, base):
             log.write("\n===== boot =====\n")
             proc = subprocess.Popen(cmd, env=env, stdout=log,
                                     stderr=subprocess.STDOUT)
-            running[k["cand"]] = dict(k, proc=proc, log=log, born=now)
+            band = band_of(k)
+            running[k["cand"]] = dict(k, proc=proc, log=log, born=now,
+                                      band=band)
             running_state[k["cand"]] = running[k["cand"]]
             say("%d %s .. started (%s)" % (k["i"], k["kind"], k["cand"]))
+            vmf_status.event(base, "T%d" % band,
+                             "c%d %s boot" % (k["i"], k["kind"]))
             last_event = now
         # Poll verdicts and dead runners.
         for cand in list(running):
@@ -510,6 +549,9 @@ def race(keep, src, base):
                     verdicts[cand] = "fail (no verdict after boot)"
             if cand in verdicts:
                 say("%d %s .. %s" % (r["i"], r["kind"], verdicts[cand]))
+                vmf_status.event(base, "T%d" % r.get("band", 3),
+                                 "c%d %s %s" % (r["i"], r["kind"],
+                                                verdicts[cand][:24]))
                 r["log"].close()
                 r["proc"].terminate()
                 del running[cand]
@@ -574,6 +616,7 @@ def race(keep, src, base):
                 cand, status, os.path.join(RUNS, "race-logs",
                                            "%s.log" % cand)))
         say("rerun with --approach <name|number> to retry one approach")
+        vmf_status.event(base, "fail", "no working service", final=True)
         return 1
 
     w = next(k for k in keep if k["cand"] == winner)
@@ -647,6 +690,7 @@ def promote(w, src, base, winner):
         env["VMF_NAME"] = base
         say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)"
             % (base, base))
+        vmf_status.event(base, "promote", "booting")
         log = open(w["lp"], "a")
         log.write("\n===== promotion (%s)%s =====\n"
                   % (base, "" if attempt == 1
@@ -678,16 +722,21 @@ def promote(w, src, base, winner):
             time.sleep(2)
     # The rendered deliverable from the promoted instance's conf: the
     # bump (or the future per-VM IP) is visible at the end of the run.
+    target = ""
     try:
         with open(conf_path(base)) as f:
             for line in f:
                 if line.startswith("TARGET="):
-                    say("target: %s" % line.split("=", 1)[1].strip())
+                    target = line.split("=", 1)[1].strip()
+                    say("target: %s" % target)
                     break
     except OSError:
         pass
     if status == "pass":
         save_winner(src, w, winner)
+        vmf_status.event(base, "pass", target or "pass", final=True)
+    else:
+        vmf_status.event(base, "fail", status[:40], final=True)
     return 0 if status == "pass" else 1
 
 
