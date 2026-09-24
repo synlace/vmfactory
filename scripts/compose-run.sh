@@ -155,6 +155,23 @@ svc_count=$("${JQ[@]}" '.services | length' "$plan_tmp/plan.json")
 primary=$("${JQ[@]}" -r '.primary' "$plan_tmp/plan.json")
 PROJ="$VMF_COMPOSE_SRC/$("${JQ[@]}" -r '.project_dir // "."' "$plan_tmp/plan.json")"
 echo "compose: $svc_count services (primary: $primary)"
+# VM sizing: the plan derives memory_mb from compose evidence (innodb
+# buffers, mem_limit, service count). The user's explicit --memory
+# wins; a verify-repair floor (VMF_PLAN_MEM_FLOOR from a measured OOM)
+# raises the derived value.
+if [[ "${VMF_RUN_MEM_EXPLICIT:-0}" != "1" ]]; then
+  cmem=$("${JQ[@]}" -r '.memory_mb // 0' "$plan_tmp/plan.json")
+  floor="${VMF_PLAN_MEM_FLOOR:-0}"
+  if [[ "$floor" =~ ^[0-9]+$ ]] && [[ "$cmem" =~ ^[0-9]+$ ]] \
+      && [[ "$floor" -gt "$cmem" ]]; then
+    echo "compose: verify-repair memory floor ${floor}MB (plan proposed ${cmem:-1024})"
+    cmem="$floor"
+  fi
+  if [[ "$cmem" =~ ^[0-9]+$ && "$cmem" -gt 0 ]]; then
+    export VMF_RUN_MEM="$cmem"
+    echo "compose: sizing the VM to ${cmem}MB (compose evidence)"
+  fi
+fi
 
 # Intent refinement: an unconsumed --intent phrase (single-project run)
 # becomes a bounded, validated plan overlay - e.g. "Run 5 instances"

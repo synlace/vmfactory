@@ -11,7 +11,8 @@
     "primary": {"type": "string", "minLength": 1},
     "services": {"type": "array", "minItems": 1, "maxItems": 12,
                  "items": {"$ref": "#/definitions/service"}},
-    "checks": {"type": "array", "items": {"$ref": "#/definitions/check"}}
+    "checks": {"type": "array", "items": {"$ref": "#/definitions/check"}},
+    "memory_mb": {"type": "integer", "minimum": 1024, "maximum": 8192}
   },
   "definitions": {
     "port": {

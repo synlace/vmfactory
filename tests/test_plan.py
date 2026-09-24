@@ -572,6 +572,50 @@ services:
                       "container": "db"}},
             plan["checks"])
 
+    def test_memory_mb_from_compose_evidence(self):
+        # The ghost failure mode, turned into arithmetic: a 1G innodb
+        # buffer pool plus a 500M log buffer inside a 1024 MB VM OOM-
+        # kills mysqld. The plan sizes the VM from those flags.
+        compose = self._write("compose.yaml", """
+services:
+  mysql:
+    image: docker.io/library/mysql:8.4
+    command: ['--innodb-buffer-pool-size=1G', '--innodb-log-buffer-size=500M']
+  redis:
+    image: docker.io/library/redis:7.4
+    command: ['redis-server', '--loglevel', 'warning']
+  web:
+    image: docker.io/library/nginx
+""")
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        # floor 2048 + flags (1536 + 500) + 2 extra services (512) = 4584
+        self.assertEqual(plan["memory_mb"], 4596)
+
+    def test_memory_mb_floor_and_limit(self):
+        compose = self._write("compose.yaml", """
+services:
+  db:
+    image: docker.io/library/postgres:16
+    command: ['postgres', '-c', 'shared_buffers=512MB']
+    mem_limit: 3g
+  app:
+    image: docker.io/library/nginx
+""")
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        # floor 2048 vs limit 3072; flags 500... shared_buffers=512MB
+        # = 512; +256 extra service → 2048+512+... = 3840
+        self.assertEqual(plan["memory_mb"], 3840)
+
+    def test_plain_stack_stays_at_floor(self):
+        compose = self._write("compose.yaml", """
+services:
+  web:
+    image: docker.io/library/nginx
+    ports: ['8080:80']
+""")
+        plan = vmf_plan.translate(compose, self.tmp, self.tmp)
+        self.assertEqual(plan["memory_mb"], 2048)
+
     def test_clamp_keeps_container(self):
         out = vmf_plan._clamp_checks(
             [{"exec": {"cmd": "redis-cli ping", "container": "redis"}},

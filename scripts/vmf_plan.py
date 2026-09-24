@@ -888,7 +888,70 @@ def translate(compose_path, src, root):
             seen.add(key)
             unique.append(c)
     plan["checks"] = unique
+    plan["memory_mb"] = _compose_memory_mb(plan, svcs)
     return plan
+
+
+# Memory-bearing flags the VM must honor: the stack shares ONE VM with
+# dockerd, so a 1G innodb buffer pool inside a 1024 MB VM is an OOM
+# kill (measured on ghost's dev stack: mysqld died at anon-rss 0.8GB).
+# (flag substring, multiplier = headroom over the stated bytes)
+MEM_FLAGS = (
+    ("innodb-buffer-pool-size", 1.5),
+    ("innodb-log-buffer-size", 1.0),
+    ("shared_buffers", 1.0),
+    ("max-old-space-size", 1.0),
+    ("xmx", 1.0),
+)
+
+
+def _flag_mb(blob):
+    total = 0
+    for flag, mult in MEM_FLAGS:
+        for m in re.finditer(
+                r"%s[=\s]+?(\d+(?:\.\d+)?)([mMgG]i?B?)\b" % flag, blob):
+            n, u = float(m.group(1)), m.group(2).lower()
+            total += int(n * (1024 if u.startswith("g") else 1) * mult)
+    return total
+
+
+def _limit_mb(s):
+    # mem_limit: "2g" | 2048 | deploy.resources.limits.memory
+    vals = [s.get("mem_limit")]
+    dep = s.get("deploy")
+    if isinstance(dep, dict):
+        res = dep.get("resources")
+        if isinstance(res, dict):
+            lim = res.get("limits")
+            if isinstance(lim, dict):
+                vals.append(lim.get("memory"))
+    for v in vals:
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([mMgG]i?B?)",
+                         str(v or "").strip())
+        if m:
+            n, u = float(m.group(1)), m.group(2).lower()
+            return int(n * (1024 if u.startswith("g") else 1))
+    return 0
+
+
+def _compose_memory_mb(plan, raw_services):
+    # Deterministic VM size from compose evidence: the docker floor
+    # (2048), memory flags in commands, explicit per-service limits
+    # (raw compose services: translate drops mem_limit/deploy), and
+    # 256 MB runtime overhead per extra container.
+    flags_mb = 0
+    limit_mb = 0
+    for s in plan["services"]:
+        blob = json.dumps(s.get("command") or []) + \
+            json.dumps(s.get("entrypoint") or [])
+        flags_mb += _flag_mb(blob)
+        raw = raw_services.get(s.get("name") or "") or {}
+        limit_mb = max(limit_mb, _limit_mb(raw))
+    n = len(plan["services"])
+    base = max(2048, limit_mb) + flags_mb + max(0, n - 1) * 256
+    return _clamp_memory(base, True)
 
 
 def apply_variant(plan, value):

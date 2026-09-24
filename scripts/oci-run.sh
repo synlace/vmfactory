@@ -998,6 +998,41 @@ PY
   # Repair-first (the inversion): when the VM is alive, the agent fixes
   # the app in place and rewrites the spec — no reboot, seconds of a
   # small model instead of minutes of a rebuild.
+  # Compose-mode OOM repair first: deterministic, no agent. The stack
+  # OOM-killed a container (measured anon-rss in the evidence); the
+  # repair is a bigger VM, applied by compose-run on the child re-run
+  # via VMF_PLAN_MEM_FLOOR.
+  if python3 -c 'import json,sys
+p = json.load(open(sys.argv[1]))
+sys.exit(0 if p.get("services") and not p.get("command") else 1)' \
+      "$vplan" 2>/dev/null; then
+    local floor
+    floor=$(python3 -c '
+import json, os, sys
+sys.path.insert(0, os.environ.get("VMF_SCRIPTS_DIR") or ".")
+import vmf_verify
+try:
+    ev = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    ev = []
+print(vmf_verify.oom_floor_mb(ev) or 0)' "$rundir/verify-evidence.json" 2>/dev/null || echo 0)
+    if [[ "$floor" =~ ^[0-9]+$ && "$floor" -gt 0 ]]; then
+      echo "verify: compose OOM repair: rebooting with a ${floor}MB floor..."
+      bash "$SCRIPTS_DIR/stop.sh" "$name" >/dev/null 2>&1 || true
+      child_args=()
+      if [[ -n "${VMF_ORIG_ARGS_B64:-}" ]]; then
+        while IFS= read -r -d '' a; do
+          child_args+=("$a")
+        done < <(printf '%s' "$VMF_ORIG_ARGS_B64" | base64 -d)
+      fi
+      VMF_VERIFY_TURN=$((turn + 1)) VMF_RUN_YES=1 VMF_PLAN_MEM_FLOOR="$floor" \
+        bash "$0" ${child_args[@]+"${child_args[@]}"} --name "$name"
+      exit $?
+    fi
+  fi
+  # Repair-first (the inversion): when the VM is alive, the agent fixes
+  # the app in place and rewrites the spec — no reboot, seconds of a
+  # small model instead of minutes of a rebuild.
   if bash "$SCRIPTS_DIR/ssh.sh" "$name" -- echo ok >/dev/null 2>&1; then
     if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]] && \
         python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$name" \
