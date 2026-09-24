@@ -95,7 +95,13 @@ ip_nic() {
     "0x$(echo $macs | awk '{print $2}')" \
     "0x$(echo $macs | awk '{print $3}')") || return 1
   tap=$(bash "$SCRIPT_DIR/vmf_net.sh" claim "$mac") || return 1
+  tap=$(bash "$SCRIPT_DIR/vmf_net.sh" claim "$mac") || return 1
   printf 'ip\n' > "$VMF_RUNDIR/net"
+  # ip mode: ports are native at the guest IP (no slirp, no publish).
+  # oci-run's writer filled this file with planned remaps (they exist
+  # for the slirp fallback); truncate them or the verify probes
+  # VM_IP:35597 — a port qemu never bound — and fails a live app.
+  : > "$VMF_RUNDIR/hostfwd"
   printf 'TAP=%s\nMAC=%s\n' "$tap" "$mac" >> "$VMF_CONF"
   net_args=(-netdev "tap,id=net0,ifname=$tap,script=no,downscript=no,vnet_hdr=off" \
             -device "virtio-net-pci,netdev=net0,mac=$mac")
