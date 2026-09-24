@@ -26,6 +26,17 @@ def set_quiet(q):
     _QUIET[0] = bool(q)
 
 
+# True while a non-final CR line is pending on the terminal (no
+# newline yet); a final event terminates it before its own line.
+_OPEN_LINE = [False]
+
+
+def line_closed():
+    # The rich board closed: its Live emitted the trailing newline,
+    # so no CR line is pending.
+    _OPEN_LINE[0] = False
+
+
 def status_dir():
     return os.path.join(RUNS, ".status")
 
@@ -61,7 +72,13 @@ def _render(text, final):
     if m == "tty" and not final:
         sys.stderr.write("\r%-100s" % text[:100])
         sys.stderr.flush()
+        _OPEN_LINE[0] = True
         return
+    # A final event terminates an open CR line first, so the verdict
+    # lands on its own line instead of appending mid-line.
+    if _OPEN_LINE[0]:
+        sys.stderr.write("\n")
+        _OPEN_LINE[0] = False
     sys.stderr.write(text[:100] + "\n")
     sys.stderr.flush()
 

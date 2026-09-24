@@ -55,6 +55,9 @@ Usage: oci-run.sh [--rm] [--keep] [-d] [--name NAME] [--cpus N] [--memory MB]
   -v HOST:GUEST   mount a host path into the guest (repeatable)
   -e K=V          environment for the guest process (repeatable)
   --name NAME     microVM name (default: derived from the image)
+  --new           boot a fresh instance even when a healthy instance of
+                  this tree is already running (default behavior is to
+                  present it; --replace redeploys the bare name instead)
   --cpus N        vCPUs
   --as KIND       resolve input-kind ambiguity explicitly; every run
                   prints the classified kind as its first line
@@ -81,6 +84,7 @@ cpus=""
 mem=""
 netmode=""
 replace_flag=0
+new_flag=0
 timeout_spec=""
 diskcap=""
 ssh=1
@@ -127,6 +131,7 @@ while [[ $# -gt 0 ]]; do
     -e|--env) [[ $# -ge 2 ]] || usage; envs+=("$2"); shift 2 ;;
     --name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
     --replace) replace_flag=1; shift ;;
+    --new) new_flag=1; shift ;;
   --cpus) [[ $# -ge 2 ]] || usage; cpus="$2"; shift 2 ;;
   --as) [[ $# -ge 2 ]] || usage; input_as="$2"; shift 2 ;;
   --plan) plan_mode=1; shift ;;
@@ -321,6 +326,11 @@ if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   fi
   [[ -z "$approach_list" ]] || export VMF_RACE_APPROACH="$approach_list"
   [[ -z "$skip_list" ]] || export VMF_RACE_SKIP="$skip_list"
+  # Reattach presents a running instance of this tree; --new (and
+  # --replace, which redeploys the bare name) force a fresh boot.
+  if [[ "${new_flag:-0}" == "1" || "$replace_flag" == "1" ]]; then
+    export VMF_RACE_NEW=1
+  fi
   # The race owns the terminal; the rich board needs rich importable by
   # the race interpreter. Bare python3 when rich imports; otherwise the
   # uv-provisioned interpreter (same ladder as vmf_race._plan_interp's
@@ -809,13 +819,15 @@ sleep 0.5
 # State for `just ssh <name>` and `just ps`: one conf per instance,
 # inside the id-keyed dir. SRC records the user input, APPROACH the
 # install approach (race winner or direct), TARGET the rendered
-# deliverable the verify stage fills in after a pass.
+# deliverable the verify stage fills in after a pass. KEY is the
+# content identity of the source tree (the reattach match).
 mkdir -p "$inst_dir"
 cat > "$inst_dir/conf" <<EOF
 ID=$inst_id
 NAME=$name
 SRC=$image
 APPROACH=${VMF_APPROACH:-image}
+KEY=${VMF_BUNDLE_KEY:-}
 PORT=$ssh_port
 IMAGE=$image
 PIN=${digest:-}

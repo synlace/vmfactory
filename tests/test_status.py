@@ -79,9 +79,13 @@ class Event(Tmp):
             self.assertTrue(err.getvalue().startswith("\r"))
             with redirect_stderr(err):
                 vmf_status.event("web", "pass", "ok", final=True)
-            self.assertEqual(err.getvalue().count("\n"), 1)
+            # The final event terminates the open CR line first, so the
+            # verdict lands on its own line (2 newlines total).
+            self.assertEqual(err.getvalue().count("\n"), 2)
+            self.assertIn("\nweb", err.getvalue())
         finally:
             del os.environ["VMF_STATUS"]
+            vmf_status.line_closed()
 
     def test_off_mode_silent(self):
         os.environ["VMF_STATUS"] = "off"

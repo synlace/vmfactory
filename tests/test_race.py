@@ -422,5 +422,100 @@ class Tranches(Tmp):
         self.assertEqual(vmf_race.band_of({"kind": "weird"}), 3)
 
 
+class Reattach(Tmp):
+    def setUp(self):
+        super().setUp()
+        self.runs = tempfile.mkdtemp(prefix="vmf-runs-", dir=self.tmp)
+        self.src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        with open(os.path.join(self.src, "package.json"), "w") as f:
+            f.write('{"name": "app"}')
+        vmf_race.RUNS = self.runs
+        vmf_status.RUNS = self.runs
+        self.old_key = vmf_race.bundle_key
+        vmf_race.bundle_key = lambda src: "reattachkey"
+        self.socks = []
+        self.env_backup = {}
+        for k in ("VMF_RACE_MODE", "VMF_RACE_SKIP_CACHE", "VMF_RACE_NEW",
+                  "VMF_RACE_APPROACH", "VMF_RACE_SKIP", "VMF_NAME",
+                  "VMF_BUNDLE_KEY"):
+            self.env_backup[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        vmf_race.bundle_key = self.old_key
+        for s in self.socks:
+            s.close()
+        for k, v in self.env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _port(self):
+        import socket as sockmod
+        s = sockmod.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        self.socks.append(s)
+        return s.getsockname()[1]
+
+    def _conf(self, name, key="reattachkey", pid=None, target=None):
+        d = os.path.join(self.runs, "deadbeefcafe")
+        os.makedirs(d, exist_ok=True)
+        lines = ["ID=deadbeefcafe", "NAME=%s" % name,
+                 "KEY=%s" % key, "PID=%s" % (pid if pid else os.getpid())]
+        if target:
+            lines.append("TARGET=%s" % target)
+        with open(os.path.join(d, "conf"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_healthy_instance_presents(self):
+        port = self._port()
+        self._conf("cyberchef-2", target="tcp://127.0.0.1:%d" % port)
+        self.assertEqual(vmf_race.find_reattach(self.src),
+                         ("cyberchef-2", "tcp://127.0.0.1:%d" % port))
+
+    def test_key_mismatch_skips(self):
+        port = self._port()
+        self._conf("other", key="othertree", target="tcp://127.0.0.1:%d" % port)
+        self.assertIsNone(vmf_race.find_reattach(self.src))
+
+    def test_dead_pid_skips(self):
+        port = self._port()
+        self._conf("cyberchef-2", pid=999999,
+                   target="tcp://127.0.0.1:%d" % port)
+        self.assertIsNone(vmf_race.find_reattach(self.src))
+
+    def test_dead_target_skips(self):
+        port = self._port()
+        self.socks[-1].close()
+        self.socks.pop()
+        self._conf("cyberchef-2", target="tcp://127.0.0.1:%d" % port)
+        self.assertIsNone(vmf_race.find_reattach(self.src))
+
+    def test_new_flag_disables(self):
+        os.environ["VMF_RACE_NEW"] = "1"
+        self.assertFalse(vmf_race.reattach_allowed())
+
+    def test_main_reattaches_without_race(self):
+        port = self._port()
+        self._conf("cyberchef-2", target="tcp://127.0.0.1:%d" % port)
+        self.raced = []
+        old = (vmf_race.race, vmf_race.load_approaches)
+        vmf_race.race = lambda *a, **k: self.raced.append(a) or 0
+        vmf_race.load_approaches = lambda src: self.fail("must not plan")
+        try:
+            rc = vmf_race.main(["race", self.src])
+            self.assertEqual(rc, 0)
+            self.assertEqual(self.raced, [])
+            self.assertEqual(os.environ.get("VMF_BUNDLE_KEY"), "reattachkey")
+            st = os.path.join(self.runs, ".status")
+            self.assertTrue(any(
+                "already running: cyberchef-2" in open(os.path.join(st, f)).read()
+                for f in os.listdir(st)))
+        finally:
+            (vmf_race.race, vmf_race.load_approaches) = old
+            os.environ.pop("VMF_BUNDLE_KEY", None)
+
+
 if __name__ == "__main__":
     unittest.main()

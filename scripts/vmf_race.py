@@ -331,6 +331,75 @@ def _keep_entry(i, r, logdir, base):
             "cost": r.get("cost") or "", "detail": str(detail)[:40]}
 
 
+def reattach_allowed():
+    # --new (and --replace) force a fresh instance; the default
+    # presents a healthy running instance of the same tree.
+    return os.environ.get("VMF_RACE_NEW", "0") != "1"
+
+
+def _conf_paths():
+    # Instance confs: id-keyed dirs ($RUNS/<id>/conf) and the legacy
+    # flat layout ($RUNS/<name>.conf).
+    out = []
+    try:
+        for d in sorted(os.listdir(RUNS)):
+            p = os.path.join(RUNS, d, "conf")
+            if os.path.isfile(p):
+                out.append(p)
+            p = os.path.join(RUNS, d + ".conf")
+            if os.path.isfile(p):
+                out.append(p)
+    except OSError:
+        pass
+    return out
+
+
+def _conf_get(path, field):
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if line.startswith(field + "="):
+                    return line[len(field) + 1:].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _tcp_alive(host, port, timeout=2.0):
+    # Connect-only probe: a silent open counts alive (the verify's
+    # check_tcp semantics); refused or timed out means dead.
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def find_reattach(src):
+    # One healthy running instance of this tree presents itself
+    # instead of a new boot. The conf KEY is the content identity the
+    # race stamps on every boot; the tcp probe is the arbiter — a conf
+    # alone proves nothing.
+    k = bundle_key(src)
+    if not k:
+        return None
+    for path in _conf_paths():
+        if _conf_get(path, "KEY") != k:
+            continue
+        name = _conf_get(path, "NAME")
+        pid = _conf_get(path, "PID")
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError):
+            continue
+        target = _conf_get(path, "TARGET")
+        m = re.match(r"tcp://([^:/]+):(\d+)", target)
+        if not m or not _tcp_alive(m.group(1), m.group(2)):
+            continue
+        return name, target
+    return None
+
+
 def apply_filters(approaches):
     only = [x.strip() for x in
             (os.environ.get("VMF_RACE_APPROACH") or "").split(",") if x.strip()]
@@ -507,6 +576,7 @@ def _board_close():
             pass
         _board_ref["b"] = None
         vmf_status.set_quiet(False)
+        vmf_status.line_closed()
 
 
 def main(argv):
@@ -547,6 +617,25 @@ def main(argv):
         say("plan only: %d/%d approach(es) satisfiable; nothing booted"
             % (alive, len(approaches)))
         return 0 if alive else 1
+
+    # Content identity for this tree: the reattach match AND the key
+    # every runner stamps into its instance conf (VMF_BUNDLE_KEY).
+    key = bundle_key(src)
+    if key:
+        os.environ["VMF_BUNDLE_KEY"] = key
+
+    # Reattach first: a healthy running instance of this tree IS the
+    # presentation — no boot, no race, no promotion. --new (or
+    # --replace) forces a fresh instance instead.
+    if reattach_allowed():
+        inst = find_reattach(src)
+        if inst:
+            rname, target = inst
+            say("already running: %s · %s (--new for a fresh instance)"
+                % (rname, target))
+            vmf_status.event(base, "pass", "already running: %s · %s"
+                             % (rname, target), final=True)
+            return 0
 
     # Winner cache FIRST: a hit replays as one candidate and costs no
     # enumerate call, no gap-fill, no LLM. The check must precede
@@ -955,6 +1044,9 @@ def race(keep, src, base, feed=None, board=None):
         say("rerun with --approach <name|number> to retry one approach")
         if board:
             board.stage("fail")
+            board.close()
+            vmf_status.set_quiet(False)
+            vmf_status.line_closed()
         vmf_status.event(base, "fail", "no working service", final=True)
         return 1
 
@@ -987,6 +1079,7 @@ def race(keep, src, base, feed=None, board=None):
     if board:
         board.close()
         vmf_status.set_quiet(False)
+        vmf_status.line_closed()
     return promote(w, src, base, winner)
 
 
