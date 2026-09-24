@@ -290,5 +290,119 @@ class CacheBeforeEnumerate(Tmp):
         self.assertEqual(self.raced, [])
 
 
+class FakeBoot:
+    # A runner replacement: first poll() writes the verdict marker and
+    # reports the runner exited (0 on pass, 1 on fail) — the shape the
+    # race loop's poll path expects.
+    def __init__(self, runs_dir, cand, verdict):
+        self.runs_dir, self.cand, self.verdict = runs_dir, cand, verdict
+        self.polled = 0
+
+    def poll(self):
+        self.polled += 1
+        if self.polled == 1:
+            open(os.path.join(self.runs_dir, "%s.verdict" % self.cand),
+                 "w").write(self.verdict)
+            return 0 if self.verdict == "pass" else 1
+        return 1
+
+    def terminate(self):
+        pass
+
+
+class Tranches(Tmp):
+    def setUp(self):
+        super().setUp()
+        self.runs = tempfile.mkdtemp(prefix="vmf-runs-", dir=self.tmp)
+        self.src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        vmf_race.RUNS = self.runs
+        self.boots = []
+        self.stops = []
+        self.old = (vmf_race.runner_cmd, vmf_race.stop_vm,
+                    vmf_race.subprocess.Popen, vmf_race.promote,
+                    vmf_race.bundle_key, vmf_race.STAGGER,
+                    vmf_race.DEADLINE, vmf_race.PARALLEL)
+        vmf_race.stop_vm = lambda name: self.stops.append(name)
+        vmf_race.promote = lambda w, src, base, winner: 0
+        vmf_race.bundle_key = lambda src: "testkey"
+        vmf_race.STAGGER = 0
+        vmf_race.DEADLINE = 600
+        self.env_backup = {}
+        for k in ("VMF_RACE_TRANCHE",):
+            self.env_backup[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        (vmf_race.runner_cmd, vmf_race.stop_vm,
+         vmf_race.subprocess.Popen, vmf_race.promote,
+         vmf_race.bundle_key, vmf_race.STAGGER,
+         vmf_race.DEADLINE, vmf_race.PARALLEL) = self.old
+        for k, v in self.env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _keep(self, entries):
+        out = []
+        for i, (kind, verdict) in enumerate(entries, 1):
+            cand = "x-c%d" % i
+            out.append({"i": i, "kind": kind, "cand": cand,
+                        "lp": os.path.join(self.runs, "%s.log" % cand),
+                        "image": None, "ports": [], "compose_file": None,
+                        "verdict": verdict})
+        return out
+
+    def _popen_for(self, keep):
+        by_cand = {k["cand"]: k for k in keep}
+
+        def popen(cmd, env=None, stdout=None, stderr=None, **_kw):
+            name = env["VMF_NAME"]
+            self.boots.append(name)
+            fake = FakeBoot(self.runs, name, by_cand[name]["verdict"])
+
+            class P:
+                def __init__(self):
+                    self.fake = fake
+                def poll(self):
+                    return fake.poll()
+                def terminate(self):
+                    pass
+            return P()
+        return popen
+
+    def test_cheap_band_boots_before_expensive(self):
+        os.environ["VMF_RACE_TRANCHE"] = "tranches"
+        keep = self._keep([("install_script", "pass"),   # T2
+                           ("prebuilt_image", "pass")])  # T0
+        vmf_race.subprocess.Popen = self._popen_for(keep)
+        rc = vmf_race.race(keep, self.src, "x")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.boots, ["x-c2"])  # c1 never booted
+
+    def test_escalation_after_band_failure(self):
+        os.environ["VMF_RACE_TRANCHE"] = "tranches"
+        keep = self._keep([("prebuilt_image", "fail (probe timeout)"),  # T0
+                           ("install_script", "pass")])                 # T2
+        vmf_race.subprocess.Popen = self._popen_for(keep)
+        rc = vmf_race.race(keep, self.src, "x")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.boots, ["x-c1", "x-c2"])
+
+    def test_all_mode_boots_everything_staggered(self):
+        keep = self._keep([("install_script", "fail"),   # T2
+                           ("prebuilt_image", "pass")])  # T0
+        vmf_race.subprocess.Popen = self._popen_for(keep)
+        rc = vmf_race.race(keep, self.src, "x")
+        self.assertEqual(rc, 0)
+        # all-mode: both boot (queue order), the pass crowns.
+        self.assertEqual(self.boots, ["x-c1", "x-c2"])
+
+    def test_cost_word_refines_band(self):
+        self.assertEqual(vmf_race.band_of(
+            {"kind": "install_script", "cost": "fast"}), 0)
+        self.assertEqual(vmf_race.band_of({"kind": "compose"}), 1)
+        self.assertEqual(vmf_race.band_of({"kind": "weird"}), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

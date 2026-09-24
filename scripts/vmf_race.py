@@ -401,6 +401,29 @@ def main(argv):
 
 
 
+# Tranche bands by method cost. The static map is the default; a plan
+# entry's cost word (fast/medium/slow/slowest, from the fan-out)
+# refines it. Band 0 boots first; a failed band escalates to the next.
+KIND_BAND = {"prebuilt_image": 0, "compose": 1, "dockerfile": 1,
+             "install_script": 2, "source_build": 3}
+COST_BAND = {"fast": 0, "medium": 1, "slow": 2, "slowest": 3}
+# Seconds a band owns before escalation (0 = rest of the race deadline).
+BAND_SECS = (480, 720, 900, 0)
+
+
+def band_of(k):
+    c = (k.get("cost") or "").strip().lower()
+    if c in COST_BAND:
+        return COST_BAND[c]
+    return KIND_BAND.get(k.get("kind"), 3)
+
+
+def tranche_mode():
+    return (os.environ.get("VMF_RACE_TRANCHE") or "all").strip().lower() \
+        == "tranches"
+
+
+
 def race(keep, src, base):
     # The staggered boot loop, the crown, and the promotion. Keep
     # entries carry i/kind/cand/lp/image/ports/compose_file.
@@ -409,7 +432,23 @@ def race(keep, src, base):
     winner = None
     started = time.time()
     last_event = started
-    queue = list(keep)
+    # Tranche bands: cheapest methods first; a band that exhausts its
+    # verdicts escalates to the next. "all" (default) races everything
+    # at once, exactly as before the bands existed.
+    bands = [[] for _ in range(4)]
+    for k in keep:
+        bands[band_of(k)].append(k)
+    if tranche_mode():
+        say("tranches: " + " | ".join(
+            ("T%d %s" % (i, ",".join(x["kind"] for x in b))) if b
+            else ("T%d -" % i)
+            for i, b in enumerate(bands)))
+        groups = [(i, b) for i, b in enumerate(bands) if b]
+    else:
+        groups = [(0, list(keep))]
+    queue = []
+    band_no = 0
+    band_start = 0.0
     # Reruns reuse candidate names: stale verdict markers would poison
     # the poll (and the crown).
     for k in keep:
@@ -419,7 +458,7 @@ def race(keep, src, base):
                 os.unlink(p)
             except OSError:
                 pass
-    while queue or running:
+    while queue or running or groups:
         now = time.time()
         # Stagger: the next candidate starts STAGGER seconds after the
         # last race event (a start, a verdict, or a failure). Cheapest
@@ -492,6 +531,36 @@ def race(keep, src, base):
                 r["log"].close()
                 r["proc"].terminate()
             say("race deadline reached")
+            break
+        # Band deadline: the band owns its slice of the clock; hanging
+        # candidates (and unstarted queue entries) yield to the next
+        # band when it lapses.
+        band_secs = BAND_SECS[band_no] if tranche_mode() else 0
+        if band_secs and now - band_start > band_secs:
+            for cand, r in running.items():
+                verdicts.setdefault(cand, "fail (band T%d deadline)" % band_no)
+                r["log"].close()
+                r["proc"].terminate()
+                running_state.pop(cand, None)
+            for k in queue:
+                verdicts.setdefault(
+                    k["cand"], "fail (band T%d deadline; not started)" % band_no)
+            running.clear()
+            queue = []
+        if not queue and not running and groups:
+            if winner:
+                break
+            nxt_no, nxt = groups.pop(0)
+            if tranche_mode() and nxt and band_start:
+                say("tranche T%d failed; escalate to T%d" % (band_no, nxt_no))
+            band_no, queue = nxt_no, list(nxt)
+            band_start = time.time()
+            if tranche_mode() and queue:
+                say("tranche T%d: %d candidate(s) (%s)" % (
+                    band_no, len(queue),
+                    ",".join(x["kind"] for x in queue)))
+            continue
+        if not queue and not running and not groups:
             break
         time.sleep(2)
 
