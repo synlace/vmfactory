@@ -72,9 +72,13 @@ esac
 # repair agent gets medium (iterative turns over a live VM). Intent
 # stays lean (bounded-vocab pointer work). Env overrides per role;
 # VMF_REASONING=off disables everywhere.
-body=$(VMF_ROLE="$role" python3 - "$model" "$prompt" <<'PY'
+# The prompt rides STDIN (the -c script keeps argv for the model only):
+# grounded prompts (repo evidence + context7 docs) exceed the per-arg
+# exec limit (E2BIG: "Argument list too long").
+body=$(printf '%s' "$prompt" | VMF_ROLE="$role" python3 -c '
 import json, os, sys
-model, prompt = sys.argv[1], sys.argv[2]
+model = sys.argv[1]
+prompt = sys.stdin.read()
 role = os.environ.get("VMF_ROLE", "")
 effort = {"gapfill": "high", "agent": "medium"}.get(role)
 if os.environ.get("VMF_REASONING", "").strip().lower() == "off":
@@ -99,18 +103,20 @@ msg = {
 if effort:
     msg["reasoning"] = {"effort": effort}
 print(json.dumps(msg))
-PY
-)
+' "$model")
 
-resp=$(curl -sS --max-time "${VMF_LLM_TIMEOUT:-$timeout_default}" "$base/chat/completions" \
+# The body rides stdin as well (-d @-): the same E2BIG ceiling.
+resp=$(printf '%s' "$body" | curl -sS --max-time "${VMF_LLM_TIMEOUT:-$timeout_default}" "$base/chat/completions" \
   -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
-  -d "$body" 2>&1) || { echo "llm.sh: request failed: $resp" >&2; exit 3; }
+  -d @- 2>&1) || { echo "llm.sh: request failed: $resp" >&2; exit 3; }
 
-python3 - "$resp" <<'PY' || { echo "llm.sh: unexpected API response" >&2; exit 3; }
+# The response rides stdin too: a grounded repair answer can exceed
+# the per-arg exec limit just like the prompt.
+printf '%s' "$resp" | python3 -c '
 import json, sys
 try:
-    r = json.loads(sys.argv[1])
+    r = json.loads(sys.stdin.read())
     print(r["choices"][0]["message"]["content"])
 except Exception:
     sys.exit(1)
-PY
+' || { echo "llm.sh: unexpected API response" >&2; exit 3; }
