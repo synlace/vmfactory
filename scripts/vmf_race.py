@@ -530,6 +530,15 @@ def race(keep, src, base):
             stop_vm(k["cand"])
 
     # Promotion: boot the canonical name from the winner's data drive.
+    return promote(w, src, base, winner)
+
+
+
+def promote(w, src, base, winner):
+    # Boot the winning candidate's spec under the canonical name; a
+    # transient failure (partial boot, slow verdict) retries once. The
+    # verdict marker must be unlinked before EVERY attempt: a stale
+    # marker from a rerun would satisfy the wait loop instantly.
     say("promotion: stopping %s" % winner)
     stop_vm(winner)
     # Slirp winners must release their host ports before the canonical
@@ -557,26 +566,46 @@ def race(keep, src, base):
                 s.close()
                 time.sleep(1)
     time.sleep(2)
-    cmd, env = runner_cmd(w["kind"], base, src, w["image"], w["ports"], w.get("compose_file"))
-    env["VMF_NAME"] = base
-    say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)" % (base, base))
-    log = open(w["lp"], "a")
-    log.write("\n===== promotion (%s) =====\n" % base)
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-    proc.wait()
-    # The detached runner returns before its verify chain finishes: the
-    # verdict marker (and the rendered target) land minutes later. Wait
-    # for the marker instead of defaulting to pass on a missing verdict.
-    vpath = verdict_path(base)
-    deadline = time.time() + int(os.environ.get("VMF_PROMOTION_WAIT", "900"))
-    while not os.path.isfile(vpath) and time.time() < deadline:
-        time.sleep(2)
+    promote_tries = int(os.environ.get("VMF_PROMOTION_TRIES") or "2")
     status = "fail (no verdict)"
-    if os.path.isfile(vpath):
-        with open(vpath) as f:
-            status = f.read().strip() or "pass"
-    log.close()
-    say("promotion %s: %s" % (base, status))
+    for attempt in range(1, promote_tries + 1):
+        if attempt > 1:
+            say("promotion: retry %d/%d (fresh boot under %s)"
+                % (attempt, promote_tries, base))
+        cmd, env = runner_cmd(w["kind"], base, src, w["image"],
+                              w["ports"], w.get("compose_file"))
+        env["VMF_NAME"] = base
+        say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)"
+            % (base, base))
+        log = open(w["lp"], "a")
+        log.write("\n===== promotion (%s)%s =====\n"
+                  % (base, "" if attempt == 1
+                     else " retry %d" % attempt))
+        vpath = verdict_path(base)
+        try:
+            os.unlink(vpath)
+        except OSError:
+            pass
+        proc = subprocess.Popen(cmd, env=env, stdout=log,
+                                stderr=subprocess.STDOUT)
+        proc.wait()
+        # The detached runner returns before its verify chain finishes: the
+        # verdict marker (and the rendered target) land minutes later. Wait
+        # for the marker instead of defaulting to pass on a missing verdict.
+        deadline = time.time() + int(os.environ.get("VMF_PROMOTION_WAIT", "900"))
+        while not os.path.isfile(vpath) and time.time() < deadline:
+            time.sleep(2)
+        status = "fail (no verdict)"
+        if os.path.isfile(vpath):
+            with open(vpath) as f:
+                status = f.read().strip() or "pass"
+        log.close()
+        say("promotion %s: %s" % (base, status))
+        if status == "pass":
+            break
+        if attempt < promote_tries:
+            stop_vm(base)
+            time.sleep(2)
     # The rendered deliverable from the promoted instance's conf: the
     # bump (or the future per-VM IP) is visible at the end of the run.
     try:

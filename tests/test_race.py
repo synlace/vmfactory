@@ -120,5 +120,98 @@ class CacheAllowed(unittest.TestCase):
         self.assertFalse(vmf_race.cache_allowed())
 
 
+class Promotion(Tmp):
+    def setUp(self):
+        super().setUp()
+        self.runs = tempfile.mkdtemp(prefix="vmf-runs-", dir=self.tmp)
+        self.src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        vmf_race.RUNS = self.runs
+        self.stops = []
+        self.boots = []
+        self.old_stop, self.old_cmd = vmf_race.stop_vm, vmf_race.runner_cmd
+        self.old_popen = vmf_race.subprocess.Popen
+        self.old_key = vmf_race.tree_key
+        vmf_race.stop_vm = lambda name: self.stops.append(name)
+        vmf_race.tree_key = lambda src: "testkey"
+        self.old_tries = os.environ.pop("VMF_PROMOTION_TRIES", None)
+        self.old_wait = os.environ.pop("VMF_PROMOTION_WAIT", None)
+        os.environ["VMF_PROMOTION_WAIT"] = "1"
+
+    def tearDown(self):
+        vmf_race.stop_vm = self.old_stop
+        vmf_race.runner_cmd = self.old_cmd
+        vmf_race.subprocess.Popen = self.old_popen
+        vmf_race.tree_key = self.old_key
+        if self.old_tries is None:
+            os.environ.pop("VMF_PROMOTION_TRIES", None)
+        else:
+            os.environ["VMF_PROMOTION_TRIES"] = self.old_tries
+        if self.old_wait is None:
+            os.environ.pop("VMF_PROMOTION_WAIT", None)
+        else:
+            os.environ["VMF_PROMOTION_WAIT"] = self.old_wait
+
+    def _w(self):
+        return {"i": 1, "kind": "install_script", "cand": "web-c1",
+                "lp": os.path.join(self.runs, "web-c1.log"),
+                "image": None, "ports": [], "compose_file": None}
+
+    def _fake_boots(self, verdicts):
+        # Each fake boot writes the next verdict marker on wait() —
+        # like a detached runner chain would.
+        vdir = self.runs
+
+        def popen(cmd, env=None, stdout=None, stderr=None, **_kw):
+            self.boots.append(cmd)
+            idx = len(self.boots) - 1
+
+            class P:
+                def __init__(self, idx):
+                    self.idx = idx
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_a):
+                    return False
+                def wait(self):
+                    v = verdicts[min(self.idx, len(verdicts) - 1)]
+                    open(os.path.join(vdir, "web.verdict"), "w").write(v)
+                    return 0
+            return P(idx)
+        return popen
+
+    def test_retry_recovers_transient_failure(self):
+        os.environ["VMF_PROMOTION_TRIES"] = "2"
+        vmf_race.subprocess.Popen = self._fake_boots(
+            ["fail (probe timeout)", "pass"])
+        rc = vmf_race.promote(self._w(), self.src, "web", "web-c1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.boots), 2)
+        self.assertIn("web", self.stops)
+        rec = vmf_race.load_winner(self.src)
+        self.assertEqual(rec["approach"], "install_script")
+
+    def test_both_attempts_fail_exit_one(self):
+        os.environ["VMF_PROMOTION_TRIES"] = "2"
+        vmf_race.subprocess.Popen = self._fake_boots(
+            ["fail (probe timeout)", "fail (probe timeout)"])
+        rc = vmf_race.promote(self._w(), self.src, "web", "web-c1")
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.boots), 2)
+        self.assertIsNone(vmf_race.load_winner(self.src))
+
+    def test_stale_verdict_marker_never_satisfies_wait(self):
+        # A leftover verdict from a rerun must be unlinked before the
+        # first boot, or the wait loop returns instantly.
+        open(os.path.join(self.runs, "web.verdict"), "w").write("fail (x)")
+        os.environ["VMF_PROMOTION_TRIES"] = "1"
+        popen = self._fake_boots(["pass"])
+        vmf_race.subprocess.Popen = popen
+        rc = vmf_race.promote(self._w(), self.src, "web", "web-c1")
+        self.assertEqual(rc, 0)
+        # The marker read after boot is the new one, not the stale one.
+        with open(os.path.join(self.runs, "web.verdict")) as f:
+            self.assertEqual(f.read().strip(), "pass")
+
+
 if __name__ == "__main__":
     unittest.main()
