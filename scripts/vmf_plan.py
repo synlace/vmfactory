@@ -852,9 +852,12 @@ def translate(compose_path, src, root):
                 if str(test[0]) == "CMD-SHELL" and len(test) > 1:
                     cmd = str(test[1])
                 elif str(test[0]) == "CMD" and len(test) > 1:
-                    # CMD form is an argv list; the whole argv is the
-                    # command (str(test[1]) alone drops the args).
-                    cmd = " ".join(str(x) for x in test[1:])
+                    # CMD form is an argv list rejoined for sh -c: keep
+                    # tokens with spaces whole ('-e SELECT 1') but leave
+                    # ${VAR:-default} raw so the exec env expands it.
+                    cmd = " ".join(
+                        "'%s'" % x if " " in str(x) else str(x)
+                        for x in test[1:])
                 else:
                     cmd = " ".join(str(x) for x in test)
                 # The check rides the service name: the verify runner

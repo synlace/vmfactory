@@ -324,8 +324,13 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
     # Candidates pay boot + in-guest install latency; the default
     # verify deadline (built for fast images) expires mid-install.
     # Compose dev stacks boot even slower: ghost's first-run
-    # migrations finished AFTER a 420s window expired (measured).
-    env.setdefault("VMF_VERIFY_SECS", "660" if kind == "compose" else "420")
+    # migrations finished ~2 min AFTER a 660s window expired
+    # (measured 13:26-13:39). 900s covers image loads + migrations.
+    env.setdefault("VMF_VERIFY_SECS", "900" if kind == "compose" else "420")
+    # The detached runner chains python subprocesses; without this the
+    # verify's progress lines sit in the block buffer and a healthy
+    # run looks wedged in the logs.
+    env.setdefault("PYTHONUNBUFFERED", "1")
     env.pop("VMF_RUN_INTENT", None)
     if kind in ("source_build", "install_script"):
         # Repo-install kinds run the gap-fill direct flow on the real
