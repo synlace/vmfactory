@@ -294,7 +294,7 @@ The plan pipeline lives in `scripts/vmf_plan.py` (plan / variant /
 refine / flatten / ports / classify / profile) with file contracts in
 `schemas/plan.schema.json` and `schemas/refines.schema.json`; tests in
 `tests/` run without qemu or a model
-(`uv run --with pyyaml --with jsonschema python -m unittest discover tests`).
+(`uv run --with pyyaml --with jsonschema --with rich python -m unittest discover tests`).
 
 Multi-project repos (one compose per lab) never guess: every candidate
 compose file under the root or the first two directory levels gets a

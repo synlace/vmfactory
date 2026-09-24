@@ -3,8 +3,13 @@
 #
 # usage: vmf_race.py <src>
 #
-# The enumeration (vmf_plan.py enumerate) supplies the approach table.
-# Each candidate materializes as an oci-run invocation:
+# The route scout (vmf_plan.py scout) supplies the approach table as a
+# JSONL stream: one route per line, in emission order, plus a final
+# summary. The race drains the file every tick, so the first scouted
+# route boots while the scout still reads. When the scout yields
+# nothing (off, failed, zero routes), the per-method fan-out plans on
+# paper instead, and the enumerate stays as the last fallback:
+#   scout           streaming routes; boots race as they arrive
 #   compose         oci-run.sh <src>            (real repo; compose found)
 #   dockerfile      oci-run.sh <tmpdir>         (synthetic 1-service compose)
 #   prebuilt_image  oci-run.sh <tmpdir>         (synthetic compose, image ref)
@@ -16,6 +21,8 @@
 #
 # Env: VMF_RACE_MODE=plan  — table only, boot nothing (exit 0/1)
 #      VMF_RACE_APPROACH / VMF_RACE_SKIP — name or number filters (csv)
+#      VMF_RACE_SCOUT=0   — skip the scout, fan out directly
+#      VMF_SCOUT_TURNS (3) VMF_SCOUT_FIRST (120) VMF_SCOUT_DEADLINE (240)
 #      VMF_RACE_STAGGER (10) VMF_RACE_PARALLEL (2) VMF_RACE_DEADLINE (2700)
 #      VMF_RACE_CHILD=1    — candidate runners must not re-enter the race
 #      VMF_RACE_SKIP_CACHE=1 — ignore the winner cache for this run
@@ -30,6 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vmf_status
+import vmf_ui
 
 RUNS = os.environ.get("VMF_RUNS") or os.path.expanduser("~/.vmf/runs")
 GEN = os.environ.get("VMF_GENERATED") \
@@ -85,6 +93,7 @@ def save_winner(src, w, cand):
     rec = {"approach": w["kind"], "image": w.get("image"),
            "ports": w.get("ports") or [],
            "compose_file": w.get("compose_file"),
+           "method": w.get("method") or "",
            "by": cand, "url": os.environ.get("VMF_COMPOSE_URL", ""),
            "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     d = os.path.join(GEN, k)
@@ -221,6 +230,106 @@ def load_approaches(src):
         return []
 
 
+def scout_enabled():
+    return os.environ.get("VMF_RACE_SCOUT", "1") != "0"
+
+
+class ScoutFeed:
+    # Streams scout emissions into the race: the scout subprocess
+    # appends one JSON route per line to a JSONL file as it reads; the
+    # race drains the file every tick, so the first scouted route can
+    # boot while the scout still reads. The file (not the pipe) is the
+    # contract.
+    def __init__(self, src, log=None):
+        self.out = os.path.join(RUNS, ".race-scout.jsonl")
+        self.routes = 0
+        self.summary = None
+        self.summary_taken = False
+        self._consumed = 0
+        try:
+            os.unlink(self.out)
+        except OSError:
+            pass
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.join(SCRIPTS, "vmf_plan.py"),
+             "scout", src, self.out],
+            stdout=log or subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def kill(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def wait_first(self, timeout):
+        # Block until the first route lands, the scout exits, or the
+        # timeout lapses. Returns the drained routes (possibly several)
+        # or None when the scout yielded nothing usable.
+        end = time.time() + max(10, timeout)
+        while time.time() < end:
+            got = self.drain()
+            if got:
+                return got
+            if not self.alive():
+                return self.drain() or None
+            time.sleep(1)
+        return None
+
+    def drain(self):
+        out = []
+        try:
+            with open(self.out) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return out
+        while self._consumed < len(lines):
+            ln = lines[self._consumed]
+            self._consumed += 1
+            try:
+                j = json.loads(ln)
+            except ValueError:
+                continue
+            if "summary" in j:
+                self.summary = j["summary"]
+                continue
+            if j.get("kind"):
+                out.append(j)
+        self.routes += len(out)
+        return out
+
+
+def _route_allowed(r, i):
+    # Streaming twin of apply_filters: kind, method, or number.
+    handles = {r.get("kind"), r.get("method"), str(i)}
+    only = {x.strip() for x in
+            (os.environ.get("VMF_RACE_APPROACH") or "").split(",") if x.strip()}
+    skip = {x.strip() for x in
+            (os.environ.get("VMF_RACE_SKIP") or "").split(",") if x.strip()}
+    if only and not (handles & only):
+        return False
+    if skip and (handles & skip):
+        return False
+    return True
+
+
+def _keep_entry(i, r, logdir, base):
+    cand = "%s-c%d" % (base, i)
+    detail = r.get("image") or r.get("compose_file") or ""
+    if not detail and isinstance(r.get("direct"), dict):
+        cmd = r["direct"].get("command") or []
+        detail = " ".join(str(x) for x in cmd)[:40]
+    return {"i": i, "kind": r.get("kind"), "cand": cand,
+            "lp": os.path.join(logdir, "%s.log" % cand),
+            "image": r.get("image"), "ports": r.get("ports") or [],
+            "compose_file": r.get("compose_file"),
+            "method": r.get("method") or "", "cite": r.get("cite") or "",
+            "cost": r.get("cost") or "", "detail": str(detail)[:40]}
+
+
 def apply_filters(approaches):
     only = [x.strip() for x in
             (os.environ.get("VMF_RACE_APPROACH") or "").split(",") if x.strip()]
@@ -311,7 +420,8 @@ def satisfiable(kind, src, image, ports, log, compose_file=None):
     return True
 
 
-def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
+def runner_cmd(kind, name, src, image, ports=None, compose_file=None,
+               method=None):
     # Candidates re-enter oci-run as children; the marker env stops the
     # race from re-entering. --yes/--ssh ride the runner args.
     env = dict(os.environ)
@@ -336,8 +446,13 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None):
     if kind in ("source_build", "install_script"):
         # Repo-install kinds run the gap-fill direct flow on the real
         # source dir; a synthetic compose would need an image the plan
-        # does not carry (the "None" registry pull).
+        # does not carry (the "None" registry pull). A scouted route
+        # replays its OWN plan (direct-<method>.json); the shared pkg
+        # plan (direct.json) stays the unspecific fallback.
         env["VMF_PLAN_SKIP_COMPOSE"] = "1"
+        if method and re.fullmatch(r"[a-z0-9_-]{1,24}", method) \
+                and method != "pkg":
+            env["VMF_PLAN_DIRECT"] = method
         args = [src]
     elif kind == "compose":
         # The enumeration may name the compose file the dev script uses
@@ -362,6 +477,7 @@ def _die(signum, _frame):
     # Killed races must not orphan candidate VMs: reap everything this
     # race started, then exit.
     say("killed (signal %d); reaping candidates" % signum)
+    _board_close()
     for cand in list(running_state):
         r = running_state[cand]
         try:
@@ -378,6 +494,18 @@ def _die(signum, _frame):
 
 running_state = {}
 _die_base = ""
+_board_ref = {}
+
+
+def _board_close():
+    b = _board_ref.get("b")
+    if b:
+        try:
+            b.close()
+        except Exception:
+            pass
+        _board_ref["b"] = None
+        vmf_status.set_quiet(False)
 
 
 def main(argv):
@@ -431,7 +559,8 @@ def main(argv):
             keep = [{"i": 1, "kind": w["approach"], "cand": cand,
                      "lp": os.path.join(logdir, "%s.log" % cand),
                      "image": w.get("image"), "ports": w.get("ports") or [],
-                     "compose_file": w.get("compose_file"), "cached": True}]
+                     "compose_file": w.get("compose_file"),
+                     "method": w.get("method") or "", "cached": True}]
             say("winner cache: replay %s (%s)" % (
                 w["approach"], w.get("url") or "same tree"))
             vmf_status.event(base, "replay", w["approach"])
@@ -443,6 +572,34 @@ def main(argv):
             except OSError:
                 pass
             say("winner cache: replay failed; racing the full field")
+
+    # The scout fast path: streaming routes race as they arrive. A
+    # scout that yields nothing (off, transport failure, zero routes)
+    # falls back to the fan-out below — never a new failure mode.
+    if scout_enabled():
+        feed = ScoutFeed(src, log=open(RACE_LOG, "a") if RACE_LOG else None)
+        vmf_status.event(base, "scout", "reading repo + releases")
+        say("scout: reading repo + releases")
+        first = feed.wait_first(
+            int(os.environ.get("VMF_SCOUT_FIRST") or 120))
+        if first:
+            say("scout: %d route(s) before the race; feed stays live"
+                % len(first))
+            vmf_status.event(base, "plan", "scout: %d route(s)"
+                             % len(first))
+            rc = race_scout(feed, first, src, base)
+            if rc is not None:
+                return rc
+            say("scout: routes filtered out; falling back to fan-out")
+        else:
+            feed.kill()
+            say("scout: no routes (%s); falling back to fan-out"
+                % ("done" if not feed.alive() else "timeout"))
+        if RACE_LOG:
+            try:
+                os.unlink(feed.out)
+            except OSError:
+                pass
 
     approaches = apply_filters(load_approaches(src))
     if not approaches:
@@ -473,6 +630,46 @@ def main(argv):
     return race(keep, src, base)
 
 
+def race_scout(feed, first, src, base):
+    # The scout fast path: the first scouted route(s) enter the race
+    # immediately; the feed keeps streaming later routes into the boot
+    # loop, so a route the scout finds at t+30s still boots at t+35s.
+    # The rich board (when the terminal allows it) renders the lane
+    # view; status files and the race log stay the plain source of
+    # truth. Scout routes are structurally pruned at clamp time (image,
+    # ports, command), so no plan-stage prune here: the scout IS the
+    # plan, and the verify arbitrates honestly.
+    logdir = os.path.join(RUNS, "race-logs")
+    os.makedirs(logdir, exist_ok=True)
+    keep = []
+    for r in first:
+        i = len(keep) + 1
+        if not _route_allowed(r, i):
+            say("%d %s .. filtered" % (i, r.get("kind")))
+            continue
+        keep.append(_keep_entry(i, r, logdir, base))
+    if not keep:
+        feed.kill()
+        return None
+    board = None
+    if vmf_ui.available() and os.environ.get("VMF_LOUD") != "1":
+        board = vmf_ui.Board(base)
+        if board.ok:
+            vmf_status.set_quiet(True)
+            _board_ref["b"] = board
+            board.stage("scout · reading repo + releases")
+            for k in keep:
+                board.lane(k["method"] or k["kind"], "plan",
+                           k["detail"], k["cite"],
+                           "%s/T%d" % (k["cost"], band_of(k)))
+    if not tranche_mode():
+        say("scout: %d route(s) in flight; the scout keeps reading"
+            % len(keep))
+    rc = race(keep, src, base, feed=feed, board=board)
+    _board_close()
+    return rc
+
+
 
 # Tranche bands by method cost. The static map is the default; a plan
 # entry's cost word (fast/medium/slow/slowest, from the fan-out)
@@ -497,9 +694,12 @@ def tranche_mode():
 
 
 
-def race(keep, src, base):
+def race(keep, src, base, feed=None, board=None):
     # The staggered boot loop, the crown, and the promotion. Keep
-    # entries carry i/kind/cand/lp/image/ports/compose_file.
+    # entries carry i/kind/cand/lp/image/ports/compose_file; scout
+    # entries add method/cite/cost/detail. A live feed streams more
+    # keep entries in as the scout emits them; the board (when active)
+    # renders the same events as lanes.
     running = {}
     verdicts = {}
     winner = None
@@ -517,9 +717,14 @@ def race(keep, src, base):
             else ("T%d -" % i)
             for i, b in enumerate(bands)))
         groups = [(i, b) for i, b in enumerate(bands) if b]
+        queue = []
     else:
-        groups = [(0, list(keep))]
-    queue = []
+        # all-mode: the queue holds everything from the start; the
+        # scout feed appends behind it in emission order. (A group-pop
+        # snapshot would drop feed entries drained before the first
+        # pop.)
+        groups = []
+        queue = list(keep)
     band_no = 0
     band_start = 0.0
     # Reruns reuse candidate names: stale verdict markers would poison
@@ -531,15 +736,60 @@ def race(keep, src, base):
                 os.unlink(p)
             except OSError:
                 pass
-    while queue or running or groups:
+    while queue or running or groups or (feed and feed.alive()):
         now = time.time()
+        # The feed drains first: a freshly scouted route joins the
+        # queue in emission order, behind whatever is already queued.
+        if feed:
+            logdir = os.path.join(RUNS, "race-logs")
+            for r in feed.drain():
+                i = len(keep) + 1
+                if not _route_allowed(r, i):
+                    say("%d %s .. filtered" % (i, r.get("kind")))
+                    if board:
+                        board.lane(r.get("method") or "?", "parked",
+                                   "filtered out")
+                    continue
+                k = _keep_entry(i, r, logdir, base)
+                keep.append(k)
+                queue.append(k)
+                # Reruns reuse candidate names: a drained entry must
+                # clear stale verdict markers like the initial keep.
+                for p in (os.path.join(RUNS, "%s.verdict" % k["cand"]),
+                          os.path.join(RUNS, k["cand"], "verdict")):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+                say("%d %s .. scouted (%s)" % (
+                    i, r.get("kind"), r.get("cite")
+                    or r.get("evidence") or ""))
+                vmf_status.event(base, "plan", "scout: %s route"
+                                 % (k["method"] or k["kind"]))
+                if board:
+                    board.lane(k["method"] or k["kind"], "plan",
+                               k["detail"], k["cite"],
+                               "%s/T%d" % (k["cost"], band_of(k)))
+            if not feed.alive() and not feed.summary_taken:
+                feed.summary_taken = True
+                s = feed.summary or {}
+                if board:
+                    board.chips(skipped=len(s.get("skipped") or []),
+                                llm=s.get("llm") or 0)
+                    if s.get("skipped"):
+                        board.note("skipped · %s"
+                                   % " · ".join(s["skipped"]))
+                say("scout: done (%d route(s), %d llm call(s))"
+                    % (feed.routes, s.get("llm") or 0))
         # Stagger: the next candidate starts STAGGER seconds after the
         # last race event (a start, a verdict, or a failure). Cheapest
         # boots first; usually it wins alone.
         if (queue and len(running) < PARALLEL
                 and now - last_event >= STAGGER):
             k = queue.pop(0)
-            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"], k["ports"], k.get("compose_file"))
+            cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"],
+                                  k["ports"], k.get("compose_file"),
+                                  k.get("method"))
             log = open(k["lp"], "a")
             log.write("\n===== boot =====\n")
             proc = subprocess.Popen(cmd, env=env, stdout=log,
@@ -551,6 +801,12 @@ def race(keep, src, base):
             say("%d %s .. started (%s)" % (k["i"], k["kind"], k["cand"]))
             vmf_status.event(base, "T%d" % band,
                              "c%d %s boot" % (k["i"], k["kind"]))
+            if board:
+                board.lane(k["method"] or k["kind"], "booting",
+                           k.get("detail"), k.get("cite"),
+                           "%s/T%d" % (k.get("cost"), band))
+                board.stage(("scout + boot " if feed and feed.alive()
+                             else "boot ") + (k["method"] or k["kind"]))
             last_event = now
         # Poll verdicts and dead runners.
         for cand in list(running):
@@ -590,6 +846,16 @@ def race(keep, src, base):
                 vmf_status.event(base, "T%d" % r.get("band", 3),
                                  "c%d %s %s" % (r["i"], r["kind"],
                                                 verdicts[cand][:24]))
+                if board:
+                    ok = verdicts[cand] == "pass"
+                    board.lane(r.get("method") or r["kind"],
+                               "pass" if ok else "parked",
+                               "" if ok else verdicts[cand][:40],
+                               r.get("cite"))
+                    if winner:
+                        board.stage("pass")
+                    elif not (feed and feed.alive()):
+                        board.stage("boot")
                 r["log"].close()
                 r["proc"].terminate()
                 del running[cand]
@@ -641,6 +907,11 @@ def race(keep, src, base):
                     ",".join(x["kind"] for x in queue)))
             continue
         if not queue and not running and not groups:
+            if feed and feed.alive():
+                # The scout still reads; wait for its routes instead of
+                # declaring the field empty.
+                time.sleep(2)
+                continue
             break
         time.sleep(2)
 
@@ -654,6 +925,8 @@ def race(keep, src, base):
                 cand, status, os.path.join(RUNS, "race-logs",
                                            "%s.log" % cand)))
         say("rerun with --approach <name|number> to retry one approach")
+        if board:
+            board.stage("fail")
         vmf_status.event(base, "fail", "no working service", final=True)
         return 1
 
@@ -681,6 +954,11 @@ def race(keep, src, base):
             stop_vm(k["cand"])
 
     # Promotion: boot the canonical name from the winner's data drive.
+    # The board hands the terminal back to the one-line status first
+    # (the promote wait is a future rich seam, not this slice).
+    if board:
+        board.close()
+        vmf_status.set_quiet(False)
     return promote(w, src, base, winner)
 
 
@@ -724,7 +1002,8 @@ def promote(w, src, base, winner):
             say("promotion: retry %d/%d (fresh boot under %s)"
                 % (attempt, promote_tries, base))
         cmd, env = runner_cmd(w["kind"], base, src, w["image"],
-                              w["ports"], w.get("compose_file"))
+                              w["ports"], w.get("compose_file"),
+                              w.get("method"))
         env["VMF_NAME"] = base
         say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)"
             % (base, base))

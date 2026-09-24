@@ -28,6 +28,16 @@ class Tmp(unittest.TestCase):
         self.old_status_runs = vmf_status.RUNS
         vmf_status.RUNS = self.tmp
         self.addCleanup(setattr, vmf_status, "RUNS", self.old_status_runs)
+        # main() must never spawn the scout subprocess (a real LLM
+        # call); scout wiring is test_scout.py's job.
+        self.old_scout_env = os.environ.pop("VMF_RACE_SCOUT", None)
+        os.environ["VMF_RACE_SCOUT"] = "0"
+        self.addCleanup(self._restore_scout_env)
+
+    def _restore_scout_env(self):
+        os.environ.pop("VMF_RACE_SCOUT", None)
+        if self.old_scout_env is not None:
+            os.environ["VMF_RACE_SCOUT"] = self.old_scout_env
 
 
 class WinnerKey(unittest.TestCase):
@@ -265,8 +275,10 @@ class CacheBeforeEnumerate(Tmp):
             self.raced.append((keep, base)) or 0)
         self.env_backup = {}
         for k in ("VMF_RACE_MODE", "VMF_RACE_SKIP_CACHE",
-                  "VMF_RACE_APPROACH", "VMF_RACE_SKIP", "VMF_NAME"):
+                  "VMF_RACE_APPROACH", "VMF_RACE_SKIP", "VMF_NAME",
+                  "VMF_RACE_SCOUT"):
             self.env_backup[k] = os.environ.pop(k, None)
+        os.environ["VMF_RACE_SCOUT"] = "0"
 
     def tearDown(self):
         (vmf_race.bundle_key, vmf_race.load_winner,

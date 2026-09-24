@@ -255,6 +255,21 @@ def gapfill(root, plan_out):
         shutil.copy(cache, os.path.join(root, "compose.yaml"))
         return
     dcache = os.path.join(gen, "direct.json")
+    # A scout route boots its OWN direct plan (direct-<method>.json,
+    # written by the scout); the fan-out/pkg plan (direct.json) stays
+    # the shared fallback when no per-method plan exists.
+    dm = (os.environ.get("VMF_PLAN_DIRECT") or "").strip()
+    if dm and re.fullmatch(r"[a-z0-9_-]{1,24}", dm):
+        alt = os.path.join(gen, "direct-%s.json" % dm)
+        if os.path.isfile(alt):
+            dcache = alt
+        else:
+            # The route's own plan vanished (cache-cleaned mid-race):
+            # fail this candidate honestly rather than boot the shared
+            # pkg plan under the wrong method.
+            sys.stderr.write("error: no direct plan for method '%s' (%s "
+                             "missing)\n" % (dm, alt))
+            sys.exit(1)
     # Sidecar for the verify-revision loop: the gap-fill cache key is
     # content-derived (repo evidence hash), so compose-run carries the
     # cache dir to oci-run instead of recomputing it.
@@ -1293,7 +1308,8 @@ def usage():
         "  profile <kind> <path-or-ref>    evidence-based VM profile\n"
         "  intent <image> <phrase> <out>   plain-image --intent setup plan\n"
         "  cache-key <src>                 winner-cache key (bundle+compose)\n"
-        "  fanout <src> <out.json>         parallel per-method planners\n")
+        "  fanout <src> <out.json>         parallel per-method planners\n"
+        "  scout <src> <out.jsonl>         streaming route scout (JSONL)\n")
 
 
 KINDS = ("git-url", "dir", "image", "image-tar", "compose-file", "dockerfile",
@@ -2087,6 +2103,26 @@ def _root_compose_variants(root):
     return out[:6]
 
 
+def _clamp_direct(j, ports):
+    # The pkg/release/source payload the guest boot replays (the
+    # gap-fill direct shape). A command is mandatory; everything else
+    # clamps or degrades to its default.
+    cmd = [str(x) for x in (j.get("command") or [])][:16]
+    if not cmd:
+        return None
+    return {"base_image": str(j.get("base_image") or ""),
+            "install": [str(x) for x in (j.get("install") or [])][:20],
+            "command": cmd, "ports": ports,
+            "checks": _clamp_checks(j.get("checks")),
+            "images": _clamp_images(j.get("images")),
+            "env": {str(k): str(v)
+                    for k, v in (j.get("env") or {}).items()},
+            "needs_docker": bool(j.get("needs_docker")),
+            "memory_mb": _clamp_memory(j.get("memory_mb"),
+                                       j.get("needs_docker")),
+            "notes": str(j.get("notes") or "")[:120]}
+
+
 def fanout_cmd(src, out):
     # Parallel per-method planners over one shared evidence bundle.
     # Every method answers plan-or-blocked on paper; the race boots
@@ -2236,19 +2272,8 @@ def fanout_cmd(src, out):
         cmd = [str(x) for x in (j.get("command") or [])][:16]
         if not cmd:
             return None, "no command"
-        payload = {"base_image": "",
-                   "install": [str(x) for x in (j.get("install") or [])][:20],
-                   "command": cmd, "ports": ports,
-                   "checks": _clamp_checks(j.get("checks")),
-                   "images": _clamp_images(j.get("images")),
-                   "env": {str(k): str(v)
-                           for k, v in (j.get("env") or {}).items()},
-                   "needs_docker": bool(j.get("needs_docker")),
-                   "memory_mb": _clamp_memory(j.get("memory_mb"),
-                                              j.get("needs_docker")),
-                   "notes": str(j.get("notes") or "")[:120]}
         return {"kind": FANOUT_KIND[m], "ports": ports,
-                "direct": payload, "notes": notes}, None
+                "direct": _clamp_direct(j, ports), "notes": notes}, None
 
     os.makedirs(gen, exist_ok=True)
     runnable = {}
@@ -2336,6 +2361,359 @@ def fanout_cmd(src, out):
                                       (", grounded: %s"
                                        % ", ".join(c7_ids[:2])) if c7_ids else ""))
     return 0 if out_approaches else 1
+
+
+# The route scout: one bounded LLM loop reads the evidence and emits
+# runnable routes as it finds them (the race boots from the stream
+# while the scout still reads). Methods extend the fan-out's five with
+# `release` — a published release asset is often the fastest route that
+# exists (curl + exec; no image pull, no build), so it defaults to the
+# fast band.
+SCOUT_METHODS = ("prebuilt", "compose", "build", "pkg", "source", "release")
+SCOUT_KIND = {"prebuilt": "prebuilt_image", "compose": "compose",
+              "build": "dockerfile", "pkg": "install_script",
+              "source": "source_build", "release": "install_script"}
+SCOUT_DEFAULT_COST = {"prebuilt": "fast", "compose": "medium",
+                      "build": "medium", "pkg": "slow",
+                      "source": "slowest", "release": "fast"}
+SCOUT_COSTS = ("fast", "medium", "slow", "slowest")
+
+
+def _install_hints(root, max_lines=24, line_cap=96):
+    # Deterministic sieve over README/INSTALL: section headers and
+    # lines that look like install routes. Bounded input for the scout
+    # prompt — the interpretation is the scout's job, never a regex
+    # verdict.
+    verbs = ("install", "apt-get", "snap ", "brew ", "curl ", "wget ",
+             "npm i", "pip install", "cargo install", "go install",
+             "docker run", "docker compose", "docker-compose", "make ",
+             "./configure", "unzip", "tar -", "npx ", "yarn ")
+    out = []
+    for name in ("README.md", "README.rst", "README.txt", "INSTALL.md",
+                 "INSTALL"):
+        p = os.path.join(root, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            text = open(p, errors="replace").read(16384)
+        except OSError:
+            continue
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not s or len(s) > line_cap * 2:
+                continue
+            low = s.lower()
+            if s.startswith(("#", "```", "$")):
+                out.append(s[:line_cap])
+            elif any(v in low for v in verbs):
+                out.append(s[:line_cap])
+            if len(out) >= max_lines:
+                return out
+    return out
+
+
+def _release_manifest(root, timeout=15, max_releases=3, max_assets=8):
+    # Deterministic release inventory for GitHub-origin repos: tags,
+    # asset names and sizes from the API. No LLM; asset choice is the
+    # scout's judgment. Any failure degrades to "" — releases are one
+    # route among many, never a dependency.
+    url = ""
+    try:
+        r = subprocess.run(["git", "-C", root, "remote", "get-url",
+                            "origin"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            url = (r.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.search(r"github\.com[/:]([^/]+)/([^/#?\s]+?)(?:\.git)?/?$", url)
+    if not m:
+        return ""
+    api = "https://api.github.com/repos/%s/%s/releases?per_page=%d" % (
+        m.group(1), m.group(2), max_releases)
+    try:
+        r = subprocess.run(["curl", "-sS", "--max-time", str(timeout), api],
+                           capture_output=True, text=True,
+                           timeout=timeout + 5)
+        if r.returncode != 0:
+            return ""
+        rels = json.loads(r.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    lines = []
+    for rel in rels[:max_releases]:
+        if not isinstance(rel, dict):
+            continue
+        tag = str(rel.get("tag_name") or rel.get("name") or "?")[:40]
+        when = str(rel.get("published_at") or "?")[:10]
+        lines.append("release %s (published %s)" % (tag, when))
+        for a in (rel.get("assets") or [])[:max_assets]:
+            if not isinstance(a, dict):
+                continue
+            lines.append("  asset %s (%s bytes)" % (
+                str(a.get("name") or "?")[:60], a.get("size") or 0))
+        body = str(rel.get("body") or "").strip().replace("\n", " ")
+        if body:
+            lines.append("  notes: %s" % body[:160])
+    return "\n".join(lines[:40])
+
+
+def _route_detail(route):
+    # One-line lane detail: the surface the route boots.
+    if route.get("image"):
+        return str(route["image"])
+    if route.get("compose_file"):
+        return str(route["compose_file"])
+    if route["method"] == "build":
+        return "root Dockerfile"
+    d = route.get("direct") or {}
+    if d.get("command"):
+        return " ".join(str(x) for x in d["command"])[:40]
+    return (route.get("evidence") or "")[:40]
+
+
+def _clamp_route(r, root):
+    # One scouted route -> a flat approach entry the race can boot.
+    # Returns (route, drop_why). Structure is pruned HERE, not at boot:
+    # boot kinds need an exact surface (image ref, compose file,
+    # Dockerfile) and a tcp port to verify; direct kinds need a
+    # command. A dropped route is a scan finding, never a boot.
+    if not isinstance(r, dict):
+        return None, "bad shape"
+    m = str(r.get("method") or "").strip().lower()
+    if m not in SCOUT_METHODS:
+        return None, "unknown method"
+    why = str(r.get("why") or "")[:40]
+    cost = str(r.get("cost") or "").strip().lower()
+    if cost not in SCOUT_COSTS:
+        cost = SCOUT_DEFAULT_COST[m]
+    ports = _clamp_ports(r.get("ports"))
+    route = {"method": m, "kind": SCOUT_KIND[m], "cost": cost,
+             "cite": str(r.get("cite") or why)[:40],
+             "evidence": ("scout: %s %s" % (m, why or "route"))[:120]}
+    if m == "prebuilt":
+        img = _clamp_images(r.get("images") or
+                            ([r.get("image")] if r.get("image") else []))
+        if not img:
+            return None, "no exact image ref"
+        if not ports:
+            return None, "no ports to verify"
+        route["image"] = img[0]
+        route["ports"] = ports
+        return route, None
+    if m == "compose":
+        cf = _clamp_compose_file(r.get("compose_file"), root)
+        if not cf:
+            return None, "no standalone compose file"
+        if not ports:
+            return None, "no ports to verify"
+        route["compose_file"] = cf
+        route["ports"] = ports
+        return route, None
+    if m == "build":
+        df = str(r.get("dockerfile") or "Dockerfile")
+        if "/" in df or not os.path.isfile(os.path.join(root, df)):
+            return None, "no root Dockerfile"
+        if not ports:
+            return None, "no ports to verify"
+        route["ports"] = ports
+        return route, None
+    direct = _clamp_direct(r, ports)
+    if not direct:
+        return None, "no command"
+    route["direct"] = direct
+    route["ports"] = direct["ports"]
+    return route, None
+
+
+def _scout_scan(root, out, routes):
+    # The bounded scout loop. Turn 1 emits the obvious routes (official
+    # image, release asset, compose stack); later turns keep reading
+    # for OTHER routes until the model says exhausted or the turn
+    # budget lapses. Every honest route lands in `out` the moment it
+    # clamps; the race drains the file while the scout still reads.
+    bundle = _gapfill_bundle(root)
+    if not bundle.strip():
+        return {"skipped": [], "llm": 0, "transient": False}
+    variants = _root_compose_variants(root)
+    for n in variants:
+        try:
+            bundle += "\n=== compose variant: %s ===\n%s" % (
+                n, open(os.path.join(root, n),
+                        errors="replace").read(6144))
+        except OSError:
+            pass
+    has_compose = bool(variants) or \
+        any(os.path.isfile(os.path.join(root, n)) for n in NAMES) or \
+        bool(scan(root))
+    has_dockerfile = os.path.isfile(os.path.join(root, "Dockerfile"))
+    has_make = any(os.path.isfile(os.path.join(root, f))
+                   for f in ("Makefile", "go.mod", "Cargo.toml"))
+    skipped = []
+    if not has_compose:
+        skipped.append("no compose file")
+    if not has_dockerfile:
+        skipped.append("no root Dockerfile")
+    if not has_make:
+        skipped.append("no build manifest")
+    rel = _release_manifest(root)
+    hints = _install_hints(root)
+    emitted = set()
+    llm_calls = 0
+    transient = False
+    turns = max(1, min(6, int(os.environ.get("VMF_SCOUT_TURNS") or 3)))
+    deadline = int(os.environ.get("VMF_SCOUT_DEADLINE") or 240)
+    for turn in range(1, turns + 1):
+        prompt = (
+            "You are the route scout for a disposable microVM run of this "
+            "repository: find the FASTEST routes to a working install, and "
+            "emit each one as soon as the evidence supports it. A route is "
+            "ONE install approach with a method from this vocabulary: "
+            "prebuilt (official container image, exact ref) | compose (the "
+            "repo's standalone compose stack) | build (root Dockerfile) | "
+            "pkg (install packages in the guest, then exec the app) | "
+            "source (build from source in the guest) | release (download a "
+            "published release asset and run it; often the fastest route "
+            "of all, check the release inventory). When a method cannot "
+            "work for this repo, do not emit it. Never invent versions, "
+            "ports, or env values.\n"
+            "Reply with ONE JSON object:\n"
+            '{"routes": [{"method": "<vocab>", "why": "<max 8 words>", '
+            '"cost": "fast|medium|slow|slowest", '
+            '"cite": "<where this route comes from: README line, release '
+            'tag>", '
+            '"image": "<prebuilt only: exact ref>", '
+            '"compose_file": "<compose only: repo ROOT file>", '
+            '"dockerfile": "<build only>", '
+            '"install": ["<pkg/release/source: shell commands run once>"], '
+            '"command": ["<pkg/release/source: argv that starts the app>"], '
+            '"ports": [<guest tcp ports>], '
+            '"checks": [{"probe": {"port": N, "path": "/", '
+            '"expect_status_max": 399}}], '
+            '"images": ["<container images the app needs>"], '
+            '"env": {"K": "V"}, "needs_docker": <bool>, '
+            '"memory_mb": <1024-8192>}], '
+            '"more": <true when more routes may exist and you should keep '
+            'reading; false when done>}\n')
+        if turn > 1:
+            prompt += ("Routes already emitted: %s. Keep reading the "
+                       "evidence for OTHER routes (releases, package "
+                       "managers, alternate methods); never re-emit one "
+                       'already listed. Reply {"routes": [], "more": '
+                       "false} when exhausted.\n"
+                       % (", ".join(sorted(emitted)) or "none"))
+        if skipped:
+            prompt += ("Methods with no supporting evidence in this repo "
+                       "(do not emit them): %s.\n" % ", ".join(skipped))
+        if rel:
+            prompt += "Release inventory:\n%s\n" % rel[:2048]
+        if hints:
+            prompt += ("Install hint lines (README/INSTALL):\n%s\n"
+                       % "\n".join(hints)[:2048])
+        prompt += "Evidence:\n%s" % bundle[:32768]
+        rc, o, _e = vmf_llm.llm_call("gapfill", prompt, timeout=deadline)
+        llm_calls += 1
+        if rc != 0:
+            transient = True
+            break
+        try:
+            j = vmf_llm.parse_llm_json(o)
+        except Exception:
+            transient = True
+            break
+        new = 0
+        for r in (j.get("routes") or [])[:6]:
+            route, why = _clamp_route(r, root)
+            if not route or route["method"] in emitted:
+                continue
+            emitted.add(route["method"])
+            routes.append(route)
+            new += 1
+            with open(out, "a") as f:
+                f.write(json.dumps(route) + "\n")
+            sys.stderr.write("scout: %-9s .. %-9s %-40s %s/T%d\n"
+                             % (route["method"], route["kind"],
+                                _route_detail(route)[:40], route["cost"],
+                                COST_RANK[route["cost"]]))
+        if not j.get("more") or (not new and turn > 1):
+            break
+    return {"skipped": skipped, "llm": llm_calls, "transient": transient}
+
+
+def _scout_cache_direct(root, routes):
+    # Each direct route doubles as the runner's replay plan: the boot
+    # (VMF_PLAN_SKIP_COMPOSE=1 + VMF_PLAN_DIRECT=<method>) replays
+    # direct-<method>.json with zero LLM calls. Same non-interactive
+    # gate as the fan-out's direct warming.
+    if not vmf_llm.accepted():
+        return
+    gdir = os.path.join(
+        _gen_root(),
+        hashlib.sha256((PROMPT_V + "\n" + _gapfill_bundle(root)
+                        ).encode()).hexdigest()[:12])
+    os.makedirs(gdir, exist_ok=True)
+    for r in routes:
+        if "direct" not in r:
+            continue
+        m = r["method"]
+        with open(os.path.join(gdir, "direct-%s.json" % m), "w") as f:
+            json.dump(r["direct"], f, indent=2)
+        with open(os.path.join(gdir, "direct-%s.json.meta.json" % m),
+                  "w") as f:
+            json.dump({"model": os.environ.get("VMF_GAPFILL_MODEL")
+                       or os.environ.get("VMF_LLM_MODEL", ""),
+                       "notes": r["direct"].get("notes", ""),
+                       "created": "", "context7": [], "refined": False,
+                       "turns": 0, "scout": m}, f, indent=2)
+
+
+def scout_cmd(src, out):
+    # Emissions stream to `out` as JSONL: one route object per line in
+    # emission order, then a final {"summary": ...} line. The race
+    # drains the file while the scout still reads. Results cache under
+    # the winner key: a replay dumps the routes instantly, zero LLM.
+    root = src
+    gen = os.path.join(_gen_root(), winner_key(root))
+    os.makedirs(gen, exist_ok=True)
+    cache = os.path.join(gen, "scout.json")
+    if os.path.isfile(cache):
+        try:
+            c = json.load(open(cache))
+            routes = c.get("routes") or []
+            summary = c.get("summary") or {}
+            with open(out, "a") as f:
+                for r in routes:
+                    f.write(json.dumps(r) + "\n")
+                f.write(json.dumps({"summary": summary}) + "\n")
+            _scout_cache_direct(root, routes)
+            sys.stderr.write("scout: cache replay %d route(s), %d skipped, "
+                             "0 llm call(s)\n"
+                             % (len(routes),
+                                len(summary.get("skipped") or [])))
+            return 0 if routes else 1
+        except (OSError, ValueError):
+            pass
+    routes = []
+    summary = _scout_scan(root, out, routes)
+    if not summary.get("transient"):
+        # An honest exhausted/blocked answer caches; a transport or
+        # parse failure is NOT the model's verdict — never cached, the
+        # next run scouts again.
+        try:
+            with open(cache, "w") as f:
+                json.dump({"routes": routes, "summary": summary}, f,
+                          indent=2)
+        except OSError:
+            pass
+    _scout_cache_direct(root, routes)
+    with open(out, "a") as f:
+        f.write(json.dumps({"summary": summary}) + "\n")
+    sys.stderr.write("scout: %d route(s), %d skipped, %d llm call(s)%s\n"
+                     % (len(routes), len(summary.get("skipped") or []),
+                        summary.get("llm") or 0,
+                        " (transient; will retry)"
+                        if summary.get("transient") else ""))
+    return 0 if routes else 1
 
 
 def enumerate_cmd(src, out, verbose=False):
@@ -2457,6 +2835,8 @@ def main(argv):
         return 0
     elif cmd == "fanout" and len(rest) >= 2:
         return fanout_cmd(rest[0], rest[1])
+    elif cmd == "scout" and len(rest) >= 2:
+        return scout_cmd(rest[0], rest[1])
     else:
         usage()
         return 2

@@ -6,4 +6,5 @@ dependencies = [
     "ansible-core>=2.21.4",
     "jsonschema>=4.26.0",
     "pyyaml>=6.0.3",
+    "rich>=13.0.0",
 ]

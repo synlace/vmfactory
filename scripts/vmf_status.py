@@ -16,6 +16,14 @@ RUNS = os.environ.get("VMF_RUNS") or \
     os.path.join(os.path.expanduser("~"), ".vmf", "runs")
 # Settled lines stay visible to watch for this long.
 WATCH_TTL = 600
+# The rich board (vmf_ui) owns the terminal while active; the CR line
+# goes quiet until the board closes. Status files keep updating — the
+# board renders events, the files stay the source of truth.
+_QUIET = [False]
+
+
+def set_quiet(q):
+    _QUIET[0] = bool(q)
 
 
 def status_dir():
@@ -46,6 +54,8 @@ def _mode():
 
 def _render(text, final):
     m = _mode()
+    if _QUIET[0] and not final:
+        return
     if m == "off" or (m != "tty" and not final):
         return
     if m == "tty" and not final:
