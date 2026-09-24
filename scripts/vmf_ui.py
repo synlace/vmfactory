@@ -88,7 +88,7 @@ class _SelfRender:
 class Board:
     # Live lane board. `file` is injectable for tests; the default
     # stderr matches every other writer (say, status events).
-    def __init__(self, name, t0=None, file=None):
+    def __init__(self, name, t0=None, file=None, width=None):
         self.name = (name or "")[:16]
         self.t0 = t0 or time.time()
         self._stage_text = "scan"
@@ -103,8 +103,14 @@ class Board:
             self.dead = True
             return
         try:
+            # A pre-board one-line status (a CR line, e.g. the clone
+            # phase) may occupy this terminal row; erase it so the
+            # board replaces it 1:1 instead of stacking below it.
+            if file is None and sys.stderr.isatty():
+                sys.stderr.write("\x1b[2K\r")
+                sys.stderr.flush()
             console = Console(file=file or sys.stderr, highlight=False,
-                              soft_wrap=False)
+                              soft_wrap=False, width=width)
             self._live = Live(console=console, auto_refresh=True,
                               refresh_per_second=6, transient=False)
             self._live.start()
@@ -133,14 +139,19 @@ class Board:
         ht.add_column(width=9, justify="right")
         ht.add_row(head, Text(_clock(self.t0), style="bright_black"))
         lt = Table.grid(padding=(0, 1))
-        for w in (1, 10, 9, 40, 24, 9):
+        # Leading indent: every lane sits visibly under its head line
+        # (the spinner indents with the lane, like the mock; the
+        # 2-wide slot keeps lane names aligned across states).
+        lt.add_column(width=2, justify="left")
+        for w in (2, 10, 9, 40, 24, 9):
             lt.add_column(width=w, justify="left")
         for m in self.order:
             L = self.lanes[m]
             act = L["state"] == "booting"
             st = STATE_STYLE.get(L["state"], "bright_black")
             lt.add_row(
-                Text(fr if act else " ", style="magenta"),
+                Text("  "),
+                Text((fr + " ") if act else "  ", style="magenta"),
                 Text("%-10s" % m[:10], style="bold"),
                 Text("%-9s" % L["state"][:9], style=st),
                 Text("%-40s" % (L["detail"] or "")[:40],
@@ -150,7 +161,7 @@ class Board:
                 Text("%-9s" % (L["band"] or "")[:9], style="bright_black"))
         parts = [ht, lt]
         if self.note_text:
-            parts.append(Text("  %s" % self.note_text[:90],
+            parts.append(Text("    %s" % self.note_text[:86],
                               style="bright_black"))
         return Group(*parts)
 

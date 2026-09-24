@@ -96,7 +96,11 @@ vmf_number_instance() { # name [replace_flag] -> final name on stdout
   for n in 2 3 4 5 6 7 8 9; do
     cand="$base-$n"
     if ! vmf_conf_running "$cand"; then
-      echo "lab: $base is running — booting instance $cand" >&2
+      # The rich board carries the instance name on its first line;
+      # VMF_SILENT_NUMBER keeps the terminal clean there.
+      if [[ "${VMF_SILENT_NUMBER:-0}" != "1" ]]; then
+        echo "lab: $base is running — booting instance $cand" >&2
+      fi
       printf '%s' "$cand"
       return 0
     fi

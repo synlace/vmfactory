@@ -182,9 +182,27 @@ esac
 # Skipped on the compose/direct handoff passes (VMF_MODE/VMF_COMPOSE_SRC
 # set by the first pass).
 export VMF_SCRIPTS_DIR="${VMF_SCRIPTS_DIR:-$SCRIPTS_DIR}"
+# Board mode: the race will render the rich lane board on this TTY —
+# the same conditions vmf_ui.available() checks (tty stderr, rich via
+# the interpreter ladder) plus the run-shape gates (not VMF_LOUD, not
+# plan mode). In board mode the pre-race lines fold into the board's
+# first line instead of stacking above it.
+board_mode=0
+if [[ -t 2 && "${VMF_LOUD:-}" != "1" && "${plan_mode:-0}" != "1" ]] \
+   && { python3 -c 'import rich' 2>/dev/null || command -v uv >/dev/null 2>&1; }; then
+  board_mode=1
+fi
 if [[ -z "${VMF_MODE:-}" && -z "${VMF_COMPOSE_SRC:-}" ]]; then
-  kind=$(python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" classify "$image" \
-    ${input_as:+"--as" "$input_as"}) || exit $?
+  if [[ $board_mode -eq 1 ]]; then
+    errf="$RUNS_DIR/.classify-err.$$"
+    kind=$(python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" classify "$image" \
+      ${input_as:+"--as" "$input_as"} 2>"$errf") \
+      || { cat "$errf" >&2; rm -f "$errf"; exit $?; }
+    rm -f "$errf"
+  else
+    kind=$(python3 "$VMF_SCRIPTS_DIR/vmf_plan.py" classify "$image" \
+      ${input_as:+"--as" "$input_as"}) || exit $?
+  fi
   # Compose runs take no command: positionals after the input are a
   # mangled flag (lost quotes) or a misuse — say so instead of
   # silently dropping them (checked before the clone, so nothing runs).
@@ -241,9 +259,29 @@ if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   repo_src="$RUNS_DIR/.compose-src.$$"
   rm -rf "$repo_src"
   mkdir -p "$repo_src"
-  vmf_run git -- git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
-  export VMF_COMPOSE_SRC="$repo_src" VMF_COMPOSE_URL="$clone_url"
+  # Name and instance numbering BEFORE the clone: the board's first
+  # line carries the final instance name from the clone phase on.
   name="${name:-$(basename "${clone_url%%.git}")}"
+  [[ $board_mode -eq 1 ]] && export VMF_SILENT_NUMBER=1
+  numbered=$(vmf_number_instance "$name" "$replace_flag")
+  numbered_done=1
+  [[ "$numbered" == "$name" ]] || name="$numbered"
+  if [[ $board_mode -eq 1 ]]; then
+    python3 "$VMF_SCRIPTS_DIR/vmf_status.py" begin "$name" >/dev/null 2>&1 || true
+    python3 "$VMF_SCRIPTS_DIR/vmf_status.py" event "$name" clone \
+      "cloning source tree" >/dev/null 2>&1 || true
+    if vmf_run git -- git clone -q --depth 1 "$clone_url" "$repo_src" \
+        2>"$RUNS_DIR/.clone-err.$$"; then
+      rm -f "$RUNS_DIR/.clone-err.$$"
+    else
+      cat "$RUNS_DIR/.clone-err.$$" >&2
+      rm -f "$RUNS_DIR/.clone-err.$$"
+      exit 1
+    fi
+  else
+    vmf_run git -- git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
+  fi
+  export VMF_COMPOSE_SRC="$repo_src" VMF_COMPOSE_URL="$clone_url"
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
   [[ "$yes_flag" -eq 0 ]] || export VMF_RUN_YES=1
@@ -259,8 +297,12 @@ elif [[ -d "$image" ]]; then  # Any local directory: compose-run.sh locates the 
 fi
 # Instance numbering: a running lab keeps the bare name; this run
 # takes a numbered instance unless --replace. Race children exempt.
-numbered=$(vmf_number_instance "$name" "$replace_flag")
-[[ "$numbered" == "$name" ]] || name="$numbered"
+# The git-url path numbered before the clone (board first-line);
+# skip the duplicate there.
+if [[ -z "${numbered_done:-}" ]]; then
+  numbered=$(vmf_number_instance "$name" "$replace_flag")
+  [[ "$numbered" == "$name" ]] || name="$numbered"
+fi
 if [[ -z "${VMF_MODE:-}" && -n "${VMF_COMPOSE_SRC:-}" ]]; then
   export VMF_NAME="$name" VMF_COMPOSE_SLUG="$name"
   export VMF_RUN_DETACH="${detach:-0}" VMF_RUN_KEEP="${keep:-0}"

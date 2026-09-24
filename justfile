@@ -72,10 +72,11 @@ build lab=lab: (generate lab)
 boot lab=lab:
     sh scripts/boot.sh {{ lab }}
 
-# Run an OCI image as an ephemeral microVM (docker-style flags); ssh in
-# with `just ssh <name>` afterwards. "$@" + positional-arguments keeps
-# quoting intact (--intent "Run 3 instances" reaches oci-run as one arg).
-run *args:
+# Boot an OCI image as an ephemeral microVM (docker-style flags); ssh
+# in with `just ssh <name>` afterwards. "$@" + positional-arguments
+# keeps quoting intact (--intent "Run 3 instances" reaches oci-run as
+# one arg). @: the board owns the terminal from the first line.
+@run *args:
     exec sh scripts/oci-run.sh "$@"
 
 # SSH into a running box (qemu) or microVM (dropbear); pass a command to
