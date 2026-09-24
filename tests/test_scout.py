@@ -438,14 +438,38 @@ class QuietStatus(unittest.TestCase):
             vmf_status.set_quiet(True)
             vmf_status._render("web plan x t+0:01", final=False)
             self.assertEqual(buf.getvalue(), "")
+            # Board-owned: even the final verdict renders nothing (the
+            # board shows it); the file record is independent.
             vmf_status._render("web pass t+1:00", final=True)
-            self.assertIn("pass", buf.getvalue())
+            self.assertEqual(buf.getvalue(), "")
             vmf_status.set_quiet(False)
             vmf_status._render("web plan y t+0:02", final=False)
             self.assertIn("plan y", buf.getvalue())
         finally:
             sys.stderr = old
             vmf_status.set_quiet(False)
+            vmf_status.line_closed()
+            if old_env is None:
+                os.environ.pop("VMF_STATUS", None)
+            else:
+                os.environ["VMF_STATUS"] = old_env
+
+    def test_final_terminates_open_cr_line(self):
+        buf = io.StringIO()
+        old_env = os.environ.pop("VMF_STATUS", None)
+        os.environ["VMF_STATUS"] = "tty"
+        old = sys.stderr
+        sys.stderr = buf
+        try:
+            vmf_status.line_closed()
+            vmf_status._render("web promote booting t+0:30", final=False)
+            vmf_status._render("web pass tcp://1.2.3.4:80 t+0:41", final=True)
+            out = buf.getvalue()
+            self.assertIn("\nweb pass", out)
+            self.assertIn("promote booting", out)
+        finally:
+            sys.stderr = old
+            vmf_status.line_closed()
             if old_env is None:
                 os.environ.pop("VMF_STATUS", None)
             else:

@@ -1074,21 +1074,23 @@ def race(keep, src, base, feed=None, board=None):
             stop_vm(k["cand"])
 
     # Promotion: boot the canonical name from the winner's data drive.
-    # The board hands the terminal back to the one-line status first
-    # (the promote wait is a future rich seam, not this slice).
-    if board:
-        board.close()
-        vmf_status.set_quiet(False)
-        vmf_status.line_closed()
-    return promote(w, src, base, winner)
+    # The board rides through promotion: the winning lane goes
+    # pass -> promoting -> pass (canonical target), and the board's
+    # last line is the verdict. promote() closes it.
+    return promote(w, src, base, winner, board)
 
 
 
-def promote(w, src, base, winner):
+def promote(w, src, base, winner, board=None):
     # Boot the winning candidate's spec under the canonical name; a
     # transient failure (partial boot, slow verdict) retries once. The
     # verdict marker must be unlinked before EVERY attempt: a stale
-    # marker from a rerun would satisfy the wait loop instantly.
+    # marker from a rerun would satisfy the wait loop instantly. With
+    # a board, the winning lane rides through: pass (candidate
+    # verdict) -> promoting (canonical boot from the winner data
+    # drive) -> pass with the canonical target; the board's last line
+    # IS the verdict.
+    method = w.get("method") or w["kind"]
     say("promotion: stopping %s" % winner)
     stop_vm(winner)
     # Slirp winners must release their host ports before the canonical
@@ -1116,12 +1118,20 @@ def promote(w, src, base, winner):
                 s.close()
                 time.sleep(1)
     time.sleep(2)
+    if board:
+        board.lane(method, "promoting", "canonical · winner drive",
+                   w.get("cite"), _band_label(w, band_of(w)))
+        board.stage("promote · booting canonical")
     promote_tries = int(os.environ.get("VMF_PROMOTION_TRIES") or "2")
     status = "fail (no verdict)"
     for attempt in range(1, promote_tries + 1):
         if attempt > 1:
             say("promotion: retry %d/%d (fresh boot under %s)"
                 % (attempt, promote_tries, base))
+            if board:
+                board.lane(method, "promoting",
+                           "canonical · retry %d" % attempt,
+                           w.get("cite"), _band_label(w, band_of(w)))
         cmd, env = runner_cmd(w["kind"], base, src, w["image"],
                               w["ports"], w.get("compose_file"),
                               w.get("method"))
@@ -1141,6 +1151,7 @@ def promote(w, src, base, winner):
         proc = subprocess.Popen(cmd, env=env, stdout=log,
                                 stderr=subprocess.STDOUT)
         proc.wait()
+        t_promote = time.time()
         # The detached runner returns before its verify chain finishes: the
         # verdict marker (and the rendered target) land minutes later. Wait
         # for the marker instead of defaulting to pass on a missing verdict.
@@ -1151,6 +1162,10 @@ def promote(w, src, base, winner):
             int(os.environ.get("VMF_PROMOTION_WAIT") or "900"), vw + 120)
         while not os.path.isfile(vpath) and time.time() < deadline:
             time.sleep(2)
+            if board:
+                el = int(time.time() - t_promote)
+                board.stage("promote · booting canonical · %d:%02d"
+                            % (el // 60, el % 60))
         status = "fail (no verdict)"
         if os.path.isfile(vpath):
             with open(vpath) as f:
@@ -1176,8 +1191,18 @@ def promote(w, src, base, winner):
         pass
     if status == "pass":
         save_winner(src, w, winner)
+        if board:
+            board.lane(method, "pass", target or "canonical",
+                       w.get("cite"), _band_label(w, band_of(w)))
+            board.stage("pass")
         vmf_status.event(base, "pass", target or "pass", final=True)
+        _board_close()
     else:
+        if board:
+            board.lane(method, "parked", status[:40], w.get("cite"),
+                       _band_label(w, band_of(w)))
+            board.stage("fail")
+            _board_close()
         vmf_status.event(base, "fail", status[:40], final=True)
     return 0 if status == "pass" else 1
 

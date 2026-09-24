@@ -50,11 +50,11 @@ def _display(text):
         if kind != short:
             out = out.replace(kind, short)
     return out
-STATE_STYLE = {"plan": "cyan", "booting": "magenta", "pass": "green",
-               "parked": "bright_black", "blocked": "yellow",
-               "skipped": "yellow"}
+STATE_STYLE = {"plan": "cyan", "booting": "magenta", "promoting": "magenta",
+               "pass": "green", "parked": "bright_black",
+               "blocked": "yellow", "skipped": "yellow"}
 # States that own the head spinner (work is in flight).
-ACTIVE_STATES = ("plan", "booting")
+ACTIVE_STATES = ("plan", "booting", "promoting")
 
 
 def available():
@@ -147,7 +147,7 @@ class Board:
             lt.add_column(width=w, justify="left")
         for m in self.order:
             L = self.lanes[m]
-            act = L["state"] == "booting"
+            act = L["state"] in ACTIVE_STATES
             st = STATE_STYLE.get(L["state"], "bright_black")
             lt.add_row(
                 Text("  "),

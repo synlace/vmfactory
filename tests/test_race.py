@@ -251,6 +251,39 @@ class Promotion(Tmp):
         with open(os.path.join(self.runs, "web.verdict")) as f:
             self.assertEqual(f.read().strip(), "pass")
 
+    def test_board_rides_through_promotion(self):
+        # The winning lane goes promoting -> pass (canonical target) on
+        # the board; the plain final render is suppressed while the
+        # board owns the terminal, but the status file still records.
+        os.environ["VMF_PROMOTION_TRIES"] = "1"
+        vmf_race.subprocess.Popen = self._fake_boots(["pass"])
+        rec = []
+
+        class FakeBoard:
+            def lane(self, *a):
+                rec.append(("lane",) + a)
+            def stage(self, *a):
+                rec.append(("stage",) + a)
+            def close(self):
+                rec.append(("close",))
+        board = FakeBoard()
+        vmf_race._board_ref["b"] = board
+        vmf_status.set_quiet(True)
+        try:
+            rc = vmf_race.promote(self._w(), self.src, "web", "web-c1",
+                                  board)
+            self.assertEqual(rc, 0)
+        finally:
+            vmf_race._board_ref.pop("b", None)
+            vmf_status.set_quiet(False)
+            vmf_status.line_closed()
+        lanes = [r[2] for r in rec if r[0] == "lane"]
+        self.assertEqual(lanes, ["promoting", "pass"])
+        self.assertIn(("stage", "pass"), rec)
+        self.assertIn(("close",), rec)
+        with open(os.path.join(vmf_status.RUNS, ".status", "web")) as f:
+            self.assertIn("pass", f.read())
+
 
 class CacheBeforeEnumerate(Tmp):
     # The rekey contract: a winner-cache hit replays without ever
@@ -341,7 +374,7 @@ class Tranches(Tmp):
                     vmf_race.bundle_key, vmf_race.STAGGER,
                     vmf_race.DEADLINE, vmf_race.PARALLEL)
         vmf_race.stop_vm = lambda name: self.stops.append(name)
-        vmf_race.promote = lambda w, src, base, winner: 0
+        vmf_race.promote = lambda w, src, base, winner, board=None: 0
         vmf_race.bundle_key = lambda src: "testkey"
         vmf_race.STAGGER = 0
         vmf_race.DEADLINE = 600
