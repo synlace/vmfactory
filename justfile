@@ -79,6 +79,13 @@ boot lab=lab:
 @run *args:
     exec sh scripts/oci-run.sh "$@"
 
+# Preview the deliverable: spec + per-lane plans, printed. Nothing
+# boots; the plans land in the race's cache, so a run right after
+# replays them with zero LLM calls. Rich-rendered on a terminal;
+# plain when piped or --plain.
+@plan *args:
+    exec {{ uvrun }} --with pyyaml --with rich python scripts/vmf_plan.py preview "$@"
+
 # SSH into a running box (qemu) or microVM (dropbear); pass a command to
 # run it remotely instead. Docker-style leading flags are accepted/ignored.
 ssh *args:

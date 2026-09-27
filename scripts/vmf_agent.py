@@ -84,12 +84,28 @@ SYSTEM_BRIEF = (
     '{"install": ["<shell, idempotent, run once at boot>"], '
     '"command": ["<argv>"], "ports": [<guest tcp ports>], '
     '"checks": [{"probe": {"port": P, "path": "/", "expect_status": 200, '
-    '"expect_contains": "<text that proves it>"}}], '
+    '"expect_contains": "<text that proves it>"}} or for a CLI tool '
+    '{"cmd": {"bin": "<tool>", "probes": ["<tool> --version", '
+    '"<tool> --help"]}}], '
+    '"user": "<run the app as this account>", '
     '"images": ["<container images the plan needs>"], '
     '"env": {"K": "V"}, "needs_docker": <bool>, '
     '"memory_mb": <measured need, 1024-8192>, "notes": "<max 12 words>"}\n'
     "checks must reproduce what you verified (status and a distinctive "
-    "body substring). Reply with ONE JSON object only.")
+    "body substring). If the app is a CLI tool (no server, no ports), "
+    "set command to [\"sleep\", \"100000000\"] (a keep-alive so the VM "
+    "survives the verify), leave ports empty, and declare the cmd check "
+    "naming the tool binary. The boot is unattended: nothing can click "
+    "a button or answer a wizard, so any one-time initialization "
+    "(database schema, migrations, a setup page) must ride the install "
+    "list as a deterministic command (a CLI runner, an SQL import, or "
+    "a scripted curl of the setup endpoint). If the app refuses root "
+    "(embedded postgres does), create a dedicated account in the "
+    "install list (useradd -m app) and declare user: the install runs "
+    "as root, the app runs as that account. A login page is not "
+    "success: if the app ships default credentials, declare a check "
+    "that logs in and asserts post-auth content. Reply with ONE JSON "
+    "object only.")
 
 
 def show_cmd(cmd):
@@ -177,7 +193,8 @@ def guest_probe(name, port, path, want, contains):
 
 def guest_acceptance(name, plan):
     # Deterministic in-guest replay of the plan's checks: tcp via the
-    # proc listener table, probe via busybox wget, exec verbatim.
+    # proc listener table, probe via busybox wget, exec verbatim, cmd
+    # via the verify's two-level CLI runner (same ssh transport).
     results, failures = [], []
     for p in vmf_plan._clamp_ports(plan.get("ports")):
         ok = guest_tcp_listening(name, p)
@@ -199,6 +216,12 @@ def guest_acceptance(name, plan):
             if rc != 0:
                 failures.append("exec failed rc=%d: %s"
                                 % (rc, ((out + err).strip()[:200])))
+        elif "cmd" in c:
+            ok, ev = vmf_verify.check_cmd(c, name)
+            results.append(ok)
+            if not ok:
+                failures.append("%s: %s" % (vmf_verify.spec_key(
+                    "cmd", None, c), (ev or {}).get("actual", "failed")))
     return all(results) and bool(results), failures
 
 
@@ -246,7 +269,8 @@ def validate_spec(raw, plan):
     # with no runtime dies with "executable not found" at boot).
     needs_docker = bool(raw.get("needs_docker")) or \
         (cmd[0].strip() in ("docker", "podman", "nerdctl"))
-    return {"base_image": plan.get("base_image", ""),
+    return {"base_image": vmf_plan._clamp_base_image(
+                plan.get("base_image", "")),
             "install": install,
             "command": cmd,
             "ports": vmf_plan._clamp_ports(raw.get("ports")),
@@ -255,6 +279,7 @@ def validate_spec(raw, plan):
             "images": vmf_plan._clamp_images(raw.get("images")),
             "env": {str(k): str(v)
                     for k, v in (raw.get("env") or {}).items()},
+            "user": vmf_plan._clamp_user(raw.get("user")),
             "needs_docker": needs_docker,
             "memory_mb": vmf_plan._clamp_memory(raw.get("memory_mb"),
                                                 needs_docker),
@@ -363,15 +388,21 @@ def agent_cmd(args):
     # versions, official images, ports) replace stale priors — the
     # Ghost/node class of failure becomes un-navigable.
     facts = ""
-    try:
-        grounded, c7_ids = vmf_plan.ground_for_app(args.image, args.phrase,
-                                                   role="agent")
-        if grounded.strip():
-            facts = grounded
-            sys.stderr.write("agent: grounded %s\n"
-                             % vmf_llm.grounding_note(c7_ids))
-    except Exception as e:
-        sys.stderr.write("agent: grounding unavailable (%s); priors\n" % e)
+    # Grounding needs an intent: a race child carries no phrase, and
+    # grounding a generic base image with an empty intent matched
+    # unrelated docs (mkdocs, pwa-install) and poisoned the repair
+    # prompt with junk facts.
+    if (args.phrase or "").strip():
+        try:
+            grounded, c7_ids = vmf_plan.ground_for_app(
+                args.image, args.phrase, role="agent")
+            if grounded.strip():
+                facts = grounded
+                sys.stderr.write("agent: grounded %s\n"
+                                 % vmf_llm.grounding_note(c7_ids))
+        except Exception as e:
+            sys.stderr.write(
+                "agent: grounding unavailable (%s); priors\n" % e)
 
     def persist():
         if getattr(args, "resume", None):
@@ -478,10 +509,14 @@ def agent_cmd(args):
                 or vmf_plan._synth_checks(runnable_ports, cmd)
             if not runnable_checks:
                 note = ("The plan declares no ports and no checks; the "
-                        "acceptance has nothing to verify. Declare the "
-                        "guest tcp port(s) the app serves and one probe "
-                        "per HTTP port (status + distinctive body text), "
-                        "then reply done again.")
+                        "acceptance has nothing to verify. For a server, "
+                        "declare the guest tcp port(s) it serves and one "
+                        "probe per HTTP port (status + distinctive body "
+                        "text). For a CLI tool, keep the sleep keep-alive "
+                        "command and declare a cmd check "
+                        '({"cmd": {"bin": "<tool>", "probes": '
+                        '["<tool> --version", "<tool> --help"]}}). Then '
+                        "reply done again.")
                 turns.append({"cmd": "(acceptance)",
                               "out": note[:OUT_CAP]})
                 print("agent:   → plan declares no checks; re-asking")

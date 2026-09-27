@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vmf plan · plan1 mock · the deliverable on paper</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    background: #0d1117; color: #c9d1d9; margin: 0; padding: 28px 20px 48px;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  }
+  header, section, footer { max-width: 1000px; margin: 0 auto 22px; }
+  header h1 { font-size: 15px; color: #e6edf3; margin: 0 0 6px; }
+  header p { color: #8b949e; margin: 0 0 8px; }
+  nav a { color: #58a6ff; text-decoration: none; margin-right: 14px; font-size: 12px; }
+  nav a:hover { text-decoration: underline; }
+  .cap { color: #8b949e; margin-bottom: 6px; font-size: 12px; }
+  .cap b { color: #e6edf3; font-weight: 600; }
+  pre {
+    margin: 0; padding: 12px 16px; overflow-x: auto; white-space: pre;
+    background: #010409; border: 1px solid #21262d; border-radius: 8px;
+  }
+  .b    { color: #e6edf3; font-weight: 600; }
+  .dim  { color: #8b949e; }
+  .ok   { color: #3fb950; }
+  .bad  { color: #f85149; }
+  .warn { color: #d29922; }
+  .cy   { color: #76e3ea; }
+  .mg   { color: #d2a8ff; }
+  footer { color: #8b949e; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>vmf plan — plan1 mock · the deliverable on paper</h1>
+  <p>What <span class="b">just plan &lt;src&gt; [--intent …]</span> shows once the
+  preview's plain writer moves onto <span class="b">rich</span>: a spec table (the
+  target-state contract), a lane table, one panel per plan lane, blocked lanes
+  dimmed, and a footer that never claims anything booted. Data is the real
+  preview output of 2026-09-26/27 (paperclip with the web intent; mvt with
+  none). Mock only — scripts/vmf_plan.py still writes plain text.</p>
+  <nav>
+    <a href="#web">1 · web intent (paperclip)</a>
+    <a href="#cli">2 · no intent (mvt, CLI class)</a>
+    <a href="#lane">3 · --spec override + --lane filter</a>
+    <a href="#live">4 · interactive replay · plan assembly</a>
+  </nav>
+</header>
+
+<section id="web">
+  <div class="cap"><b>1 · web intent</b> — the same intent that crowned
+  <span class="cy">cli://paperclipai</span> three runs in a row now names the
+  target in a spec block the plans must serve; the keep-alive instruction is
+  gone from the prompts and a keep-alive plan is blocked at the clamp.</div>
+<pre>
+  <span class="b">vmf plan</span>  <span class="b">just plan https://github.com/paperclipai/paperclip</span>
+        <span class="cy">--intent "Run paperclip's web server on port 3100, authenticated mode"</span>
+
+  <span class="dim">scout   Dockerfile · package.json · .env.example · README.md</span>
+  <span class="dim">deliverable  </span><span class="b ok">web</span>
+               <span class="dim">← intent + scout (--spec to override)</span>
+  <span class="dim">serve        </span><span class="cy">http 0.0.0.0:3100 · path /</span>
+  <span class="dim">auth         </span><span class="warn">required · authenticated mode per user intent</span>
+  <span class="dim">user         </span><span class="mg">non-root</span>
+  <span class="dim">hold         </span>25s
+
+lane 1     <span class="b">build      </span> medium    dockerfile      1 chk    1/1
+lane 2     <span class="b">direct     </span> slow      install_script  3 chk    3/3
+        <span class="bad">✗ compose  </span> <span class="dim">no complete compose file in evidence</span>
+        <span class="bad">✗ prebuilt </span> <span class="dim">no official container image ref in evidence</span>
+
+<span class="dim">╭───────────────────────────── plan 1 · build · dockerfile · medium ─────────────────────────────╮</span>
+<span class="dim">│</span>  <span class="dim">env          </span><span class="cy">HOST=0.0.0.0 · PORT=3100 · PAPERCLIP_HOME=/paperclip ·        </span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="cy">PAPERCLIP_OPEN_ON_LISTEN=false · PAPERCLIPAI_VERSION=latest ·               </span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="cy">BETTER_AUTH_SECRET=&lt;required secret, set at launch&gt;</span>                            <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">checks       </span><span class="ok">tcp:3100</span> <span class="dim">· hold 25s</span>                                              <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">verdict      </span><span class="b">winner needs 1/1 checks</span> <span class="dim">· floor: tcp + hold · model adds: —</span>      <span class="dim">│</span>
+<span class="dim">╰────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+<span class="dim">╭──────────────────────────── plan 2 · direct · install_script · slow ───────────────────────────╮</span>
+<span class="dim">│</span>  <span class="dim">install      </span>apt-get update &amp;&amp; apt-get install -y --no-install-recommends     <span class="dim">│</span>
+<span class="dim">│</span>                ca-certificates curl gnupg                                       <span class="dim">│</span>
+<span class="dim">│</span>                mkdir -p /etc/apt/keyrings &amp;&amp; curl -fsSL https://deb.            <span class="dim">│</span>
+<span class="dim">│</span>                nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor    <span class="dim">│</span>
+<span class="dim">│</span>                -o /etc/apt/keyrings/nodesource.gpg &amp;&amp; echo 'deb [signed-by=     <span class="dim">│</span>
+<span class="dim">│</span>                /etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/    <span class="dim">│</span>
+<span class="dim">│</span>                node_24.x nodistro main' &gt; /etc/apt/sources.list.d/             <span class="dim">│</span>
+<span class="dim">│</span>                nodesource.list &amp;&amp; apt-get update &amp;&amp; apt-get install -y          <span class="dim">│</span>
+<span class="dim">│</span>                --no-install-recommends nodejs                                   <span class="dim">│</span>
+<span class="dim">│</span>                groupadd --gid 10001 paperclip &amp;&amp; useradd --create-home          <span class="dim">│</span>
+<span class="dim">│</span>                --shell /bin/bash --uid 10001 --gid 10001 paperclip &amp;&amp; mkdir     <span class="dim">│</span>
+<span class="dim">│</span>                -p /paperclip /home/paperclip/workspace &amp;&amp; chown -R              <span class="dim">│</span>
+<span class="dim">│</span>                paperclip:paperclip /paperclip /home/paperclip                   <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">run          </span>npx --yes paperclipai@latest onboard --yes --bind    <span class="mg">as paperclip</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">env          </span><span class="cy">PAPERCLIP_HOME=/paperclip · PAPERCLIP_OPEN_ON_LISTEN=false ·   </span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="cy">HOST=0.0.0.0 · PORT=3100 · HOME=/home/paperclip ·                            </span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="cy">NPM_CONFIG_UPDATE_NOTIFIER=false</span>                                                <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">checks       </span><span class="ok">tcp:3100</span> <span class="dim">·</span> <span class="ok">probe:/ → 2xx</span> <span class="dim">·</span> <span class="ok">cmd:curl</span> <span class="dim">· hold 25s</span>                   <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">verdict      </span><span class="b">winner needs 3/3 checks</span> <span class="dim">· floor: tcp + hold · model adds: cmd · probe</span> <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">notes        </span><span class="dim">onboard --yes --bind lan is the unattended init; no default       </span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">credentials evidenced</span>                                                          <span class="dim">│</span>
+<span class="dim">╰────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+  <span class="b warn">dry run — nothing booted</span>  <span class="dim">·  `just run &lt;src&gt; --intent …` executes</span>
+</pre>
+</section>
+
+<section id="cli">
+  <div class="cap"><b>2 · no intent</b> — the CLI class: the spec row names the
+  absence instead of guessing, and the plans keep the honest keep-alive shape
+  with the two-level cmd check.</div>
+<pre>
+  <span class="b">vmf plan</span>  <span class="b">just plan https://github.com/mvt-project/mvt</span>
+
+  <span class="dim">scout   package.json · pyproject.toml · Makefile · README.md</span>
+  <span class="warn">spec    (none — pass --intent to declare the target)</span>
+
+lane 1     <span class="b">direct     </span> slow      install_script  1 chk    1/1
+lane 2     <span class="b">direct     </span> slowest   source_build    1 chk    1/1
+        <span class="bad">✗ compose  </span> <span class="dim">no compose file</span>
+        <span class="bad">✗ prebuilt </span> <span class="dim">no official image</span>
+        <span class="bad">✗ build    </span> <span class="dim">no root Dockerfile</span>
+
+<span class="dim">╭───────────────────────────── plan 1 · direct · install_script · slow ─────────────────────────────╮</span>
+<span class="dim">│</span>  <span class="dim">install      </span>pip install mvt                                                     <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">run          </span>sleep 100000000    <span class="warn">keep-alive</span>                                        <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">checks       </span><span class="ok">cmd:mvt</span> <span class="dim">· hold 25s</span>                                                  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">verdict      </span><span class="b">winner needs 1/1 checks</span> <span class="dim">· floor: hold · model adds: cmd</span>             <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">notes        </span><span class="dim">CLI tool: keep-alive so the VM survives the verify</span>                   <span class="dim">│</span>
+<span class="dim">╰───────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+<span class="dim">╭──────────────────────────── plan 2 · direct · source_build · slowest ─────────────────────────────╮</span>
+<span class="dim">│</span>  <span class="dim">base         </span><span class="cy">python:3.12-slim</span>                                                    <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">install      </span>git clone --depth 1 &lt;repo&gt; /src                                      <span class="dim">│</span>
+<span class="dim">│</span>                pip install /src                                                     <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">run          </span>sleep 100000000    <span class="warn">keep-alive</span>                                        <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">checks       </span><span class="ok">cmd:mvt</span> <span class="dim">· hold 25s</span>                                                  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">verdict      </span><span class="b">winner needs 1/1 checks</span> <span class="dim">· floor: hold · model adds: cmd</span>             <span class="dim">│</span>
+<span class="dim">╰───────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+  <span class="b warn">dry run — nothing booted</span>  <span class="dim">·  `just run &lt;src&gt; --intent …` executes</span>
+</pre>
+</section>
+
+<section id="lane">
+  <div class="cap"><b>3 · --spec override + --lane filter</b> — the human
+  correction point: the spec's provenance line reads
+  <span class="dim">← user (--spec override)</span> and the plans regenerate
+  from the corrected contract. <span class="b">--lane 2</span> renders one
+  panel only.</div>
+<pre>
+  <span class="b">vmf plan</span>  <span class="b">just plan https://github.com/paperclipai/paperclip</span>
+        <span class="cy">--spec '{"deliverable": "web", "serve": {"port": 3100}}'</span> <span class="cy">--lane 2</span>
+
+  <span class="dim">scout   Dockerfile · package.json · .env.example · README.md</span>
+  <span class="dim">deliverable  </span><span class="b ok">web</span>
+               <span class="dim">← user (--spec override) (--spec to override)</span>
+  <span class="dim">serve        </span><span class="cy">http 0.0.0.0:3100 · path /</span>
+  <span class="dim">hold         </span>25s
+
+<span class="dim">╭──────────────────────────── plan 2 · direct · install_script · slow ───────────────────────────╮</span>
+<span class="dim">│</span>  <span class="dim">install      </span>apt-get update &amp;&amp; apt-get install -y --no-install-recommends     <span class="dim">│</span>
+<span class="dim">│</span>                ca-certificates curl gnupg                                       <span class="dim">│</span>
+<span class="dim">│</span>                … (nodesource repo setup, useradd)                               <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">run          </span>npx --yes paperclipai@latest onboard --yes --bind    <span class="mg">as paperclip</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">checks       </span><span class="ok">tcp:3100</span> <span class="dim">·</span> <span class="ok">probe:/ → 2xx</span> <span class="dim">·</span> <span class="ok">cmd:curl</span> <span class="dim">· hold 25s</span>                   <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">verdict      </span><span class="b">winner needs 3/3 checks</span> <span class="dim">· floor: tcp + hold · model adds: cmd · probe</span> <span class="dim">│</span>
+<span class="dim">╰────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+  <span class="b warn">dry run — nothing booted</span>  <span class="dim">·  `just run &lt;src&gt; --intent …` executes</span>
+</pre>
+</section>
+
+<section id="live">
+  <div class="cap"><b>4 · interactive replay</b> — the plan assembling:
+  clone → read → the spec derive (one llm call) → grounding → the four
+  per-method calls landing as they finish, each lane row flipping from
+  <span class="dim">waiting</span> to <span class="cy">plan</span> or
+  <span class="warn">blocked</span> the moment its call returns. The lane
+  buttons (or arrow keys) filter the event log; <span class="b">all</span>
+  is the top of the cycle. Lane rows carry state words during the replay;
+  the shipped render collapses them into the section-1 shape.
+  <button class="rpl" id="replay">↻ replay</button>
+  <button class="rpl lane-btn on" data-lane="">all</button>
+  <button class="rpl lane-btn" data-lane="prebuilt">prebuilt</button>
+  <button class="rpl lane-btn" data-lane="compose">compose</button>
+  <button class="rpl lane-btn" data-lane="build">build</button>
+  <button class="rpl lane-btn" data-lane="pkg">pkg</button>
+  <button class="rpl lane-btn" data-lane="spec">spec</button></div>
+<pre id="story"></pre>
+  <div class="keys">[space] step (click, then type)  [a] auto  [↑/↓] lane  [r] restart</div>
+</section>
+
+<footer>
+  Mock only. The renderer it previews lives in scripts/vmf_plan.py preview_cmd;
+  the data behind every line is the plan-N.json + spec.json pair the race
+  consumes. Run the live rich render:
+  <span class="cy">uv run --with rich python3 mocks/plan/plan.py [1-3] [--lane N]</span>.
+</footer>
+
+<script>
+  // The paperclip plan assembly (mocks/plan/plan.py · scenario 1),
+  // replayed the way mocks/run/rich1.html replays the race board.
+  // Real stderr lines from the 2026-09-26 preview; the clock labels
+  // approximate the measured ~3-minute wall time.
+  const FR = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  const NAME = 'paperclip';
+  // [simTime, stage, clockLabel]
+  const HEAD = [
+    [0,   'clone',         't+0:03'],
+    [0.5, 'scout · read',  't+0:09'],
+    [1.2, 'spec · llm',    't+0:38'],
+    [1.8, 'ground · llm',  't+1:12'],
+    [2.2, 'plan prebuilt', 't+1:45'],
+    [2.7, 'plan compose',  't+2:01'],
+    [3.5, 'plan build',    't+2:40'],
+    [4.8, 'plan pkg',      't+3:12'],
+    [5.4, 'dry run',       't+3:14'],
+  ];
+  // Lane state piecewise: [from, state, styleClass, detail].
+  // "waiting" = the slot exists, its llm call is still in flight.
+  const LANES = {
+    prebuilt: [[0, 'waiting', 'dim', ''],
+               [2.2, 'blocked', 'warn', 'no official container image ref']],
+    compose:  [[0, 'waiting', 'dim', ''],
+               [2.7, 'blocked', 'warn', 'no complete compose file']],
+    build:    [[0, 'waiting', 'dim', ''],
+               [3.5, 'plan', 'cy', 'Run as node (uid 1000); onboard --yes']],
+    pkg:      [[0, 'waiting', 'dim', ''],
+               [4.8, 'plan', 'cy', 'onboard --yes --bind lan is the unattend']],
+  };
+  const SKIPPED = ['source', 'no build manifest'];
+  const SPEC = ['deliverable web', 'serve http 0.0.0.0:3100 · path /',
+                'auth required · user non-root'];
+  // [simTime, lane, clockLabel, text] — the preview's stderr lines.
+  const EV = [
+    [0,   '*',       't+0:03', 'clone: shallow · depth 1 (paperclipai/paperclip)'],
+    [0.5, '*',       't+0:09', 'scout: reading README · Dockerfile · package.json · .env.example'],
+    [0.5, '*',       't+0:09', 'scout: source skipped (no build manifest)'],
+    [1.2, 'spec',    't+0:38', 'spec: deliverable web · serve http://0.0.0.0.0:3100/ (intent + scout)'],
+    [1.8, '*',       't+1:12', 'grounded: /docker-library/postgres [node:24-tri…], /nodejs/corepack [pnpm …]'],
+    [2.2, 'prebuilt','t+1:45', 'fanout: prebuilt  .. blocked   no official container image ref'],
+    [2.7, 'compose', 't+2:01', 'fanout: compose   .. blocked   no complete compose file'],
+    [3.5, 'build',   't+2:40', 'fanout: build     .. plan      Run as node (uid 1000); onboard --yes'],
+    [4.8, 'pkg',     't+3:12', 'fanout: pkg       .. plan      onboard --yes --bind lan is the unattend'],
+    [5.4, '*',       't+3:14', 'fanout: 2 runnable, 3 blocked/skipped, 6 llm call(s)'],
+    [5.4, '*',       't+3:14', 'dry run — nothing booted · `just run &lt;src&gt; --intent …` executes'],
+  ];
+  const FINAL = [5.4, '2 runnable · 3 blocked/skipped · 6 llm · dry run — nothing booted'];
+  const DONE = 5.4;
+  const pad = (s, w) => s + ' '.repeat(Math.max(0, w - s.length));
+  let sel = '', fi = 0, spT = null, tm = [];
+  const storyEl = document.getElementById('story');
+  function laneState(name, t) {
+    let st = LANES[name][0];
+    for (const s of LANES[name]) if (t >= s[0]) st = s;
+    return st;
+  }
+  function evStyle(text) {
+    if (text.includes(' .. plan') || text.startsWith('spec:')) return 'cy';
+    if (text.includes('blocked')) return 'warn';
+    if (text.startsWith('dry run') || text.includes('runnable')) return 'ok';
+    if (text.includes('skipped')) return 'dim';
+    return 'dim';
+  }
+  function llmCount(t) {
+    return [1.2, 1.8, 2.2, 2.7, 3.5, 4.8].filter(x => t >= x).length;
+  }
+  function draw(t) {
+    if (spT) { clearInterval(spT); spT = null; }
+    const h = HEAD.filter(x => t >= x[0]).pop();
+    const busy = t < DONE;
+    const fr = FR[fi];
+    const sp = '<span class="mg sp">' + fr + '</span>';
+    const chips = (t < 0.5 ? '' :
+      '  <span class="warn">1 skipped</span>') +
+      (t < 1.2 ? '' : '  <span class="dim">' + llmCount(t) + ' llm</span>');
+    const headLen = 2 + 2 + (NAME + ' · ' + h[1]).length +
+      chips.replace(/<[^>]+>/g, '').length;
+    let out = '  ' + (busy ? sp : ' ') + ' <span class="b">' + NAME +
+      '</span> <span class="dim">· ' + h[1] + '</span>' + chips +
+      ' '.repeat(Math.max(1, 95 - headLen)) +
+      '<span class="dim">' + h[2] + '</span>\n';
+    out += '\n';
+    // The spec line: deriving until the derive call lands, then the
+    // one-line contract with its provenance.
+    if (t < 0.5) {
+      out += '  <span class="dim">spec    (the read has not started)</span>\n';
+    } else if (t < 1.2) {
+      out += '  ' + sp + ' <span class="dim">spec    deriving from the intent + the read …</span>\n';
+    } else {
+      out += '  <span class="dim">spec    </span><span class="b ok">web</span>' +
+        '<span class="cy"> · http 0.0.0.0:3100 · path /</span>' +
+        '<span class="warn"> · auth required</span>' +
+        '<span class="mg"> · user non-root</span>' +
+        '<span class="dim">  ← intent + scout</span>\n';
+    }
+    out += '\n';
+    if (t >= 0.5) {
+      for (const name of ['prebuilt', 'compose', 'build', 'pkg']) {
+        const [, st, stc, det] = laneState(name, t);
+        const act = st === 'waiting';
+        const cur = sel === name ? '<span class="b">&gt;</span> ' : '  ';
+        out += cur + (act ? sp : '  ') + ' <span class="b">' +
+          pad(name, 10) + '</span>' +
+          '<span class="' + stc + '">' + pad(st, 9) + '</span>' +
+          pad(det, 42) + '\n';
+      }
+      out += '  ' + '  ' + ' <span class="b">' + pad(SKIPPED[0], 10) + '</span>' +
+        '<span class="dim">' + pad('skipped', 9) + '</span>' +
+        '<span class="dim">' + pad(SKIPPED[1], 42) + '</span>\n';
+    }
+    out += '\n';
+    const evs = EV.filter(e => t >= e[0] && (!sel || e[1] === sel)).slice(-6);
+    const cap = sel ? '── events · ' + sel + ' ' : '── events ';
+    out += '<span class="dim">' + cap + '[↑/↓ lane] ' +
+      '─'.repeat(Math.max(2, 88 - cap.length)) + '</span>\n';
+    if (!evs.length) out += '  <span class="dim">(no events for this lane yet)</span>\n';
+    for (const [, lane, clock, text] of evs) {
+      const tag = (!sel && lane !== '*') ?
+        '<span class="dim">[' + lane + '] </span>' : '';
+      out += '  <span class="dim">' + pad(clock, 8) + '</span>  ' +
+        tag + '<span class="' + evStyle(text) + '">' + text + '</span>\n';
+    }
+    if (t >= FINAL[0]) out += '\n  <span class="ok">' + FINAL[1] + '</span>\n';
+    storyEl.innerHTML = out;
+    if (busy) spT = setInterval(() => {
+      fi = (fi + 1) % 10;
+      storyEl.querySelectorAll('.sp').forEach(el => { el.textContent = FR[fi]; });
+    }, 90);
+  }
+  function setLane(l) {
+    sel = l;
+    document.querySelectorAll('.lane-btn').forEach(b =>
+      b.classList.toggle('on', (b.dataset.lane || '') === sel));
+    draw(playing());
+  }
+  const PTS = [0, 0.5, 1.2, 1.8, 2.2, 2.7, 3.5, 4.8, 5.4];
+  let at = DONE;
+  const playing = () => at;
+  function play() {
+    tm.forEach(clearTimeout); tm = [];
+    PTS.forEach(p => tm.push(setTimeout(() => { at = p; draw(p); }, p * 1000)));
+    tm.push(setTimeout(() => { at = DONE; draw(DONE); }, DONE * 1000 + 400));
+  }
+  play();
+  document.getElementById('replay').onclick = play;
+  document.querySelectorAll('.lane-btn').forEach(b =>
+    b.onclick = () => setLane(b.dataset.lane || ''));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const order = ['', 'prebuilt', 'compose', 'build', 'pkg', 'spec'];
+      let i = order.indexOf(sel); if (i < 0) i = 0;
+      sel = e.key === 'ArrowDown'
+        ? order[Math.min(i + 1, order.length - 1)]
+        : order[Math.max(i - 1, 0)];
+      setLane(sel);
+    }
+  });
+</script>
+</body>
+</html>

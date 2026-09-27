@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vmf run · rich mock</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    background: #0d1117; color: #c9d1d9; margin: 0; padding: 28px 20px 48px;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  }
+  header, section, footer { max-width: 980px; margin: 0 auto 22px; }
+  header h1 { font-size: 15px; color: #e6edf3; margin: 0 0 6px; }
+  header p { color: #8b949e; margin: 0 0 8px; }
+  nav a { color: #58a6ff; text-decoration: none; margin-right: 14px; font-size: 12px; }
+  nav a:hover { text-decoration: underline; }
+  .cap { color: #8b949e; margin-bottom: 6px; font-size: 12px; }
+  .cap b { color: #e6edf3; font-weight: 600; }
+  pre {
+    margin: 0; padding: 12px 16px; overflow-x: auto; white-space: pre;
+    background: #010409; border: 1px solid #21262d; border-radius: 8px;
+  }
+  .b    { color: #e6edf3; font-weight: 600; }
+  .dim  { color: #8b949e; }
+  .ok   { color: #3fb950; }
+  .bad  { color: #f85149; }
+  .warn { color: #d29922; }
+  .cy   { color: #76e3ea; }
+  .mg   { color: #d2a8ff; }
+  .bl   { color: #58a6ff; }
+  footer { color: #8b949e; font-size: 12px; }
+  .rpl { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; font: inherit; font-size: 11px; border-radius: 4px; padding: 1px 8px; cursor: pointer; }
+  .rpl:hover { background: #30363d; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>vmf run — rich mock</h1>
+  <p>Five styles for in-line progress. Writers stay plain (status files + race-logs); rich renders only when stdout is a TTY.</p>
+  <nav>
+    <a href="#fanout">1 · fanout lanes</a>
+    <a href="#window">2 · window bar</a>
+    <a href="#race">3 · race table</a>
+    <a href="#verdict">4 · verdict panel</a>
+    <a href="#watch">5 · watch board</a>
+  </nav>
+</header>
+
+<section id="fanout">
+  <div class="cap"><b>1 · fanout lanes</b> — rich.progress, one lane per approach slot. Only on a TTY; race-logs keep plain events.</div>
+
+  <div class="cap"><b>1a · flat</b> — lanes resolve in place; grounding cites its lane; only active work spins.</div>
+<pre>
+<span class="mg sp">⠋</span> <span class="b">cyberchef</span> <span class="dim">· plan · fanout</span>  <span class="cy">3 planned</span>  <span class="warn">2 skipped</span>  <span class="dim">4 llm</span><span class="dim">                                                                  </span><span class="dim">t+0:14</span>
+    <span class="b">prebuilt </span> <span class="cy">plan    </span> guest: docker run -p 8080:8080          <span class="dim">ghcr.io/gchq/cyberchef</span>  <span class="dim">fast/T0</span>
+    <span class="b">compose  </span> <span class="warn">skipped </span> no compose file                                              <span class="dim">—</span>
+    <span class="b">build    </span> <span class="cy">plan    </span> build with --ulimit nofile=10000; nginx <span class="dim">/gchq/cyberchef</span>         <span class="dim">medium/T1</span>
+    <span class="b">pkg      </span> <span class="cy">plan    </span> npm start dev server on 8080            <span class="dim">Node.js v24 install</span>     <span class="dim">slow/T2</span>
+    <span class="b">source   </span> <span class="warn">skipped </span> no build manifest                                                <span class="dim">—</span>
+</pre>
+
+  <div class="cap"><b>1b · band-grouped</b> — lanes grouped by tranche band; cites ride with each plan.</div>
+<pre>
+<span class="mg sp">⠹</span> <span class="b">cyberchef</span> <span class="dim">· plan · fanout</span>  <span class="cy">3 planned</span>  <span class="warn">2 skipped</span>  <span class="dim">4 llm</span><span class="dim">                                                                  </span><span class="dim">t+0:14</span>
+  <span class="dim">T0 fast ─────────────────────────────────────────────────────────────</span>
+    <span class="b">prebuilt </span> <span class="cy">plan    </span> guest: docker run -p 8080:8080          <span class="dim">ghcr.io/gchq/cyberchef</span>
+  <span class="dim">T1 medium ──────────────────────────────────────────────────────────</span>
+    <span class="b">build    </span> <span class="cy">plan    </span> build with --ulimit nofile=10000; nginx <span class="dim">/gchq/cyberchef</span>
+  <span class="dim">T2 slow ─────────────────────────────────────────────────────────────</span>
+    <span class="b">pkg      </span> <span class="cy">plan    </span> npm start dev server on 8080            <span class="dim">Node.js v24 install</span>
+  <span class="dim">— skipped ──────────────────────────────────────────────────────────</span>
+    <span class="b">compose  </span> <span class="warn">skipped </span> no compose file
+    <span class="b">source   </span> <span class="warn">skipped </span> no build manifest
+</pre>
+
+  <div class="cap"><b>1c · lifecycle · scout flow</b> — clone → scan (the files the sieve reads + the release inventory) → the scout emits routes as it reads, each clamping into a lane (no per-lane llm) with prebuilt booting while the scout still reads; skips are scan findings; losers park. The board stays open through promotion: the winning lane re-boots the canonical instance (promoting → final pass with the canonical target), and the board's last line IS the verdict. <button class="rpl" id="replay">↻ replay</button></div>
+<pre id="story"></pre>
+</section>
+
+<section id="window">
+  <div class="cap"><b>2 · window bar</b> — rich.progress countdown during the promotion wait; same event still lands in the status file.</div>
+<pre>
+<span class="mg sp">⠹</span> <span class="b">ghost-c1</span> <span class="dim">· promote · waiting for verify window</span>
+   <span class="bar" data-remaining="860" data-total="1200"></span>  <span class="clock" data-remaining="860" data-total="1200"></span> <span class="dim">·</span> exec:mysql <span class="ok">✓</span> exec:redis <span class="ok">✓</span> <span class="dim">·</span> tcp:2368 <span class="bad">✗ closed</span> tcp:80 <span class="bad">✗ closed</span>
+</pre>
+</section>
+
+<section id="race">
+  <div class="cap"><b>3 · race table</b> — rich.live redrawing one Table; a row per status event. Band headers (T0→T3) would section candidates.</div>
+<pre>
+┌──────┬──────────┬────────┬──────────────────────────────────────────────┐
+│ <span class="b">t+   </span>│ <span class="b">candidate</span>│ <span class="b">stage  </span>│ <span class="b">detail                                       </span>│
+├──────┼──────────┼────────┼──────────────────────────────────────────────┤
+│ 0:00 │ ghost-c1 │ boot   │ compose · 5108MB · guest 192.168.42.100      │
+│ 0:42 │ ghost-c1 │ verify │ waiting · tcp:2368 · tcp:80                  │
+│ 1:13 │ ghost-c1 │ verify │ <span class="ok">exec:mysql ✓</span> · <span class="ok">exec:redis ✓</span>                  │
+│ 2:05 │ ghost-c1 │ verify │ <span class="bad">tcp:2368 ✗ closed</span> · gateway up, no upstream  │
+│ 5:47 │ ghost-c1 │ boot   │ <span class="bad">✗ data-ghost-dev-1 Exited (127)</span>              │
+│      │          │        │   <span class="warn">sh: 1: nodemon: not found</span>                  │
+└──────┴──────────┴────────┴──────────────────────────────────────────────┘
+</pre>
+</section>
+
+<section id="verdict">
+  <div class="cap"><b>4 · verdict panel</b> — rich.Panel for the final honest verdict; the same text stays in the plain status file for non-TTY.</div>
+<pre>
+╭─ <span class="b">verdict · ghost-c1</span> ───────────────────────────────────╮
+│ <span class="bad b">FAIL 2/4</span> <span class="dim">· window 20:00 expired</span>                        │
+│                                                        │
+│ <span class="bad">✗ data-ghost-dev-1 Exited (127)</span>                        │
+│   <span class="warn">sh: 1: nodemon: not found</span>                            │
+│ <span class="ok">✓ mysql healthy · redis healthy · gateway up</span>           │
+│                                                        │
+│ <span class="dim">evidence </span><span class="cy">~/.vmf/runs/ghost-c1.verify-evidence.json</span>      │
+│ <span class="dim">console  </span><span class="cy">~/.vmf/runs/ghost-c1.verify-console.txt</span>        │
+╰────────────────────────────────────────────────────────╯
+</pre>
+</section>
+
+<section id="watch">
+  <div class="cap"><b>5 · watch board</b> — <span class="b">just watch</span> redrawing ~/.vmf/runs/.status as a Table. Rich's main home: the watcher, not the writers.</div>
+<pre>
+┌────────────┬────────┬──────────────────────────────┬────────────┐
+│ <span class="b">run        </span>│ <span class="b">stage  </span>│ <span class="b">detail                       </span>│ <span class="b">window     </span>│
+├────────────┼────────┼──────────────────────────────┼────────────┤
+│ <span class="ok">✔</span> cyberchef│ <span class="ok">pass   </span>│ tcp://192.168.42.191:8080    │ <span class="dim">t+1:15     </span>│
+│ <span class="mg sp">⠸</span> ghost-c1 │ verify │ <span class="ok">exec ✓✓</span> · <span class="bad">tcp ✗✗ closed</span>      │ <span class="warn">14:20/20:00</span>│
+│ <span class="ok">✔</span> ghost    │ <span class="ok">pass   </span>│ install_script · .100        │ <span class="dim">t+5:02     </span>│
+└────────────┴────────┴──────────────────────────────┴────────────┘
+</pre>
+</section>
+
+<footer>mock · spinners + countdown + lifecycle replay animate · data from this week's runs (cyberchef, ghost)</footer>
+
+<script>
+  const FR = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  document.querySelectorAll('.sp').forEach((el, i) => {
+    let f = (i * 3) % 10;
+    setInterval(() => { el.textContent = FR[f = (f + 1) % 10]; }, 90);
+  });
+
+  document.querySelectorAll('.bar, .clock').forEach(el => {
+    const W = 21;
+    let r = +el.dataset.remaining; const t = +el.dataset.total;
+    const draw = () => {
+      r = Math.max(0, r - 1); el.dataset.remaining = r;
+      if (el.classList.contains('bar')) {
+        const fill = Math.round((t - r) / t * W);
+        el.innerHTML = '<span class="cy">' + '━'.repeat(fill) + (fill < W ? '╸' : '') + '</span>'
+          + '<span class="dim">' + '─'.repeat(W - fill - (fill < W ? 1 : 0)) + '</span>';
+      } else {
+        el.textContent = Math.floor(r / 60) + ':' + String(r % 60).padStart(2, '0') + ' / ' + Math.floor(t / 60) + ':00';
+      }
+    };
+    draw();
+    if (r === 0) return;
+    const iv = setInterval(() => { draw(); if (r === 0) clearInterval(iv); }, 1000);
+  });
+
+  const storyEl = document.getElementById('story');
+  const EMIT = [
+    [3.0, 'prebuilt', 'guest: docker run -p 8080:8080', 'fast/T0', 'ghcr.io/gchq/cyberchef'],
+    [4.6, 'release',  'unzip release · serve web/ on 8080', 'fast/T0', 'releases · v10.19.2.zip'],
+    [6.0, 'build',    'build with --ulimit nofile=10000; nginx', 'medium/T1', '/gchq/cyberchef'],
+    [7.0, 'pkg',      'npm start dev server on 8080', 'slow/T2', 'Node.js v24 install'],
+  ];
+  const BOOT = [3.4, 'prebuilt'];
+  const PASS = [8.4, 'prebuilt', 'tcp://192.168.42.191:8080'];
+  const PROMOTE = [9.0, 'canonical · winner drive'];
+  const FINAL = [10.2, 'tcp://192.168.42.110:8080'];
+  const HEAD = [[0, 'clone · cloning source tree', 't+0:00'], [1.0, 'scan · package.json · README · releases v10.19.2', 't+0:05'], [2.0, 'scout · reading evidence + releases', 't+0:08'], [3.4, 'scout + boot prebuilt', 't+0:10'], [7.6, 'boot prebuilt · scout done · 4 routes', 't+0:22'], [8.4, 'pass · candidate', 't+1:15'], [9.0, 'promote · booting canonical', 't+1:17'], [10.2, 'pass', 't+1:28']];
+  let fi = 0, spT = null, tm = [];
+  const pad = (s, w) => s + ' '.repeat(Math.max(0, w - s.length));
+  function draw(t) {
+    if (spT) { clearInterval(spT); spT = null; }
+    const h = HEAD.filter(x => t >= x[0]).pop();
+    const rows = [];
+    for (const e of EMIT) {
+      if (t < e[0]) continue;
+      const [, name, det0, band, cite] = e;
+      let st, stc, det = det0, slot = ' ';
+      if (name === PASS[1] && t >= FINAL[0]) { st = 'pass'; stc = 'ok'; det = FINAL[1]; }
+      else if (name === PASS[1] && t >= PROMOTE[0]) { st = 'promoting'; stc = 'mg'; det = PROMOTE[1]; slot = '<span class="mg sp">' + FR[fi] + '</span>'; }
+      else if (name === PASS[1] && t >= PASS[0]) { st = 'pass'; stc = 'ok'; det = PASS[2]; }
+      else if (name === BOOT[1] && t >= BOOT[0] && t < PASS[0]) { st = 'booting'; stc = 'mg'; slot = '<span class="mg sp">' + FR[fi] + '</span>'; }
+      else if (t >= PASS[0]) { st = 'parked'; stc = 'dim'; }
+      else { st = 'plan'; stc = 'cy'; }
+      const dimmed = stc === 'dim';
+      const detSpan = st === 'pass' ? '<span class="cy">' + pad(det, 40) + '</span>'
+        : dimmed ? '<span class="dim">' + pad(det, 40) + '</span>' : pad(det, 40);
+      rows.push('  ' + slot + ' ' + '<span class="b">' + pad(name, 10) + '</span>'
+        + '<span class="' + stc + '">' + pad(st, 9) + '</span>' + detSpan
+        + '<span class="dim">' + pad(cite, 24) + '</span> '
+        + '<span class="dim">' + band + '</span>');
+    }
+    if (t >= 1) rows.push('  <span class="dim">skipped · no compose file · no build manifest</span>');
+    if (t >= PROMOTE[0] && t < FINAL[0]) {
+      const el = Math.round((t - PROMOTE[0]) / (FINAL[0] - PROMOTE[0]) * 11);
+      const fill = Math.round(el / 11 * 20);
+      rows.push('  <span class="cy">' + '━'.repeat(fill) + (fill < 20 ? '╸' : '') + '</span>'
+        + '<span class="dim">' + '─'.repeat(20 - fill - (fill < 20 ? 1 : 0)) + '</span>'
+        + '  0:0' + el + ' / 0:11 · canonical boot from the winner data drive');
+    }
+    const chips = t < 3 ? '  <span class="dim">planning…</span>' : '  <span class="warn">2 skipped</span>  <span class="dim">2 llm</span>';
+    const vis = 14 + h[1].length + chips.replace(/<[^>]+>/g, '').length;
+    const busy = t < PASS[0] || (t >= PROMOTE[0] && t < FINAL[0]);
+    const hs = busy ? '<span class="mg sp">' + FR[fi] + '</span>' : ' ';
+    storyEl.innerHTML = hs + ' <span class="b">cyberchef</span> <span class="dim">· ' + h[1] + '</span>' + chips
+      + ' '.repeat(Math.max(1, 90 - vis)) + '<span class="dim">' + h[2] + '</span>\n'
+      + rows.join('\n');
+    if (busy) spT = setInterval(() => { fi = (fi + 1) % 10; storyEl.querySelectorAll('.sp').forEach(el => { el.textContent = FR[fi]; }); }, 90);
+  }
+  function play() { tm.forEach(clearTimeout); tm = []; [0, 1.0, 2.0, 3, 3.4, 4.6, 6, 7, 7.6, 8.4, 9.0, 9.6, 10.2].forEach(x => tm.push(setTimeout(() => draw(x), x * 1000))); }
+  play();
+  document.getElementById('replay').onclick = play;
+</script>
+</body>
+</html>

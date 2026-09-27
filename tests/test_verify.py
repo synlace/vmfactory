@@ -10,12 +10,14 @@
 #
 # Run: uv run --with pyyaml --with jsonschema python -m unittest discover tests
 import io
+import http.server
 import json
 import os
 import shutil
 import socket
 import sys
 import tempfile
+import threading
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -201,6 +203,93 @@ class ContainerExec(unittest.TestCase):
             "exec:db:mysqladmin ping -h x")
 
 
+class CmdChecks(unittest.TestCase):
+    # The two-level CLI check over the ssh seam: level one proves the
+    # binary is on the login PATH, level two runs the probe ladder with
+    # the exit policy (exit 0 pass · 127 not installed · usage output
+    # pass · else installed-but-fails).
+    def run_spec(self, template, spec):
+        os.environ["VMF_VERIFY_SSH"] = template
+        try:
+            return vmf_verify.check_cmd(spec, "vm")
+        finally:
+            del os.environ["VMF_VERIFY_SSH"]
+
+    def test_exit_zero_passes(self):
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*) echo 'mvt 1.5.2';; esac",
+            {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}})
+        self.assertTrue(ok)
+        self.assertIsNone(ev)
+
+    def test_not_installed_fails_at_level_one(self):
+        ok, ev = self.run_spec(
+            "exit 9",
+            {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}})
+        self.assertFalse(ok)
+        self.assertIn("not installed", ev["actual"])
+
+    def test_usage_exit_counts_as_running(self):
+        # argparse/click-style: the tool runs but rejects the probe flag.
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*) echo 'usage: mvt [-h]'; exit 2;; esac",
+            {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}})
+        self.assertTrue(ok)
+        self.assertIsNone(ev)
+
+    def test_probe_127_fails_as_not_found(self):
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*) exit 127;; esac",
+            {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}})
+        self.assertFalse(ok)
+        self.assertIn("127", ev["actual"])
+
+    def test_installed_but_probe_fails(self):
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*) echo 'Traceback (most recent call last)'; exit 1;; esac",
+            {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}})
+        self.assertFalse(ok)
+        self.assertIn("installed, probe fails", ev["actual"])
+
+    def test_ladder_second_probe_wins(self):
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*--version*) echo junk; exit 1;; "
+            "*) echo 'Commands: check-blob';; esac",
+            {"cmd": {"bin": "mvt",
+                     "probes": ["mvt --version", "mvt --help"]}})
+        self.assertTrue(ok)
+        self.assertIsNone(ev)
+
+    def test_expect_exit_declared(self):
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; *) exit 2;; esac",
+            {"cmd": {"bin": "mvt", "probes": ["mvt bare"],
+                     "expect_exit": 2}})
+        self.assertTrue(ok)
+        self.assertIsNone(ev)
+
+    def test_expect_out_regex_passes_nonzero(self):
+        ok, ev = self.run_spec(
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*) echo 'installed build 7.2.1'; exit 1;; esac",
+            {"cmd": {"bin": "mvt", "probes": ["mvt status"],
+                     "expect_out": r"build \d"}})
+        self.assertTrue(ok)
+        self.assertIsNone(ev)
+
+    def test_spec_key_uses_bin(self):
+        self.assertEqual(
+            vmf_verify.spec_key(
+                "cmd", None,
+                {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}}),
+            "cmd:mvt")
+
+
 class DeriveChecks(unittest.TestCase):
     def test_tcp_from_ports_plus_model_checks(self):
         plan = {"ports": [1337, 1338],
@@ -220,6 +309,44 @@ class DeriveChecks(unittest.TestCase):
         runnable, skipped = vmf_verify.derive_checks(plan, {})
         self.assertEqual([(k, p) for k, p, _ in runnable],
                          [("tcp", 8080)])
+        self.assertEqual(skipped, [])
+
+    def test_cmd_check_routed(self):
+        plan = {"ports": [],
+                "checks": [{"cmd": {"bin": "mvt",
+                                    "probes": ["mvt --version"]}}]}
+        runnable, skipped = vmf_verify.derive_checks(plan, {})
+        self.assertEqual([(k, p) for k, p, _ in runnable], [("cmd", None)])
+        self.assertEqual(skipped, [])
+
+    def test_compose_gets_floor_probe_despite_tcp_checks(self):
+        # tcp alone is vacuous for compose stacks: docker's userland
+        # proxy accepts on a published port even with a dead backend.
+        # The floor probe joins whenever no probe is declared, even
+        # when the plan carries (tcp-shaped) checks of its own.
+        plan = {"primary": "app",
+                "services": [{"name": "app",
+                              "ports": [{"host": 3100, "proto": "tcp"}]}],
+                "checks": [{"tcp": {"port": 3100}}]}
+        runnable, skipped = vmf_verify.derive_checks(plan, {})
+        self.assertEqual([(k, p) for k, p, _ in runnable],
+                         [("tcp", 3100), ("probe", 3100)])
+        self.assertEqual(skipped, [])
+
+    def test_env_checks_merge_into_plan(self):
+        # Synthetic-stack boots (prebuilt/dockerfile) have no plan of
+        # their own: the approach's declared checks ride VMF_PLAN_CHECKS
+        # and merge beside the derived tcp checks. Declared checks do
+        # not suppress the floor probe when none is a probe.
+        os.environ["VMF_PLAN_CHECKS"] = json.dumps(
+            [{"exec": {"cmd": "echo hi"}}])
+        try:
+            runnable, skipped = vmf_verify.derive_checks(
+                {"ports": [8080]}, {})
+        finally:
+            del os.environ["VMF_PLAN_CHECKS"]
+        self.assertEqual([(k, p) for k, p, _ in runnable],
+                         [("tcp", 8080), ("probe", 8080), ("exec", None)])
         self.assertEqual(skipped, [])
 
 
@@ -256,18 +383,39 @@ class RunFlow(unittest.TestCase):
         return a
 
     def test_all_pass(self):
-        s, port = free_port()
-        s.listen(1)
+        stub = HttpStub()
+        stub.routes = {"/": (200, "ok")}
+        stub.start()
         try:
             out = io.StringIO()
             with redirect_stdout(out):
                 rc = vmf_verify.run_cmd(self.args(
-                    {"ports": [port],
+                    {"ports": [stub.port],
                      "checks": [{"exec": {"cmd": "echo hi"}}]}))
         finally:
-            s.close()
+            stub.stop()
         self.assertEqual(rc, 0)
-        self.assertIn("verdict: 2/2 checks pass", out.getvalue())
+        self.assertIn("verdict: 3/3 checks pass", out.getvalue())
+
+    def test_pass_verdict_names_what_was_proven(self):
+        # The bare word overclaims: the printed verdict carries the
+        # proven-check list (the marker itself stays exactly "pass").
+        stub = HttpStub()
+        stub.routes = {"/": (200, "ok")}
+        stub.start()
+        try:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = vmf_verify.run_cmd(self.args(
+                    {"ports": [stub.port],
+                     "checks": [{"exec": {"cmd": "echo hi"}}]}))
+        finally:
+            stub.stop()
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            "checks pass (tcp:%d, probe:%d/, exec:echo hi)"
+            % (stub.port, stub.port),
+            out.getvalue())
 
     def test_fail_writes_evidence(self):
         s, port = free_port()
@@ -404,6 +552,87 @@ class RunFlow(unittest.TestCase):
         # not "pass" (the race must not crown it).
         self.assertEqual(rc, 2)
         self.assertIn("unverified", out.getvalue())
+
+    def test_cmd_check_run_passes(self):
+        os.environ["VMF_VERIFY_SSH"] = (
+            "case {cmd} in *'command -v mvt'*) exit 0;; "
+            "*) echo 'mvt 1.5.2';; esac")
+        try:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = vmf_verify.run_cmd(self.args(
+                    {"ports": [],
+                     "checks": [{"cmd": {"bin": "mvt",
+                                         "probes": ["mvt --version"]}}]}))
+        finally:
+            os.environ["VMF_VERIFY_SSH"] = "true"
+        self.assertEqual(rc, 0)
+        self.assertIn("verdict: 1/1 checks pass", out.getvalue())
+        self.assertIn("check cmd:mvt pass", out.getvalue())
+
+    def test_cmd_check_run_fails_with_evidence(self):
+        # ssh answers (the readiness gate passes) but the binary check
+        # fails every poll: not-installed evidence after the deadline.
+        os.environ["VMF_VERIFY_SSH"] = (
+            "case {cmd} in *'command -v mvt'*) exit 9;; *) exit 0;; esac")
+        try:
+            ev_path = os.path.join(self.tmp, "ev.json")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = vmf_verify.run_cmd(self.args(
+                    {"ports": [],
+                     "checks": [{"cmd": {"bin": "mvt",
+                                         "probes": ["mvt --version"]}}]},
+                    deadline=3, evidence_out=ev_path))
+        finally:
+            os.environ["VMF_VERIFY_SSH"] = "true"
+        self.assertEqual(rc, 1)
+        self.assertIn("check cmd:mvt FAIL", out.getvalue())
+        ev = json.load(open(ev_path))
+        self.assertEqual(ev[0]["check"], "cmd:mvt")
+        self.assertIn("not installed", ev[0]["actual"])
+
+    def test_liveness_hold_passes_when_steady(self):
+        # A pass must hold across two sweeps: with a steady check and a
+        # short hold the verdict still lands.
+        os.environ["VMF_VERIFY_HOLD"] = "1"
+        try:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = vmf_verify.run_cmd(self.args(
+                    {"checks": [{"exec": {"cmd": "echo hi"}}]},
+                    deadline=15))
+        finally:
+            os.environ["VMF_VERIFY_HOLD"] = "0"
+        self.assertEqual(rc, 0)
+        self.assertIn("holding 1s for liveness", out.getvalue())
+
+    def test_lapse_fails_the_verdict(self):
+        # The paperclip class: the check answers the first sweep and is
+        # gone after. The hold sweep catches the lapse and the verdict
+        # fails with the vanished check's evidence.
+        flag = os.path.join(self.tmp, "lapse-flag")
+        os.environ["VMF_VERIFY_SSH"] = (
+            "case {cmd} in *'vmf-verify-ready'*) exit 0;; "
+            "*'echo hi'*) if [ -f %s ]; then exit 9; "
+            "else touch %s; exit 0; fi;; "
+            "*) exit 0;; esac" % (flag, flag))
+        try:
+            ev_path = os.path.join(self.tmp, "ev.json")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = vmf_verify.run_cmd(self.args(
+                    {"checks": [{"exec": {"cmd": "echo hi"}}]},
+                    deadline=20, evidence_out=ev_path))
+        finally:
+            if self.old_ssh is None:
+                os.environ.pop("VMF_VERIFY_SSH", None)
+            else:
+                os.environ["VMF_VERIFY_SSH"] = self.old_ssh
+        self.assertEqual(rc, 1)
+        self.assertIn("holding", out.getvalue())
+        self.assertIn("liveness lapse", out.getvalue())
+        self.assertIn("check exec:echo hi FAIL", out.getvalue())
 
     def test_log_and_rfb_skipped(self):
         out = io.StringIO()
@@ -676,6 +905,12 @@ class TargetRender(unittest.TestCase):
         self.assertEqual(
             vmf_verify.render_target(runnable, {8080: 8080}),
             "http://127.0.0.1:8080/")
+
+    def test_cmd_only_renders_cli_target(self):
+        runnable = [("cmd", None,
+                     {"cmd": {"bin": "mvt", "probes": ["mvt --version"]}})]
+        self.assertEqual(vmf_verify.render_target(runnable, {}),
+                         "cli://mvt")
 
     def test_empty_runnable_renders_none(self):
         self.assertIsNone(vmf_verify.render_target([], {}))

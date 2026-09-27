@@ -493,9 +493,17 @@ class SynthChecks(unittest.TestCase):
         self.assertEqual([c["tcp"]["port"] for c in out[:1]], [8080])
         self.assertTrue(any("probe" in c for c in out))
 
-    def test_command_only_gives_exec(self):
-        out = vmf_plan._synth_checks([], ["ghost", "version"])
-        self.assertEqual(out, [{"exec": {"cmd": "sh -c 'command -v ghost'"}}])
+    def test_command_only_gives_cmd_ladder(self):
+        out = vmf_plan._synth_checks([], ["mvt", "android", "check"])
+        self.assertEqual(out, [{"cmd": {"bin": "mvt",
+                                        "probes": ["mvt --version",
+                                                   "mvt --help"]}}])
+
+    def test_keepalive_command_synthesizes_nothing(self):
+        # A keep-alive command names no app; an unverified verdict beats
+        # a vacuous `command -v sleep` pass.
+        self.assertEqual(vmf_plan._synth_checks([], ["sleep", "100000000"]),
+                         [])
 
     def test_declared_checks_win(self):
         out = vmf_plan._synth_checks([], [])
@@ -662,3 +670,828 @@ services:
         p = self.path("manifest.json")
         open(p, "w").write(json.dumps(plan))
         return p
+
+
+class CmdChecksClamp(unittest.TestCase):
+    """The cmd check vocabulary: bin + probe ladder, clamped."""
+
+    def test_full_cmd_check_clamped(self):
+        out = vmf_plan._clamp_checks(
+            [{"cmd": {"bin": "mvt",
+                      "probes": ["mvt --version", "  ", "mvt -V", "x"],
+                      "expect_exit": 2, "expect_out": r"v\d+"}}])
+        self.assertEqual(out, [{"cmd": {"bin": "mvt",
+                                        "probes": ["mvt --version", "mvt -V",
+                                                   "x"],
+                                        "expect_exit": 2,
+                                        "expect_out": r"v\d+"}}])
+
+    def test_bin_derived_from_first_probe(self):
+        out = vmf_plan._clamp_checks([{"cmd": {"probes": ["mvt --version"]}}])
+        self.assertEqual(out, [{"cmd": {"bin": "mvt",
+                                        "probes": ["mvt --version"]}}])
+
+    def test_bin_only_expands_ladder(self):
+        out = vmf_plan._clamp_checks([{"cmd": {"bin": "mvt"}}])
+        self.assertEqual(out, [{"cmd": {"bin": "mvt",
+                                        "probes": ["mvt --version",
+                                                   "mvt --help"]}}])
+
+    def test_junk_dropped(self):
+        out = vmf_plan._clamp_checks(
+            [{"cmd": {}}, {"cmd": {"bin": ""}},
+             {"cmd": {"probes": ["   "]}}, {"cmd": "junk"}])
+        self.assertEqual(out, [])
+
+    def test_bad_regex_omitted_check_kept(self):
+        out = vmf_plan._clamp_checks(
+            [{"cmd": {"bin": "mvt", "probes": ["mvt --version"],
+                      "expect_out": "(bad"}}])
+        self.assertEqual(out, [{"cmd": {"bin": "mvt",
+                                        "probes": ["mvt --version"]}}])
+
+
+class UserClamp(unittest.TestCase):
+    """The plan's run account: created by the install list, dropped to
+    by the guest init via setuidgid. Apps that refuse root need it."""
+
+    def test_valid_names(self):
+        self.assertEqual(vmf_plan._clamp_user("paperclip"), "paperclip")
+        self.assertEqual(vmf_plan._clamp_user("App_2"), "app_2")
+        self.assertEqual(vmf_plan._clamp_user("svc-worker-2"),
+                         "svc-worker-2")
+        self.assertEqual(vmf_plan._clamp_user("_svc"), "_svc")
+
+    def test_junk_dropped(self):
+        self.assertEqual(vmf_plan._clamp_user(""), "")
+        self.assertEqual(vmf_plan._clamp_user(None), "")
+        self.assertEqual(vmf_plan._clamp_user("1abc"), "")
+        self.assertEqual(vmf_plan._clamp_user("has space"), "")
+        self.assertEqual(vmf_plan._clamp_user("/etc/passwd"), "")
+        self.assertEqual(vmf_plan._clamp_user("x" * 33), "")
+
+    def test_direct_plan_carries_user(self):
+        d = vmf_plan._clamp_direct(
+            {"command": ["paperclipai", "run"], "user": "Paperclip"},
+            [])
+        self.assertEqual(d["user"], "paperclip")
+
+
+class BaseImageClamp(unittest.TestCase):
+    """A direct plan's base_image is ONE oci ref: the fat-base ready
+    marker line carries a timestamp, and a model echo of it died at
+    derive on buildah's "invalid reference format"."""
+
+    def test_timestamp_dropped(self):
+        self.assertEqual(vmf_plan._clamp_base_image(
+            "localhost/vmf-fat-base:1 2026-09-23T09:47:02+01:00"),
+            "localhost/vmf-fat-base:1")
+
+    def test_plain_ref_unchanged(self):
+        self.assertEqual(vmf_plan._clamp_base_image("python:3.12-slim"),
+                         "python:3.12-slim")
+
+    def test_empty(self):
+        self.assertEqual(vmf_plan._clamp_base_image(None), "")
+        self.assertEqual(vmf_plan._clamp_base_image("  "), "")
+
+    def test_direct_plan_base_clamped(self):
+        d = vmf_plan._clamp_direct(
+            {"base_image": "localhost/vmf-fat-base:1 2026-09-23",
+             "command": ["mvt", "version"]}, [])
+        self.assertEqual(d["base_image"], "localhost/vmf-fat-base:1")
+
+
+class FatBaseRef(Tmp):
+    """fat_base_ref: the ready marker is "<ref> <timestamp>" on one
+    line; only the ref token may reach the plan and derive."""
+
+    def setUp(self):
+        super().setUp()
+        self.old_home = os.environ["HOME"]
+        self.old_base = os.environ.pop("VMF_BASE_IMAGE", None)
+        os.environ["HOME"] = self.tmp
+
+    def tearDown(self):
+        os.environ["HOME"] = self.old_home
+        if self.old_base is not None:
+            os.environ["VMF_BASE_IMAGE"] = self.old_base
+        else:
+            os.environ.pop("VMF_BASE_IMAGE", None)
+        super().tearDown()
+
+    def _ready(self, text):
+        d = os.path.join(self.tmp, ".local", "share", "vmf")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "fat-base.ready"), "w").write(text)
+
+    def test_marker_timestamp_stripped(self):
+        self._ready("localhost/vmf-fat-base:1 2026-09-23T09:47:02+01:00\n")
+        self.assertEqual(vmf_plan.fat_base_ref(),
+                         "localhost/vmf-fat-base:1")
+
+    def test_env_wins_and_strips(self):
+        os.environ["VMF_BASE_IMAGE"] = ("localhost/x:1 "
+                                        "2026-09-23T09:47:02+01:00")
+        self.assertEqual(vmf_plan.fat_base_ref(), "localhost/x:1")
+
+    def test_missing_marker_empty(self):
+        self.assertEqual(vmf_plan.fat_base_ref(), "")
+# ---- target-state spec (intent → deliverable contract) ----
+
+import vmf_llm  # noqa: E402
+
+
+class _Repo(Tmp):
+    # A repo fixture builder shared by the fan-out/preview test classes.
+    def _mkrepo(self, files):
+        d = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+SPEC_WEB = {"deliverable": "web",
+            "serve": {"proto": "http", "port": 3100, "path": "/"},
+            "auth": {"required": True, "note": "first-run admin"},
+            "env_required": ["BETTER_AUTH_SECRET"],
+            "user": "non-root", "hold": 25,
+            "why": "paperclip serves web"}
+
+
+class SpecClamp(Tmp):
+    def test_clamp_spec_full(self):
+        s = vmf_plan._clamp_spec(dict(SPEC_WEB),
+                                 intent="run the web server on port 3100")
+        self.assertEqual(s["deliverable"], "web")
+        self.assertEqual(s["serve"]["port"], 3100)
+        self.assertEqual(s["serve"]["path"], "/")
+        self.assertTrue(s["auth"]["required"])
+        self.assertEqual(s["env_required"], ["BETTER_AUTH_SECRET"])
+        self.assertEqual(s["user"], "non-root")
+        self.assertEqual(s["hold"], 25)
+        self.assertEqual(s["intent"], "run the web server on port 3100")
+
+    def test_intent_port_wins(self):
+        s = vmf_plan._clamp_spec({"deliverable": "web",
+                                  "serve": {"port": 9999}},
+                                 intent="serve on port 4242")
+        self.assertEqual(s["serve"]["port"], 4242)
+
+    def test_junk_degrades(self):
+        self.assertIsNone(vmf_plan._clamp_spec("junk"))
+        s = vmf_plan._clamp_spec({"deliverable": "app",
+                                  "serve": {"proto": "gopher", "path": "x"},
+                                  "env_required": ["lower", "OK_KEY"],
+                                  "user": "1bad", "hold": 9999})
+        self.assertEqual(s["deliverable"], "")
+        self.assertEqual(s["serve"]["proto"], "http")
+        self.assertEqual(s["serve"]["path"], "/")
+        self.assertEqual(s["env_required"], ["OK_KEY"])
+        self.assertEqual(s["user"], "")
+        self.assertEqual(s["hold"], 120)
+
+    def test_is_keepalive(self):
+        self.assertTrue(vmf_plan._is_keepalive(["sleep", "100000000"]))
+        self.assertTrue(vmf_plan._is_keepalive(["tail", "-f", "/x"]))
+        self.assertFalse(vmf_plan._is_keepalive(["node", "server.js"]))
+        self.assertFalse(vmf_plan._is_keepalive([]))
+
+
+class SpecDerive(Tmp):
+    def setUp(self):
+        super().setUp()
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        os.environ.pop("VMF_RUN_INTENT", None)
+        os.environ.pop("VMF_PLAN_SPEC", None)
+
+    def tearDown(self):
+        os.environ.pop("VMF_GENERATED", None)
+        os.environ.pop("VMF_RUN_INTENT", None)
+        os.environ.pop("VMF_PLAN_SPEC", None)
+        super().tearDown()
+
+    def test_no_intent_no_spec_no_calls(self):
+        self.calls = []
+        old = vmf_llm.llm_call
+        vmf_llm.llm_call = \
+            lambda *a, **k: self.calls.append(a) or (0, "", "")
+        try:
+            s = vmf_plan.load_or_derive_spec(self.tmp, self.path("gen"))
+        finally:
+            vmf_llm.llm_call = old
+        self.assertIsNone(s)
+        self.assertEqual(self.calls, [])
+
+    def test_derive_persists_and_reuses(self):
+        self.calls = []
+        old = vmf_llm.llm_call
+        vmf_llm.llm_call = lambda *a, **k: self.calls.append(a) \
+            or (0, json.dumps(SPEC_WEB), "")
+        try:
+            gen = self.path("gen")
+            os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+            s = vmf_plan.load_or_derive_spec(self.tmp, gen)
+            self.assertEqual(s["deliverable"], "web")
+            n = len(self.calls)
+            s2 = vmf_plan.load_or_derive_spec(self.tmp, gen)
+            self.assertEqual(s2["deliverable"], "web")
+            self.assertEqual(len(self.calls), n)
+        finally:
+            vmf_llm.llm_call = old
+
+    def test_transport_down_falls_back_deterministic(self):
+        root = self.path("repo")
+        os.makedirs(root)
+        with open(os.path.join(root, "compose.yml"), "w") as f:
+            f.write("services:\n  web:\n    image: nginx\n"
+                    "    ports: ['8080:80']\n")
+        old = vmf_llm.llm_call
+        vmf_llm.llm_call = lambda *a, **k: (1, "", "down")
+        try:
+            s = vmf_plan.derive_spec(root, "run the web server on port 3100")
+        finally:
+            vmf_llm.llm_call = old
+        self.assertEqual(s["deliverable"], "web")
+        self.assertEqual(s["serve"]["port"], 3100)
+        self.assertEqual(s["why"], "deterministic fallback")
+
+    def test_fallback_cli_without_anything(self):
+        root = self.path("repo2")
+        os.makedirs(root)
+        s = vmf_plan._fallback_spec(root, "")
+        self.assertEqual(s["deliverable"], "cli")
+
+    def test_spec_block_shape(self):
+        b = vmf_plan.spec_block(dict(SPEC_WEB))
+        self.assertIn("deliverable: web", b)
+        self.assertIn("http://0.0.0.0:3100", b)
+        self.assertIn("keep-alive", b)
+        self.assertEqual(vmf_plan.spec_block(None), "")
+        self.assertEqual(vmf_plan.spec_block({"deliverable": ""}), "")
+
+
+class FanoutSpec(_Repo):
+    def setUp(self):
+        super().setUp()
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        os.environ.pop("VMF_RUN_INTENT", None)
+        os.environ.pop("VMF_PLAN_SPEC", None)
+        self.calls = []
+        self.old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+
+    def tearDown(self):
+        (vmf_llm.llm_call, vmf_llm.ground) = self.old
+        os.environ.pop("VMF_GENERATED", None)
+        os.environ.pop("VMF_RUN_INTENT", None)
+        os.environ.pop("VMF_PLAN_SPEC", None)
+        super().tearDown()
+
+    def _stub(self, responder):
+        def fake(role, prompt, timeout=90, env=None):
+            self.calls.append(prompt)
+            return 0, responder(prompt), ""
+        vmf_llm.llm_call = fake
+
+    def _pkg(self, body):
+        def responder(prompt):
+            if prompt.startswith("Derive the target state"):
+                return json.dumps(SPEC_WEB)
+            if "runtime packages" in prompt:
+                return json.dumps(body)
+            return json.dumps({"status": "blocked", "why": "nope"})
+        return responder
+
+    def test_intent_reaches_planner_prompts(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g paperclipai"],
+                              "command": ["paperclipai", "run"],
+                              "ports": [3100],
+                              "checks": [{"probe": {"port": 3100,
+                                                    "path": "/"}}],
+                              "user": "pc", "notes": "web tool"}))
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+        out = self.path("fa.json")
+        rc = vmf_plan.fanout_cmd(src, out)
+        self.assertEqual(rc, 0)
+        pkg = [p for p in self.calls if "runtime packages" in p]
+        self.assertTrue(pkg)
+        self.assertIn("deliverable: web", pkg[0])
+        self.assertIn("0.0.0.0:3100", pkg[0])
+        self.assertNotIn('set command to ["sleep", "100000000"]', pkg[0])
+
+    def test_keepalive_plan_blocked_under_web(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g paperclipai"],
+                              "command": ["sleep", "100000000"],
+                              "notes": "cli"}))
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+        out = self.path("fa.json")
+        rc = vmf_plan.fanout_cmd(src, out)
+        self.assertEqual(rc, 1)
+        gen = os.path.join(self.tmp, "gen",
+                           os.listdir(os.path.join(self.tmp, "gen"))[0])
+        b = json.load(open(os.path.join(gen, "plan-pkg.json.blocked")))
+        self.assertEqual(b["why"], "plan ignores the web target")
+        self.assertTrue(b.get("spec_h"))
+
+    def test_same_spec_reruns_free(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g x"],
+                              "command": ["x", "run"], "ports": [3100],
+                              "checks": [{"probe": {"port": 3100,
+                                                    "path": "/"}}],
+                              "notes": "n"}))
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+        out = self.path("fa.json")
+        vmf_plan.fanout_cmd(src, out)
+        n = len(self.calls)
+        rc = vmf_plan.fanout_cmd(src, out)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.calls), n)
+
+    def test_spec_change_replans(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g x"],
+                              "command": ["x", "run"], "ports": [3100],
+                              "checks": [{"probe": {"port": 3100,
+                                                    "path": "/"}}],
+                              "notes": "n"}))
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+        out = self.path("fa.json")
+        vmf_plan.fanout_cmd(src, out)
+        n = len(self.calls)
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3200"
+        rc = vmf_plan.fanout_cmd(src, out)
+        self.assertEqual(rc, 0)
+        self.assertGreater(len(self.calls), n)
+        gen = os.path.join(self.tmp, "gen")
+        keydir = os.path.join(gen, os.listdir(gen)[0])
+        doc = json.load(open(os.path.join(keydir, "plan-pkg.json")))
+        self.assertEqual(doc["approach"]["ports"], [3100])
+
+
+class PreviewRender(_Repo):
+    def setUp(self):
+        super().setUp()
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        os.environ.pop("VMF_RUN_INTENT", None)
+        os.environ.pop("VMF_PLAN_SPEC", None)
+        self.old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+
+    def tearDown(self):
+        (vmf_llm.llm_call, vmf_llm.ground) = self.old
+        os.environ.pop("VMF_GENERATED", None)
+        os.environ.pop("VMF_RUN_INTENT", None)
+        os.environ.pop("VMF_PLAN_SPEC", None)
+        super().tearDown()
+
+    def _stub(self, responder):
+        def fake(role, prompt, timeout=90, env=None):
+            return 0, responder(prompt), ""
+        vmf_llm.llm_call = fake
+
+    def _pkg(self, body):
+        def responder(prompt):
+            if prompt.startswith("Derive the target state"):
+                return json.dumps(SPEC_WEB)
+            if "runtime packages" in prompt:
+                return json.dumps(body)
+            return json.dumps({"status": "blocked", "why": "nope"})
+        return responder
+
+    def test_renders_spec_and_plans(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g paperclipai",
+                                          "useradd -m pc"],
+                              "command": ["paperclipai", "run"],
+                              "ports": [3100],
+                              "checks": [{"probe": {"port": 3100,
+                                                    "path": "/"}}],
+                              "user": "pc", "notes": "web tool"}))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = vmf_plan.preview_cmd(
+                src, intent="run the web server on port 3100")
+        self.assertEqual(rc, 0)
+        o = buf.getvalue()
+        self.assertIn("deliverable  web", o)
+        self.assertIn("0.0.0.0:3100", o)
+        self.assertIn("plan 1  direct", o)
+        self.assertIn("paperclipai run", o)
+        self.assertIn("as pc", o)
+        self.assertIn("probe:/", o)
+        self.assertIn("dry run", o)
+        # The plan landed in the race's cache: a run right after replays.
+        gen = os.path.join(self.tmp, "gen",
+                           os.listdir(os.path.join(self.tmp, "gen"))[0])
+        self.assertTrue(os.path.isfile(os.path.join(gen, "plan-pkg.json")))
+        self.assertTrue(os.path.isfile(os.path.join(gen, "spec.json")))
+
+    def test_exit_1_when_nothing_serves(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g x"],
+                              "command": ["sleep", "100000000"],
+                              "notes": "cli"}))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = vmf_plan.preview_cmd(
+                src, intent="run the web server on port 3100")
+        self.assertEqual(rc, 1)
+        self.assertIn("plan ignores the web target", buf.getvalue())
+
+    def test_json_and_lane(self):
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        self._stub(self._pkg({"status": "plan",
+                              "install": ["npm i -g x"],
+                              "command": ["x", "run"], "ports": [3100],
+                              "checks": [{"probe": {"port": 3100,
+                                                    "path": "/"}}],
+                              "notes": "n"}))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = vmf_plan.preview_cmd(
+                src, intent="run the web server on port 3100", as_json=True)
+        self.assertEqual(rc, 0)
+        doc = json.loads(buf.getvalue())
+        self.assertEqual(doc["spec"]["deliverable"], "web")
+        self.assertEqual(doc["approaches"][0]["method"], "pkg")
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            rc = vmf_plan.preview_cmd(
+                src, intent="run the web server on port 3100", lane=1)
+        self.assertEqual(rc, 0)
+        self.assertIn("plan 1 ", buf2.getvalue())
+
+# ---- the rich render (terminals; plain stays the fallback) ----
+
+try:
+    import rich.console as _rich_console_mod
+    _HAVE_RICH = True
+except ImportError:
+    _HAVE_RICH = False
+
+
+RICH_APPROACHES = [{
+    "kind": "install_script", "evidence": "fanout: pkg paperclip",
+    "cost": "slow", "method": "pkg", "ports": [3100],
+    "install": ["npm i -g paperclipai", "useradd -m pc"],
+    "checks": [{"probe": {"port": 3100, "path": "/"}}],
+    "env": {"PAPERCLIP_HOME": "/paperclip"},
+    "direct": {"base_image": "node:24-trixie-slim",
+               "command": ["paperclipai", "run"], "user": "pc",
+               "checks": [{"probe": {"port": 3100, "path": "/"}}],
+               "env": {"PAPERCLIP_HOME": "/paperclip"},
+               "notes": "web tool"},
+}]
+
+
+@unittest.skipUnless(_HAVE_RICH, "rich not installed")
+class PreviewRich(unittest.TestCase):
+    def test_rich_matches_plain_words(self):
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=102, highlight=False,
+            soft_wrap=False)
+        vmf_plan.render_preview_rich(
+            cons, dict(SPEC_WEB), RICH_APPROACHES,
+            {"compose": "no complete compose file"},
+            ["Dockerfile", "package.json"],
+            ["just plan x", "    --intent \"web server on port 3100\""])
+        out = cons.file.getvalue()
+        for w in ("vmf plan", "scout", "deliverable", "web",
+                  "0.0.0.0:3100", "auth", "required", "user",
+                  "non-root", "hold", "25s", "lane 1", "✗ compose",
+                  "plan 1", "direct", "install_script", "slow",
+                  "npm i -g paperclipai", "paperclipai run", "as pc",
+                  "PAPERCLIP_HOME=/paperclip", "tcp:3100", "probe:/",
+                  "winner needs 2/2 checks", "floor: tcp + hold",
+                  "model adds: probe", "web tool",
+                  "dry run — nothing booted"):
+            self.assertIn(w, out, w)
+
+    def test_lane_filter_and_cli_class(self):
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=102, highlight=False,
+            soft_wrap=False)
+        cli = [{"kind": "install_script", "cost": "slow", "method": "pkg",
+                "ports": [], "install": ["pip install mvt"],
+                "direct": {"command": ["sleep", "100000000"],
+                           "checks": [{"cmd": {"bin": "mvt",
+                                               "probes": ["mvt --version"]}}],
+                           "notes": "cli"}}]
+        vmf_plan.render_preview_rich(
+            cons, None, cli, {}, ["package.json"],
+            ["just plan mvt"], lane=1)
+        out = cons.file.getvalue()
+        self.assertIn("(none — pass --intent", out)
+        self.assertIn("keep-alive", out)
+        self.assertIn("cmd:mvt", out)
+        self.assertNotIn("plan 1 · direct · install_script · slowest",
+                         out)
+
+    def test_console_gate(self):
+        # Piped stdout is plain even with rich installed; VMF_PLAN_PLAIN
+        # forces plain even on a tty.
+        self.assertIsNone(vmf_plan._preview_console())
+        old = sys.stdout
+
+        class FakeTty:
+            def isatty(self):
+                return True
+        sys.stdout = FakeTty()
+        try:
+            os.environ["VMF_PLAN_PLAIN"] = "1"
+            self.assertIsNone(vmf_plan._preview_console())
+            os.environ.pop("VMF_PLAN_PLAIN", None)
+            cons = vmf_plan._preview_console()
+            if _HAVE_RICH:
+                self.assertIsNotNone(cons)
+            else:
+                self.assertIsNone(cons)
+        finally:
+            sys.stdout = old
+            os.environ.pop("VMF_PLAN_PLAIN", None)
+# ---- render fixes from the DVWA preview (2026-09-27) ----
+
+class PlanRenderFixes(_Repo):
+    def test_shell_payload_not_keepalive(self):
+        # A bare shell is a keep-alive; a shell carrying a serving
+        # payload is the app (measured: DVWA apache2ctl under bash -c).
+        self.assertFalse(vmf_plan._is_keepalive(
+            ["bash", "-c",
+             "service mariadb start && exec apache2ctl -DFOREGROUND"]))
+        self.assertFalse(vmf_plan._is_keepalive(
+            ["sh", "-c", "exec node server.js"]))
+        self.assertTrue(vmf_plan._is_keepalive(["bash"]))
+        self.assertTrue(vmf_plan._is_keepalive(
+            ["bash", "-c", "sleep 100000000"]))
+
+    def test_approaches_carry_notes(self):
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        self.addCleanup(os.environ.pop, "VMF_GENERATED", None)
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+        vmf_llm.llm_call = lambda *a, **k: (
+            0, json.dumps({"status": "plan", "install": ["npm i -g x"],
+                           "command": ["x", "run"], "ports": [3100],
+                           "checks": [{"probe": {"port": 3100,
+                                                 "path": "/"}}],
+                           "notes": "needs a db sidecar"}), "")
+        try:
+            out = self.path("fa.json")
+            rc = vmf_plan.fanout_cmd(src, out)
+        finally:
+            (vmf_llm.llm_call, vmf_llm.ground) = old
+        self.assertEqual(rc, 0)
+        doc = json.load(open(out))
+        self.assertEqual(doc["approaches"][0]["notes"],
+                         "needs a db sidecar")
+
+    def test_root_user_not_tagged(self):
+        if not _HAVE_RICH:
+            self.skipTest("rich not installed")
+        ap = dict(RICH_APPROACHES[0])
+        ap = {**ap, "direct": {**ap["direct"], "user": "root",
+                               "command": ["apache2ctl", "-DFOREGROUND"]}}
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=102, highlight=False,
+            soft_wrap=False)
+        vmf_plan.render_preview_rich(
+            cons, None, [ap], {}, ["Dockerfile"], ["just plan x"])
+        out = cons.file.getvalue()
+        self.assertIn("apache2ctl -DFOREGROUND", out)
+        self.assertNotIn("as root", out)
+    def test_notes_cap_120(self):
+        # The 40-char board column truncated panels mid-word
+        # (measured: "login veri"); notes now carry the whole story.
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        self.addCleanup(os.environ.pop, "VMF_GENERATED", None)
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        long_notes = "DB seeded via setup.php POST; login verified " \
+            "with admin/password; expect index after auth"
+        old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+        vmf_llm.llm_call = lambda *a, **k: (
+            0, json.dumps({"status": "plan", "install": ["npm i -g x"],
+                           "command": ["x", "run"], "ports": [3100],
+                           "checks": [{"probe": {"port": 3100,
+                                                 "path": "/"}}],
+                           "notes": long_notes}), "")
+        try:
+            out = self.path("fa.json")
+            rc = vmf_plan.fanout_cmd(src, out)
+        finally:
+            (vmf_llm.llm_call, vmf_llm.ground) = old
+        self.assertEqual(rc, 0)
+        doc = json.load(open(out))
+        self.assertEqual(doc["approaches"][0]["notes"], long_notes)
+
+    def test_env_shape_teaches_literal_values(self):
+        # The old shape taught "V — explanation" and the model copied
+        # it into real values (measured: DVWA's sidecar password was
+        # prose). No prompt may carry that shape again.
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        self.addCleanup(os.environ.pop, "VMF_GENERATED", None)
+        src = self._mkrepo({"README.md": "# app\n",
+                            "Dockerfile": "FROM node:24\n",
+                            "package.json": '{"name": "pc"}'})
+        prompts = []
+        old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+        vmf_llm.llm_call = lambda role, prompt, timeout=90, env=None: \
+            prompts.append(prompt) or (
+                0, json.dumps({"status": "blocked", "why": "nope"}), "")
+        try:
+            vmf_plan.fanout_cmd(src, self.path("fa.json"))
+        finally:
+            (vmf_llm.llm_call, vmf_llm.ground) = old
+        self.assertTrue(prompts)
+        for p in prompts:
+            self.assertNotIn('"V — ', p)
+            self.assertNotIn('"K": "V —', p)
+# ---- live plan assembly (streaming fanout + rich board) ----
+
+class FanoutStreaming(_Repo):
+    def setUp(self):
+        super().setUp()
+        os.environ["VMF_GENERATED"] = os.path.join(self.tmp, "gen")
+        self.addCleanup(os.environ.pop, "VMF_GENERATED", None)
+
+    def test_progress_events_and_immediate_writes(self):
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+        self.addCleanup(os.environ.pop, "VMF_RUN_INTENT", None)
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+
+        def fake(role, prompt, timeout=90, env=None):
+            if prompt.startswith("Derive the target state"):
+                return 1, "", "down"
+            if "runtime packages" in prompt:
+                return 0, json.dumps(
+                    {"status": "plan", "install": ["npm i -g x"],
+                     "command": ["x", "run"], "ports": [3100],
+                     "checks": [{"probe": {"port": 3100, "path": "/"}}],
+                     "notes": "n"}), ""
+            return 0, json.dumps({"status": "blocked",
+                                  "why": "no image"}), ""
+        vmf_llm.llm_call = fake
+        events = []
+        try:
+            out = self.path("fa.json")
+            rc = vmf_plan.fanout_cmd(src, out,
+                                     progress=lambda ev, *a:
+                                     events.append((ev,) + a))
+        finally:
+            (vmf_llm.llm_call, vmf_llm.ground) = old
+        self.assertEqual(rc, 0)
+        evs = [e[0] for e in events]
+        self.assertIn("grounding", evs)
+        self.assertIn("grounded", evs)
+        self.assertIn("spec", evs)
+        self.assertIn("done", evs)
+        methods = {e[1]: e[2] for e in events if e[0] == "method"}
+        self.assertEqual(methods.get("pkg"), "plan")
+        self.assertEqual(methods.get("prebuilt"), "blocked")
+        self.assertEqual(methods.get("source"), None)
+        skipped = [e for e in events if e[0] == "skipped"]
+        self.assertEqual(sorted(s[1] for s in skipped), ["build", "compose", "source"])
+        doc = json.load(open(out))
+        self.assertEqual(doc["approaches"][0]["method"], "pkg")
+
+    def test_plain_path_streams_per_method(self):
+        # Without a progress callback the stderr lines land as each
+        # call returns (the plain terminal sees the same assembly).
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+        vmf_llm.llm_call = lambda *a, **k: (
+            0, json.dumps({"status": "plan", "install": ["npm i -g x"],
+                           "command": ["x", "run"], "ports": [3100],
+                           "checks": [{"probe": {"port": 3100,
+                                                 "path": "/"}}],
+                           "notes": "n"}), "")
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                rc = vmf_plan.fanout_cmd(src, self.path("fa.json"))
+        finally:
+            (vmf_llm.llm_call, vmf_llm.ground) = old
+        self.assertEqual(rc, 0)
+        o = err.getvalue()
+        self.assertIn("fanout: pkg       .. plan", o)
+        self.assertIn("fanout: prebuilt  .. blocked", o)
+        self.assertIn("fanout: %d runnable" % 1, o)
+
+
+@unittest.skipUnless(_HAVE_RICH, "rich not installed")
+class LiveBoard(unittest.TestCase):
+    def _board(self):
+        b = vmf_plan._PlanLive("dvwa")
+        b.feed("stage", "read")
+        b.feed("found", ["Dockerfile", "compose.yml"])
+        b.feed("spec_wait")
+        b.feed("spec", dict(SPEC_WEB))
+        b.feed("skipped", "source", "no build manifest")
+        b.feed("grounding")
+        b.feed("method", "prebuilt", "plan", "Guest MariaDB backs image")
+        b.feed("method", "compose", "blocked", "no standalone compose")
+        b.feed("method", "build", "blocked", "needs a sidecar")
+        b.feed("method", "pkg", "plan", "DB seeded via database.sql")
+        b.feed("done", 2, 2)
+        return b
+
+    def test_renders_states_and_events(self):
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=100, highlight=False,
+            soft_wrap=False)
+        b = self._board()
+        cons.print(b)
+        out = cons.file.getvalue()
+        for w in ("dvwa", "dry run", "deliverable", "web", "0.0.0.0:3100",
+                  "prebuilt", "plan", "Guest MariaDB backs image",
+                  "compose", "blocked", "source", "skipped",
+                  "grounding", "[prebuilt]", "[compose]", "[pkg]", "6 llm"):
+            self.assertIn(w, out, w)
+        self.assertNotIn("waiting", out)
+
+    def test_waiting_rows_spin(self):
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=100, highlight=False,
+            soft_wrap=False)
+        b = vmf_plan._PlanLive("dvwa")
+        b.feed("stage", "read")
+        cons.print(b)
+        f1 = cons.file.getvalue()
+        cons.file = io.StringIO()
+        cons.print(b)
+        f2 = cons.file.getvalue()
+        self.assertIn("waiting", f2)
+        self.assertNotEqual(
+            [l for l in f1.splitlines() if "pkg" in l],
+            [l for l in f2.splitlines() if "pkg" in l])
+# ---- clean live surface (quiet stderr + transient board) ----
+
+class FanoutQuiet(FanoutStreaming):
+    def test_quiet_silences_stderr_keeps_events(self):
+        os.environ["VMF_RUN_INTENT"] = "run the web server on port 3100"
+        self.addCleanup(os.environ.pop, "VMF_RUN_INTENT", None)
+        src = self._mkrepo({"package.json": '{"name": "pc"}'})
+        old = (vmf_llm.llm_call, vmf_llm.ground)
+        vmf_llm.ground = lambda lookup, doc_cap=3000: ("", [])
+        vmf_llm.llm_call = lambda *a, **k: (
+            0, json.dumps({"status": "plan", "install": ["npm i -g x"],
+                           "command": ["x", "run"], "ports": [3100],
+                           "checks": [{"probe": {"port": 3100,
+                                                 "path": "/"}}],
+                           "notes": "n"}), "")
+        events = []
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                rc = vmf_plan.fanout_cmd(
+                    src, self.path("fa.json"),
+                    progress=lambda ev, *a: events.append((ev,) + a),
+                    quiet=True)
+        finally:
+            (vmf_llm.llm_call, vmf_llm.ground) = old
+        self.assertEqual(rc, 0)
+        self.assertNotIn("fanout:", err.getvalue())
+        evs = [e[0] for e in events]
+        self.assertIn("method", evs)
+        self.assertIn("done", evs)
+
+
+@unittest.skipUnless(_HAVE_RICH, "rich not installed")
+class TallyFooter(unittest.TestCase):
+    def test_footer_carries_tally(self):
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=102, highlight=False,
+            soft_wrap=False)
+        vmf_plan.render_preview_rich(
+            cons, None, RICH_APPROACHES, {}, ["package.json"],
+            ["just plan x"], tally=(2, 3, 0))
+        out = cons.file.getvalue()
+        self.assertIn("2 runnable, 3 blocked/skipped · 0 llm", out)
+        self.assertIn("dry run — nothing booted", out)
+
+    def test_footer_without_tally_unchanged(self):
+        cons = _rich_console_mod.Console(
+            file=io.StringIO(), width=102, highlight=False,
+            soft_wrap=False)
+        vmf_plan.render_preview_rich(
+            cons, None, RICH_APPROACHES, {}, ["package.json"],
+            ["just plan x"])
+        out = cons.file.getvalue()
+        self.assertNotIn("runnable,", out)

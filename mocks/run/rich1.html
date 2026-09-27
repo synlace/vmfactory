@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vmf run · rich1 mock · board + lane event log</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    background: #0d1117; color: #c9d1d9; margin: 0; padding: 28px 20px 48px;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  }
+  header, section, footer { max-width: 980px; margin: 0 auto 22px; }
+  header h1 { font-size: 15px; color: #e6edf3; margin: 0 0 6px; }
+  header p { color: #8b949e; margin: 0 0 8px; }
+  nav a { color: #58a6ff; text-decoration: none; margin-right: 14px; font-size: 12px; }
+  nav a:hover { text-decoration: underline; }
+  .cap { color: #8b949e; margin-bottom: 6px; font-size: 12px; }
+  .cap b { color: #e6edf3; font-weight: 600; }
+  pre {
+    margin: 0; padding: 12px 16px; overflow-x: auto; white-space: pre;
+    background: #010409; border: 1px solid #21262d; border-radius: 8px;
+  }
+  .b    { color: #e6edf3; font-weight: 600; }
+  .dim  { color: #8b949e; }
+  .ok   { color: #3fb950; }
+  .bad  { color: #f85149; }
+  .warn { color: #d29922; }
+  .cy   { color: #76e3ea; }
+  .mg   { color: #d2a8ff; }
+  .bl   { color: #58a6ff; }
+  footer { color: #8b949e; font-size: 12px; }
+  .rpl { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; font: inherit; font-size: 11px; border-radius: 4px; padding: 1px 8px; cursor: pointer; }
+  .rpl:hover { background: #30363d; }
+  .rpl.on { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .keys { color: #8b949e; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>vmf run — rich1 mock · current approach + lane event log</h1>
+  <p>The board as mocks/rich/run.py renders it today, plus the lane event
+  log: arrow keys (or the lane buttons) select a lane, and the events pane
+  rolls and filters to that lane's lines. Data from the mvt race of today
+  (the first CLI win).</p>
+  <nav>
+    <a href="#all">1 · board + rolling events (all)</a>
+    <a href="#lane">2 · lane selected · pkg / source</a>
+    <a href="#live">3 · interactive replay · lane filter</a>
+  </nav>
+</header>
+
+<section id="all">
+  <div class="cap"><b>1 · board + rolling events</b> — the current approach:
+  the board moves only on stage and verdict events; the events pane below
+  rolls the full history with lane tags. <span class="b">New idea demoed
+  here:</span> <span class="cy">install:</span> lines stream into the lane's
+  event view — the tailer reads /tmp/install.log over the existing ssh
+  poll, so the silent boot stretch becomes legible.</div>
+<pre>
+  <span class="mg sp">⠴</span> <span class="b">mvt</span> <span class="dim">· boot install_script</span>  <span class="warn">1 skipped</span>  <span class="dim">1 llm</span><span class="dim">                                                                    </span><span class="dim">t+9:40</span>
+    <span class="mg sp">⠴</span> <span class="b">pkg       </span> <span class="mg">booting  </span> sleep 100000000                        <span class="dim">README.md Installation:  </span><span class="dim">fast/T0  </span>
+    <span class="mg sp">⠴</span> <span class="b">source    </span> <span class="mg">booting  </span> uv venv; pip install .                <span class="dim">Makefile install target: </span><span class="dim">medium/T1</span>
+    <span class="dim">skipped · no compose file</span>
+
+<span class="dim">── events </span><span class="dim">[↑/↓ lane]</span><span class="dim"> ────────────────────────────────────────────────────────────────────────</span>
+  <span class="dim">  t+0:38</span>  <span class="dim">scout: dropped build .. no ports to verify</span>
+  <span class="dim">  t+1:05</span>  <span class="dim">[pkg] </span>1 install_script .. started (mvt-c1)
+  <span class="dim">  t+1:20</span>  <span class="dim">[source] </span>2 source_build .. started (mvt-c2)
+  <span class="dim">  t+1:25</span>  <span class="dim">[pkg] </span><span class="cy">install: Hit:1 http://deb.debian.org/debian bookworm InRelease</span>
+  <span class="dim">  t+2:05</span>  <span class="dim">[pkg] </span><span class="cy">install: Setting up libimage-exiftool-perl (12.57+dfsg-1) ...</span>
+  <span class="dim">  t+2:10</span>  <span class="dim">[source] </span><span class="cy">install: uv venv /workspace/.venv</span>
+  <span class="dim">  t+3:30</span>  <span class="dim">[pkg] </span><span class="bad">log mvt-c1: check cmd:mvt FAIL not installed (command -v exit 127)</span>
+  <span class="dim">  t+5:00</span>  <span class="dim">[pkg] </span><span class="cy">install: Collecting mvt</span>
+  <span class="dim">  t+9:40</span>  <span class="dim">[pkg] </span><span class="dim">log mvt-c1: verify: waiting (387s/420s): cmd:mvt</span>
+  <span class="dim">  t+9:40</span>  <span class="dim">[source] </span><span class="dim">log mvt-c2: verify: waiting (237s/420s): cmd:mvt</span>
+</pre>
+  <div class="keys">[1-5] scenario  [space] step  [a] auto  [↑/↓] lane  [q] quit</div>
+</section>
+
+<section id="lane">
+  <div class="cap"><b>2 · lane selected</b> — <span class="b">↑/↓</span> moves the
+  cursor; the events pane filters to that lane. With the install stream
+  attributed to its lane, the pkg lane carries the whole story — the
+  install progressing line by line while the cmd check waits; the source
+  lane shows its own arc.</div>
+<pre>
+  <span class="mg sp">⠴</span> <span class="b">mvt</span> <span class="dim">· boot install_script</span>  <span class="warn">1 skipped</span>  <span class="dim">1 llm</span><span class="dim">                                                                    </span><span class="dim">t+9:40</span>
+  <span class="b">&gt;</span> <span class="mg sp">⠴</span> <span class="b">pkg       </span> <span class="mg">booting  </span> sleep 100000000                        <span class="dim">README.md Installation:  </span><span class="dim">fast/T0  </span>
+    <span class="mg sp">⠴</span> <span class="b">source    </span> <span class="mg">booting  </span> uv venv; pip install .                <span class="dim">Makefile install target: </span><span class="dim">medium/T1</span>
+    <span class="dim">skipped · no compose file</span>
+
+<span class="dim">── events · pkg </span><span class="dim">[↑/↓ lane]</span><span class="dim"> ────────────────────────────────────────────────────────────────────</span>
+  <span class="dim">  t+1:05</span>  1 install_script .. started (mvt-c1)
+  <span class="dim">  t+1:25</span>  <span class="cy">install: Hit:1 http://deb.debian.org/debian bookworm InRelease</span>
+  <span class="dim">  t+2:05</span>  <span class="cy">install: Setting up libimage-exiftool-perl (12.57+dfsg-1) ...</span>
+  <span class="dim">  t+3:30</span>  <span class="bad">log mvt-c1: check cmd:mvt FAIL not installed (command -v exit 127)</span>
+  <span class="dim">  t+5:00</span>  <span class="cy">install: Collecting mvt</span>
+  <span class="dim">  t+9:40</span>  <span class="dim">log mvt-c1: verify: waiting (387s/420s): cmd:mvt</span>
+</pre>
+<pre style="margin-top:14px">
+  <span class="mg sp">⠴</span> <span class="b">mvt</span> <span class="dim">· boot install_script</span>  <span class="warn">1 skipped</span>  <span class="dim">1 llm</span><span class="dim">                                                                    </span><span class="dim">t+9:40</span>
+    <span class="mg sp">⠴</span> <span class="b">pkg       </span> <span class="mg">booting  </span> sleep 100000000                        <span class="dim">README.md Installation:  </span><span class="dim">fast/T0  </span>
+  <span class="b">&gt;</span> <span class="mg sp">⠴</span> <span class="b">source    </span> <span class="mg">booting  </span> uv venv; pip install .                <span class="dim">Makefile install target: </span><span class="dim">medium/T1</span>
+    <span class="dim">skipped · no compose file</span>
+
+<span class="dim">── events · source </span><span class="dim">[↑/↓ lane]</span><span class="dim"> ──────────────────────────────────────────────────────────────────</span>
+  <span class="dim">  t+1:20</span>  2 source_build .. started (mvt-c2)
+  <span class="dim">  t+2:10</span>  <span class="cy">install: uv venv /workspace/.venv</span>
+  <span class="dim">  t+9:40</span>  <span class="dim">log mvt-c2: verify: waiting (237s/420s): cmd:mvt</span>
+</pre>
+</section>
+
+<section id="live">
+  <div class="cap"><b>3 · interactive replay</b> — the mvt CLI scenario
+  played through: keep-alive plan, the <span class="cy">install:</span>
+  stream filling the silent stretch, the cmd check reporting honestly
+  while pip works, the pass, promotion, and <span class="cy">cli://mvt</span>.
+  The lane buttons (or arrow keys) filter the event log;
+  <span class="b">all</span> is the top of the cycle.
+  <button class="rpl" id="replay">↻ replay</button>
+  <button class="rpl lane-btn on" data-lane="">all</button>
+  <button class="rpl lane-btn" data-lane="pkg">pkg</button>
+  <button class="rpl lane-btn" data-lane="source">source</button></div>
+<pre id="story"></pre>
+  <div class="keys">[space] step (click, then type)  [a] auto  [↑/↓] lane  [r] restart</div>
+</section>
+
+<footer>mock · spinners + replay animate · install: stream demoed (tails /tmp/install.log over the ssh poll — idea, not yet built) · data from today's mvt race (mvt-c1 pass, cli://mvt, t+13:05)</footer>
+
+<script>
+  const FR = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  document.querySelectorAll('.sp').forEach((el, i) => {
+    let f = (i * 3) % 10;
+    setInterval(() => { el.textContent = FR[f = (f + 1) % 10]; }, 90);
+  });
+
+  // The mvt CLI scenario (mocks/rich/timeline.py · CLI), compressed.
+  // [simTime, clockLabel, stage]
+  const HEAD = [
+    [0,   'clone',              't+0:04'],
+    [0.4, 'scan',               't+0:38'],
+    [1.1, 'boot install_script','t+1:05'],
+    [2.1, 'boot install_script','t+2:10'],
+    [3.5, 'boot install_script','t+3:30'],
+    [5.2, 'boot install_script','t+5:00'],
+    [9.7, 'boot install_script','t+9:40'],
+    [11.6,'boot install_script','t+11:30'],
+    [11.8,'boot install_script','t+11:50'],
+    [12.0,'boot install_script','t+12:02'],
+    [12.1,'promote · booting canonical', 't+12:10'],
+    [13.1,'pass',               't+13:05'],
+  ];
+  // Lane state piecewise: [from, state, styleClass, detail]
+  const LANES = {
+    pkg: [
+      [0,    'plan',      'cy', 'cli: mvt'],
+      [1.1,  'booting',   'mg', 'sleep 100000000'],
+      [12.0, 'pass',      'ok', ''],
+      [12.1, 'promoting', 'mg', 'canonical · winner drive'],
+      [13.1, 'pass',      'ok', 'cli://mvt'],
+    ],
+    source: [
+      [0,    'plan',    'cy', 'cli: mvt'],
+      [1.3,  'booting', 'mg', 'uv venv; pip install .'],
+      [12.0, 'parked',  'dim','0/1 checks pass; 1 failed'],
+    ],
+  };
+  // [simTime, lane, clockLabel, text]
+  const EV = [
+    [0.4,  '*',     't+0:38', 'scout: dropped build .. no ports to verify'],
+    [0.4,  '*',     't+0:38', 'scout: 2 route(s) in flight; the scout keeps reading'],
+    [1.1,  'pkg',   't+1:05', '1 install_script .. started (mvt-c1)'],
+    [1.3,  'source','t+1:20', '2 source_build .. started (mvt-c2)'],
+    [1.42, 'pkg',   't+1:25', 'install: Hit:1 http://deb.debian.org/debian bookworm InRelease'],
+    [2.08, 'pkg',   't+2:05', 'install: Setting up libimage-exiftool-perl (12.57+dfsg-1) ...'],
+    [2.1,  'source','t+2:10', 'install: uv venv /workspace/.venv'],
+    [3.5,  'pkg',   't+3:30', 'log mvt-c1: verify: 1 checks, deadline 420s'],
+    [3.5,  'pkg',   't+3:30', 'log mvt-c1: check cmd:mvt FAIL not installed (command -v exit 127)'],
+    [5.0,  'pkg',   't+5:00', 'install: Collecting mvt'],
+    [9.7,  'pkg',   't+9:40', 'log mvt-c1: verify: waiting (387s/420s): cmd:mvt'],
+    [9.7,  'source','t+9:40', 'log mvt-c2: verify: waiting (237s/420s): cmd:mvt'],
+    [11.5, 'pkg',   't+11:30','install: Successfully installed mvt-1.5.9'],
+    [11.8, 'pkg',   't+11:50','log mvt-c1: check cmd:mvt pass'],
+    [11.8, 'source','t+11:50','log mvt-c2: verdict: 0/1 checks pass; 1 failed'],
+    [11.8, 'source','t+11:50','2 source_build .. fail (0/1 checks pass; 1 failed)'],
+    [12.0, 'pkg',   't+12:02','1 install_script .. pass'],
+    [12.0, '*',     't+12:02','winner 1 install_script; reaping losers'],
+    [12.1, '*',     't+12:10','promotion: booting mvt (~2-4 min)'],
+    [13.1, '*',     't+13:05','target: cli://mvt'],
+  ];
+  const FINAL = [13.1, 'mvt          pass     cli://mvt                      t+13:05'];
+  const NOTE = [0.4, 'skipped · no compose file'];
+  const pad = (s, w) => s + ' '.repeat(Math.max(0, w - s.length));
+  let sel = '', fi = 0, spT = null, tm = [];
+  const storyEl = document.getElementById('story');
+  function laneState(name, t) {
+    let st = LANES[name][0];
+    for (const s of LANES[name]) if (t >= s[0]) st = s;
+    return st;
+  }
+  function evStyle(text) {
+    if (text.startsWith('install:')) return 'cy';
+    if (text.includes('FAIL') || text.includes('fail') || text.includes('Error')) return 'bad';
+    if (text.includes('pass') && !text.includes('fail')) return 'ok';
+    return 'dim';
+  }
+  function draw(t) {
+    if (spT) { clearInterval(spT); spT = null; }
+    const h = HEAD.filter(x => t >= x[0]).pop();
+    const busy = t < 12.0 || (t >= 12.1 && t < 13.1);
+    const fr = FR[fi];
+    const sp = '<span class="mg sp">' + fr + '</span>';
+    const chips = t < 0.4 ? '' : '  <span class="warn">1 skipped</span>  <span class="dim">1 llm</span>';
+    const headLen = 2 + 2 + ('mvt · ' + h[1]).length + chips.replace(/<[^>]+>/g, '').length;
+    let out = '  ' + (busy ? sp : ' ') + ' <span class="b">mvt</span> <span class="dim">· ' + h[1] + '</span>' + chips
+      + ' '.repeat(Math.max(1, 95 - headLen)) + '<span class="dim">' + h[2] + '</span>\n';
+    for (const name of ['pkg', 'source']) {
+      const [, st, stc, det] = laneState(name, t);
+      const act = st === 'booting' || st === 'promoting' || st === 'plan';
+      const cur = sel === name ? '  <span class="b">&gt;</span> ' : '    ';
+      const detStyle = st === 'pass' ? 'cy' : st === 'parked' ? 'dim' : '';
+      out += cur + (act ? sp : '  ') + ' <span class="b">' + pad(name, 10) + '</span>'
+        + '<span class="' + stc + '">' + pad(st, 9) + '</span>'
+        + (detStyle ? '<span class="' + detStyle + '">' + pad(det, 40) + '</span>' : pad(det, 40))
+        + '<span class="dim">' + pad(name === 'pkg' ? 'README.md Installation:' : 'Makefile install target:', 24) + '</span> '
+        + '<span class="dim">' + (name === 'pkg' ? 'fast/T0  ' : 'medium/T1') + '</span>\n';
+    }
+    if (t >= NOTE[0]) out += '    <span class="dim">' + NOTE[1] + '</span>\n';
+    out += '\n';
+    const evs = EV.filter(e => t >= e[0] && (!sel || e[1] === sel)).slice(-6);
+    const cap = sel ? '── events · ' + sel + ' ' : '── events ';
+    out += '<span class="dim">' + cap + '[↑/↓ lane] ' + '─'.repeat(Math.max(2, 88 - cap.length)) + '</span>\n';
+    if (!evs.length) out += '  <span class="dim">(no events for this lane yet)</span>\n';
+    for (const [, lane, clock, text] of evs) {
+      const tag = (!sel && lane !== '*') ? '<span class="dim">[' + lane + '] </span>' : '';
+      out += '  <span class="dim">' + pad(clock, 8) + '</span>  '
+        + tag + '<span class="' + evStyle(text) + '">' + text + '</span>\n';
+    }
+    if (t >= FINAL[0]) out += '\n  <span class="ok">' + FINAL[1] + '</span>\n';
+    storyEl.innerHTML = out;
+    if (busy) spT = setInterval(() => { fi = (fi + 1) % 10; storyEl.querySelectorAll('.sp').forEach(el => { el.textContent = FR[fi]; }); }, 90);
+  }
+  function setLane(l) {
+    sel = l;
+    document.querySelectorAll('.lane-btn').forEach(b =>
+      b.classList.toggle('on', (b.dataset.lane || '') === sel));
+    draw(playing());
+  }
+  const PTS = [0, 0.4, 1.1, 1.3, 1.42, 2.08, 2.1, 3.5, 5.0, 9.7, 11.5, 11.8, 12.0, 12.1, 13.1];
+  let at = 13.1;
+  const playing = () => at;
+  function play() {
+    tm.forEach(clearTimeout); tm = [];
+    PTS.forEach((p, idx) => tm.push(setTimeout(() => { at = p; draw(p); }, p * 700)));
+    tm.push(setTimeout(() => { at = 13.1; draw(13.1); }, 13.1 * 700 + 400));
+  }
+  play();
+  document.getElementById('replay').onclick = play;
+  document.querySelectorAll('.lane-btn').forEach(b =>
+    b.onclick = () => setLane(b.dataset.lane || ''));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const order = ['', 'pkg', 'source'];
+      let i = order.indexOf(sel); if (i < 0) i = 0;
+      sel = e.key === 'ArrowDown'
+        ? order[Math.min(i + 1, order.length - 1)]
+        : order[Math.max(i - 1, 0)];
+      setLane(sel);
+    }
+  });
+</script>
+</body>

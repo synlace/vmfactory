@@ -106,6 +106,11 @@ AWK=("${TOOL[@]}")
 # per-run inputs (the guest installs at boot, before the app).
 if [[ -f "$plan_tmp/direct.json" ]]; then
   base=$("${JQ[@]}" -r '.base_image' "$plan_tmp/direct.json")
+  # One oci ref: a reference never contains whitespace. A cached plan
+  # that echoed "ref timestamp" (the fat-base ready marker line) died
+  # at derive on buildah's "invalid reference format" — keep the first
+  # token only.
+  read -r base _ <<< "$base"
   # An empty base means the generic guest sandbox: the frozen fat base
   # when it exists (node 22 + python3 + sqlite3 + nginx), else a plain
   # alpine. The scout's routes leave base_image empty on purpose; the
@@ -151,9 +156,13 @@ if [[ -f "$plan_tmp/direct.json" ]]; then
   while IFS= read -r gp; do
     [[ -n "$gp" ]] && gports_args+=(-p "$gp:$gp")
   done < <("${JQ[@]}" -r '.ports[]?' "$plan_tmp/direct.json")
-  echo "gap-fill direct: base=$base command=${gcmd[*]} ports=${gports_args[*]:-none} needs_docker=$gneed_docker mem=${VMF_RUN_MEM:-1024}"
+  # The plan's run account: the plan must create it in the install
+  # list; the guest init drops to it via setuidgid before the app.
+  guser=$("${JQ[@]}" -r '.user // ""' "$plan_tmp/direct.json")
+  echo "gap-fill direct: base=$base command=${gcmd[*]} ports=${gports_args[*]:-none} needs_docker=$gneed_docker mem=${VMF_RUN_MEM:-1024} user=${guser:-root}"
   exec env -u VMF_MODE -u VMF_COMPOSE_SRC \
     VMF_REPO_DIR="$VMF_COMPOSE_SRC" VMF_INSTALL_CMD="$ginst" \
+    ${guser:+VMF_APP_USER=$guser} \
     ${docker_env[@]+"${docker_env[@]}"} \
     ${verify_env[@]+"${verify_env[@]}"} \
     "$SCRIPT_DIR/oci-run.sh" \
@@ -223,19 +232,33 @@ while IFS=$'\t' read -r name kind rest; do
     ctx="$PROJ/$rest"
     [[ "$rest" == /* ]] && ctx="$rest"
     echo "compose: building $name (context: ${rest#./})..."
+    # Stage aliases first: `FROM x AS build` names a LOCAL stage, and a
+    # later `FROM build` must reach buildah untouched. The FROM patcher
+    # used to rewrite those into docker.io/library/build and the build
+    # died pulling a phantom image (paperclip and DVWA measured: runner
+    # exit 125, "requested access denied").
+    orig_df="$ctx/$(${JQ[@]} -r --arg n "$name" \
+      '.services[] | select(.name==$n) | .build.dockerfile' "$plan_tmp/plan.json")"
+    stages="|$( "${AWK[@]}" 'tolower($0) ~ /^[[:space:]]*from[[:space:]]/ {
+      for (i = 1; i <= NF; i++) if (tolower($i) == "as" && i < NF) print tolower($(i+1))
+    }' "$orig_df" | tr '\n' '|')"
     # Patch unqualified FROM images in a generated copy: buildah refuses
-    # short names without a registry (FROM php@sha256:... etc.).
-    "${AWK[@]}" '
+    # short names without a registry (FROM php@sha256:... etc.). Stage
+    # aliases pass through untouched.
+    "${AWK[@]}" -v stages="$stages" '
       /^[[:space:]]*FROM[[:space:]]/ {
         out = $1; i = 2
         while (i <= NF && $i ~ /^--/) { out = out " " $i; i++ }
         if (i <= NF) {
           img = $i; t = img
           sub(/@.*/, "", t); sub(/:.*/, "", t)
-          if (t != "scratch" && t !~ /[\/.]/) img = "docker.io/library/" img
-          else {
-            f1 = t; sub(/\/.*/, "", f1)
-            if (t ~ /\// && f1 !~ /\./ && f1 != "localhost") img = "docker.io/" img
+          lt = tolower(t)
+          if (index(stages, "|" lt "|") == 0) {
+            if (t != "scratch" && t !~ /[\/.]/) img = "docker.io/library/" img
+            else {
+              f1 = t; sub(/\/.*/, "", f1)
+              if (t ~ /\// && f1 !~ /\./ && f1 != "localhost") img = "docker.io/" img
+            }
           }
           out = out " " img; i++
         }
@@ -243,7 +266,7 @@ while IFS=$'\t' read -r name kind rest; do
         print out; next
       }
       { print }
-    ' "$ctx/$(${JQ[@]} -r --arg n "$name" '.services[] | select(.name==$n) | .build.dockerfile' "$plan_tmp/plan.json")" > "$dockerfile"
+    ' "$orig_df" > "$dockerfile"
     # COPY --from=<name> images: buildah resolves them from local storage
     # only. Pre-pull every external ref; refs that name a local build
     # stage (FROM ... AS <stage>) must not be pulled.

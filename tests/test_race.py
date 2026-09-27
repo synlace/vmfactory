@@ -581,5 +581,113 @@ class Reattach(Tmp):
             os.environ.pop("VMF_BUNDLE_KEY", None)
 
 
+class RaceBoardWiring(Tmp):
+    """The board is a property of the terminal, not of the entry path:
+    race() self-opens when no board was passed (the fan-out fallback
+    used to run board-less on a TTY) and closes it on the fail exit."""
+
+    class FakeBoard:
+        def __init__(self):
+            self.stages = []
+
+        def stage(self, s):
+            self.stages.append(s)
+
+    def setUp(self):
+        super().setUp()
+        self.runs = tempfile.mkdtemp(prefix="vmf-runs-", dir=self.tmp)
+        self.src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        vmf_race.RUNS = self.runs
+        self.old = (vmf_race._open_board, vmf_race._board_close,
+                    vmf_race.STAGGER, vmf_race.DEADLINE,
+                    vmf_race.stop_vm, vmf_race.promote)
+        vmf_race.stop_vm = lambda name: None
+        vmf_race.promote = lambda w, src, base, winner, board=None: 0
+        vmf_race.STAGGER = 0
+        vmf_race.DEADLINE = 600
+
+    def tearDown(self):
+        (vmf_race._open_board, vmf_race._board_close,
+         vmf_race.STAGGER, vmf_race.DEADLINE,
+         vmf_race.stop_vm, vmf_race.promote) = self.old
+        super().tearDown()
+
+    def test_self_opens_when_none(self):
+        # The DVWA case: scout yields nothing, the fan-out fallback
+        # reaches race() with no board — the board must still open.
+        opened, closed = [], []
+        vmf_race._open_board = lambda base: opened.append(base) \
+            or self.FakeBoard()
+        vmf_race._board_close = lambda: closed.append(True)
+        rc = vmf_race.race([], self.src, "unit-x")
+        self.assertEqual(rc, 1)
+        self.assertEqual(opened, ["unit-x"])
+        self.assertEqual(closed, [True])
+
+    def test_caller_board_kept(self):
+        # The scout and replay paths pass their board in; race() must
+        # not open a second one, and must close on the fail exit.
+        opened, closed = [], []
+        vmf_race._open_board = lambda base: opened.append(base)
+        vmf_race._board_close = lambda: closed.append(True)
+        fb = self.FakeBoard()
+        rc = vmf_race.race([], self.src, "unit-x", board=fb)
+        self.assertEqual(rc, 1)
+        self.assertEqual(opened, [])
+        self.assertEqual(closed, [True])
+        self.assertEqual(fb.stages, ["fail"])
+
+
+class RunnerEnv(Tmp):
+    """Synthetic-stack kinds carry the approach's install and checks:
+    install rides VMF_INSTALL_CMD (the guest runs it before the stack),
+    checks ride VMF_PLAN_CHECKS (the verify merges them)."""
+
+    def test_prebuilt_carries_install_and_checks(self):
+        cmd, env = vmf_race.runner_cmd(
+            "prebuilt_image", "x-c1", "/tmp/nowhere-src",
+            "docker.io/library/nginx:1", [80], None, "prebuilt",
+            install=["service mariadb start"],
+            checks=[{"probe": {"port": 80, "path": "/"}}])
+        self.assertIn("service mariadb start", env.get("VMF_INSTALL_CMD", ""))
+        self.assertEqual(json.loads(env.get("VMF_PLAN_CHECKS", "[]")),
+                         [{"probe": {"port": 80, "path": "/"}}])
+
+    def test_prebuilt_without_install_sets_nothing(self):
+        cmd, env = vmf_race.runner_cmd(
+            "prebuilt_image", "x-c1", "/tmp/nowhere-src",
+            "docker.io/library/nginx:1", [80], None, "prebuilt")
+        self.assertNotIn("VMF_PLAN_CHECKS", env)
+
+    def test_pkg_kind_sets_nothing(self):
+        cmd, env = vmf_race.runner_cmd(
+            "install_script", "x-c1", "/tmp/nowhere-src", None, [], None,
+            "pkg", install=["apt-get install -y x"],
+            checks=[{"exec": {"cmd": "true"}}])
+        self.assertNotIn("VMF_INSTALL_CMD", env)
+        self.assertNotIn("VMF_PLAN_CHECKS", env)
+
+    def test_compose_carries_install_checks_not_env(self):
+        # The compose kind gets install/checks (they ride the generic
+        # guest install stage and the verify merge); its env lives in
+        # the repo's own compose file, so VMF_PLAN_ENV stays unset.
+        cmd, env = vmf_race.runner_cmd(
+            "compose", "x-c1", "/tmp/nowhere-src", None, [80],
+            "compose.yml", "compose", install=["cp a b"],
+            checks=[{"exec": {"cmd": "true"}}], plan_env={"SECRET": "x"})
+        self.assertIn("cp a b", env.get("VMF_INSTALL_CMD", ""))
+        self.assertEqual(json.loads(env.get("VMF_PLAN_CHECKS", "[]")),
+                         [{"exec": {"cmd": "true"}}])
+        self.assertNotIn("VMF_PLAN_ENV", env)
+
+    def test_prebuilt_env_reaches_the_synth_compose(self):
+        cmd, env = vmf_race.runner_cmd(
+            "prebuilt_image", "x-c1", "/tmp/nowhere-src",
+            "docker.io/library/nginx:1", [80], None, "prebuilt",
+            plan_env={"BETTER_AUTH_SECRET": "paperclip-dev-secret"})
+        self.assertEqual(json.loads(env.get("VMF_PLAN_ENV", "{}")),
+                         {"BETTER_AUTH_SECRET": "paperclip-dev-secret"})
+
+
 if __name__ == "__main__":
     unittest.main()

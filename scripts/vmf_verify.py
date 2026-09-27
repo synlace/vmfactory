@@ -82,6 +82,16 @@ def derive_checks(plan, fwd):
     # tcp for every declared port (deterministic) + the model's
     # probe/exec checks (clamped). Returns (runnable, skipped) where a
     # runnable check is (kind, port_or_cmd, spec_dict).
+    # Synthetic-stack boots (prebuilt_image, dockerfile) have no plan
+    # of their own: the approach's declared checks ride VMF_PLAN_CHECKS
+    # as a JSON list and merge beside whatever the plan declares.
+    extra = os.environ.get("VMF_PLAN_CHECKS")
+    if extra:
+        try:
+            plan = dict(plan, checks=list(plan.get("checks") or [])
+                        + json.loads(extra))
+        except ValueError:
+            pass
     runnable, skipped = [], []
     ports = plan.get("ports")
     if ports is None and plan.get("services"):
@@ -105,7 +115,14 @@ def derive_checks(plan, fwd):
                   for pp in (ports or [])
                   if not (isinstance(pp, dict) and pp.get("proto") == "udp")]
     probe_c = vmf_plan._clamp_ports(probe_pool)
-    if not plan.get("checks") and probe_c:
+    # The floor probe fires whenever the plan declares no probe of its
+    # own — tcp alone is vacuous for compose stacks: docker's userland
+    # proxy accepts on a published port even with a dead backend, so a
+    # crashed app passes a tcp-only verify (paperclip measured: the
+    # container lived 11s, the crown held 1/1 tcp:3100).
+    has_probe = any(isinstance(c, dict) and "probe" in c
+                    for c in (plan.get("checks") or []))
+    if not has_probe and probe_c:
         first = min(probe_c)
         runnable.append(("probe", first,
                          {"probe": {"port": first, "path": "/",
@@ -115,6 +132,8 @@ def derive_checks(plan, fwd):
             runnable.append(("probe", c["probe"]["port"], c))
         elif "exec" in c:
             runnable.append(("exec", None, c))
+        elif "cmd" in c:
+            runnable.append(("cmd", None, c))
     for c in plan.get("checks") or []:
         if isinstance(c, dict) and ("log" in c or "rfb" in c):
             skipped.append(c)
@@ -235,6 +254,93 @@ def check_exec(cmd, name, spec=None):
     if container:
         return check_container_exec(cmd, name, container)
     return _run_exec(cmd, name)
+
+
+# A CLI tool that runs but exits non-zero on a probe (usage errors:
+# argparse 2, BSD tools 64, docker 125) is INSTALLED — the probe proves
+# the binary resolved, not that it accepted a probe flag. Output
+# anchored at line start (usage:/options:/commands:) or a x.y.z version
+# token (the lookbehind keeps IPs like 127.0.0.1 from matching) reads
+# as a working CLI, whatever the exit. Only "not found" (127) and a
+# transport timeout fail hard. The planner can pin either side with
+# expect_exit/expect_out.
+CLI_USAGE_RE = re.compile(
+    r"(?im)(^\s*(usage\b|options\b|commands\b|positional arguments|"
+    r"optional arguments)|--help\b|(?<![\d.])v?\d+\.\d+\.\d+\b(?![\d.]))")
+
+# The probe PATH: the ssh session inherits the image env (the init
+# sources it), so the app's own dirs are already present. A login shell
+# would CLOBBER that inherited PATH with /etc/profile's default — the
+# measured regression (node vanished on the prebuilt cyberchef VM) — so
+# the common user-install gaps are prepended inside a plain sh instead.
+PROBE_PATH = ('export PATH="$HOME/.local/bin:$HOME/.cargo/bin:'
+              '$HOME/go/bin:$PATH"; ')
+
+
+def _guest_sh(cmd, name):
+    return _run_probe("sh -c %s </dev/null"
+                      % shlex.quote(PROBE_PATH + cmd), name)
+
+
+def _run_probe(cmd, name):
+    # Returns (rc, output); rc None marks a transport timeout.
+    try:
+        p = subprocess.run(exec_transport(name, cmd), capture_output=True,
+                           text=True, timeout=EXEC_TIMEOUT)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return None, ""
+
+
+def check_cmd(spec, name):
+    # The CLI shape: level one proves the binary resolves on the probe
+    # PATH (any non-zero rc here = not installed — the install failed).
+    # Level two runs the probe ladder: the first probe that proves a
+    # working binary wins. A non-zero probe exit with usage/version
+    # output still counts as installed-and-runs.
+    k = spec["cmd"]
+    probes = k.get("probes") or []
+    bin_ = (k.get("bin") or "").strip()
+    if not bin_ and probes:
+        words = probes[0].split()
+        bin_ = words[0] if words else ""
+    if not bin_ or not probes:
+        return False, {"check": "cmd", "expected": "bin + probes",
+                       "actual": "cmd check missing its binary or probes"}
+    want_out = k.get("expect_out")
+    want_rc = k.get("expect_exit")
+    want_rc = want_rc if isinstance(want_rc, int) else 0
+    rc, out = _guest_sh("command -v %s" % shlex.quote(bin_), name)
+    if rc is None:
+        return False, {"check": "cmd", "expected": "command -v within %ds"
+                       % EXEC_TIMEOUT, "actual": "timeout"}
+    if rc != 0:
+        return False, {"check": "cmd", "expected": "installed",
+                       "actual": "not installed (command -v exit %d)" % rc}
+    last = None
+    for probe in probes:
+        rc, out = _guest_sh(probe, name)
+        if rc == want_rc:
+            return True, None
+        if rc == 127:
+            return False, {"check": "cmd", "expected": "runs",
+                           "actual": "probe exit 127 (not found): %s"
+                                     % (out or "")[:150]}
+        if rc is None:
+            return False, {"check": "cmd", "expected": "runs within %ds"
+                           % EXEC_TIMEOUT,
+                           "actual": "probe timeout: %s" % probe[:60]}
+        if want_out:
+            try:
+                if re.search(want_out, out or ""):
+                    return True, None
+            except re.error:
+                pass
+        if CLI_USAGE_RE.search(out or ""):
+            return True, None
+        last = "probe %r exit %d: %s" % (probe[:60], rc, (out or "")[:120])
+    return False, {"check": "cmd", "expected": "exit %d or usage output"
+                   % want_rc, "actual": "installed, probe fails: %s" % last}
 
 
 # Specific app-failure markers: trustworthy anywhere in the console
@@ -400,6 +506,15 @@ def run_cmd(args):
     results = [False] * len(runnable)
     failed = {}
     last_progress = time.time()
+    # A pass is not point-in-time evidence: the paperclip build lane
+    # answered at poll N and died at N+1 (the server binds during
+    # bootstrap, then crashes on a missing env secret — measured twice,
+    # race and promotion). A pass requires the full check set to hold
+    # for HOLD seconds after the first all-pass sweep; a lapse re-arms
+    # the check and keeps polling. VMF_VERIFY_HOLD=0 restores the old
+    # single-sweep behavior.
+    hold = int(os.environ.get("VMF_VERIFY_HOLD") or "25")
+    hold_until = 0.0
     while time.time() < deadline:
         for i, (kind, port, spec) in enumerate(runnable):
             if results[i]:
@@ -408,6 +523,8 @@ def run_cmd(args):
                 ok, ev = check_tcp(port, fwd, spec, args.probe_host)
             elif kind == "probe":
                 ok, ev = check_probe(spec, fwd, args.name, args.probe_host)
+            elif kind == "cmd":
+                ok, ev = check_cmd(spec, args.name)
             else:
                 ok, ev = check_exec(spec["exec"]["cmd"], args.name, spec)
             label = spec_key(kind, port, spec)
@@ -421,7 +538,25 @@ def run_cmd(args):
                           % (label, ev["expected"], ev["actual"]))
                 failed[label] = ev
         if all(results):
-            break
+            if not hold_until:
+                hold_until = time.time() + hold
+                # The deadline extends for the hold window: a late but
+                # real pass must not fall off the deadline edge.
+                deadline = max(deadline, time.time() + hold + 10)
+                print("verify: all checks pass; holding %ds for liveness"
+                      % hold)
+                for i in range(len(results)):
+                    results[i] = False
+                continue
+            if time.time() >= hold_until:
+                break
+        elif hold_until:
+            # A lapse inside the hold re-arms it: recovery must also
+            # survive a second full sweep, or the pass is again
+            # point-in-time.
+            hold_until = 0.0
+            print("verify: liveness lapse; holding again after the "
+                  "next full pass")
         if time.time() - last_progress >= 30:
             waiting = ", ".join(spec_key(k, p, s)
                                 for (k, p, s), r in zip(runnable, results)
@@ -443,8 +578,14 @@ def run_cmd(args):
             write_evidence(args.evidence_out, evidence)
     skipped_note = " (%d skipped)" % len(skipped) if skipped else ""
     if passed == len(runnable):
-        print("verdict: %d/%d checks pass%s"
-              % (passed, len(runnable), skipped_note))
+        # The bare word overclaims: name what was proven. The verdict
+        # MARKER stays exactly "pass" (the race string-compares it);
+        # the detail rides the printed line and the evidence file.
+        proven = ", ".join(spec_key(k, p, s) for k, p, s in runnable)
+        if len(proven) > 80:
+            proven = proven[:77] + "..."
+        print("verdict: %d/%d checks pass%s (%s)"
+              % (passed, len(runnable), skipped_note, proven))
         if args.target_out:
             url = render_target(runnable, fwd, args.probe_host)
             if url:
@@ -476,6 +617,13 @@ def render_target(runnable, fwd, host="127.0.0.1"):
             continue
         hp = fwd.get(spec["tcp"]["port"], spec["tcp"]["port"])
         return "tcp://%s:%d" % (host, hp)
+    for kind, _port, spec in runnable:
+        if kind != "cmd":
+            continue
+        k = spec["cmd"]
+        b = k.get("bin") or ((k.get("probes") or ["cli"])[0].split()
+                             or ["cli"])[0]
+        return "cli://%s" % b
     return None
 
 
@@ -485,6 +633,11 @@ def spec_key(kind, port, spec):
     if kind == "probe":
         p = spec["probe"]
         return "probe:%d%s" % (p["port"], p.get("path", "/"))
+    if kind == "cmd":
+        k = spec["cmd"]
+        b = k.get("bin") or ((k.get("probes") or ["?"])[0].split()
+                             or ["?"])[0]
+        return "cmd:%s" % b
     e = spec["exec"]
     if e.get("container"):
         return "exec:%s:%s" % (e["container"], e["cmd"][:30])
@@ -539,13 +692,30 @@ def revise_cmd(args):
         "measured resident size plus 1024 MB of headroom (at most 8192). "
         "If the grounded facts name an official container image for the "
         "app, prefer it (needs_docker=true and images=[ref]) over "
-        "rebuilding from source. Do not weaken a "
+        "rebuilding from source. If the app is a CLI tool (no server, "
+        "no ports), set command to [\"sleep\", \"100000000\"] (a "
+        "keep-alive so the VM survives the verify) with empty ports, "
+        "and declare a cmd check so the verify runs the tool's probe "
+        "ladder over ssh. The boot is unattended: nothing can click a "
+        "button or answer a wizard, so any one-time initialization "
+        "(database schema, migrations, a setup page) must ride the "
+        "install list as a deterministic command (a CLI runner, an SQL "
+        "import, or a scripted curl of the setup endpoint). A login "
+        "page is not success: if the app ships default credentials, "
+        "declare a check that logs in and asserts post-auth content. "
+        "If the app refuses root (embedded postgres does), create a "
+        "dedicated account in the install list (useradd -m app) and "
+        "declare user: the install runs as root, the app runs as that "
+        "account. Do not weaken a "
         "check to match the observed failure unless the evidence proves "
         "the check itself was wrong; prefer fixing the app config. "
         "Reply with ONE JSON object, same shape:\n"
         '{"install": [...], "command": [...], "ports": [...], '
+        '"user": "<run the app as this account>", '
         '"checks": [{"probe": {"port": N, "path": "/", '
-        '"expect_status": 200, "expect_contains": "..."}}], '
+        '"expect_status": 200, "expect_contains": "..."}} or '
+        '{"cmd": {"bin": "<tool>", "probes": ["<tool> --version", '
+        '"<tool> --help"]}}], '
         '"images": ["<container images the plan needs>"], '
         '"env": {"K": "V"}, "needs_docker": <bool>, '
         '"memory_mb": <int>, "notes": "<max 12 words>"}'
@@ -594,7 +764,8 @@ def revise_cmd(args):
     if not cmd:
         sys.stderr.write("error: the revision produced no command\n")
         return 1
-    revised = {"base_image": plan.get("base_image", ""),
+    revised = {"base_image": vmf_plan._clamp_base_image(
+                   plan.get("base_image", "")),
                "install": install,
                "command": cmd,
                "ports": vmf_plan._clamp_ports(j.get("ports")),
@@ -603,6 +774,7 @@ def revise_cmd(args):
                "images": vmf_plan._clamp_images(j.get("images")),
                "env": {str(k): str(v)
                        for k, v in (j.get("env") or {}).items()},
+               "user": vmf_plan._clamp_user(j.get("user")),
                 "needs_docker": bool(j.get("needs_docker")) or \
                     _command_needs_docker(cmd),
                 "memory_mb": vmf_plan._clamp_memory(

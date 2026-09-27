@@ -67,6 +67,23 @@ while read -r applet; do
   ln -sf /vmf/busybox "$rootfs/vmf/bin/$applet"
 done < <("$VMF_BUNDLE/busybox" --list)
 
+# Interactive login shells source /etc/profile, which RESETs PATH and
+# drops /vmf/bin (measured: `ps: not found` in an ssh session while the
+# applets sat one directory away). The profile.d drop restores it where
+# the base sources profile.d; bases without one keep the inherited PATH.
+mkdir -p "$rootfs/etc/profile.d"
+printf 'export PATH="$PATH:/vmf/bin"\n' > "$rootfs/etc/profile.d/vmf.sh"
+# Bases (or shells) that bypass profile.d: the diagnostic applets land
+# in /usr/local/bin — but only where the image carries no real binary,
+# so GNU procps still wins where installed.
+mkdir -p "$rootfs/usr/local/bin"
+for a in ps ip netstat pgrep pidof top; do
+  if [ ! -e "$rootfs/usr/bin/$a" ] && [ ! -e "$rootfs/bin/$a" ] \
+     && [ ! -e "$rootfs/usr/sbin/$a" ] && [ ! -e "$rootfs/sbin/$a" ]; then
+    ln -sf /vmf/busybox "$rootfs/usr/local/bin/$a"
+  fi
+done
+
 # /etc/passwd: distroless bases carry none; dropbear requires a root entry
 # with a shell it accepts. Root's shell is forced to /vmf/sh (busybox) so
 # every base behaves identically (alpine's /bin/ash gets rejected by

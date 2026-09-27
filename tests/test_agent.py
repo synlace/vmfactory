@@ -125,10 +125,16 @@ class ValidateSpec(unittest.TestCase):
             {"tcp": {"port": 8021}},
             {"probe": {"port": 8021, "path": "/", "expect_status_max": 399}}])
 
-    def test_command_only_gets_exec_synth(self):
+    def test_command_only_gets_cmd_synth(self):
         spec = vmf_agent.validate_spec({"command": ["ghost", "version"]}, {})
-        self.assertEqual(spec["checks"],
-                         [{"exec": {"cmd": "sh -c 'command -v ghost'"}}])
+        self.assertEqual(spec["checks"], [
+            {"cmd": {"bin": "ghost",
+                     "probes": ["ghost --version", "ghost --help"]}}])
+
+    def test_keepalive_command_gets_no_synth(self):
+        spec = vmf_agent.validate_spec(
+            {"command": ["sleep", "100000000"]}, {})
+        self.assertEqual(spec["checks"], [])
 
 
 class AgentLoop(unittest.TestCase):

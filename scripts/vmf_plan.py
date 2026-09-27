@@ -39,6 +39,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 import vmf_llm
@@ -49,7 +51,13 @@ SKIP_DIRS = {".git", "node_modules", ".github", "__pycache__", ".idea", ".vscode
 # invalidate stale cached plans. v7 adds the memory_mb field to
 # direct plans (an under-sized VM OOM-kills the app: dockerd,
 # containerd and the app share one 1024 MB VM otherwise).
-PROMPT_V = "7"
+# v13: the target-state spec (intent + evidence → deliverable
+# contract) rides every planner prompt, so "run the web server on
+# port 3100" reaches the models (measured: the phrase never did).
+# v14: the env shape no longer teaches "V — explanation" (the model
+# copied it into real values — measured: DVWA's sidecar password was
+# prose); notes cap 40 → 120 so panels carry the whole story.
+PROMPT_V = "14"
 
 
 def _gapfill_bundle(root):
@@ -327,8 +335,11 @@ def gapfill(root, plan_out):
         ' "command": ["<argv that starts the app>"],\n'
         ' "ports": [<guest tcp ports the app listens on, e.g. 8080>],\n'
         ' "checks": [{"probe": {"port": 8080, "path": "/", '
-        '"expect_status": 200, "expect_contains": "<optional text>"}}],\n'
+        '"expect_status": 200, "expect_contains": "<optional text>"}} or '
+        'for a CLI tool {"cmd": {"bin": "<tool>", "probes": '
+        '["<tool> --version", "<tool> --help"]}}],\n'
         ' "env": {"K": "V"},\n'
+        ' "user": "<run the app as this account; create it in install first>",\n'
         ' "needs_docker": <true when the app itself shells out to docker>,\n'
         ' "memory_mb": <int vm ram, 1024-8192>,\n'
         ' "services": [<docker shape, only for docker: {"name", "image" or '
@@ -351,7 +362,21 @@ def gapfill(root, plan_out):
         "checks for direct mode: one probe per HTTP-serving port whose "
         "status (and, when a specific content proves it, body text) says "
         "the app works; tcp checks for declared ports are added "
-        "automatically. At most 4 checks. Size the VM: modern CLIs and "
+        "automatically. If the app is a CLI tool (no server, no ports), "
+        "set command to [\"sleep\", \"100000000\"] (a keep-alive so the "
+        "VM survives the verify), leave ports empty, and declare a cmd "
+        "check naming the tool binary. The boot is unattended: nothing "
+        "can click a button or answer a wizard, so any one-time "
+        "initialization (database schema, migrations, a setup page) "
+        "must ride the install list as a deterministic command (a CLI "
+        "runner, an SQL import, or a scripted curl of the setup "
+        "endpoint). A login page is not success: if the app ships "
+        "default credentials, declare a check that logs in and asserts "
+        "post-auth content. If the app refuses root (embedded postgres "
+        "does), create a dedicated account in the install list "
+        "(useradd -m app) and declare user: the install runs as root, "
+        "the app runs as that account. At most 4 checks. Size the VM: "
+        "modern CLIs and "
         "TUIs often need more than the 1024 MB default, and "
         "needs_docker=true needs at least 2048 (dockerd, containerd and "
         "the app share the VM).\n"
@@ -388,7 +413,7 @@ def gapfill(root, plan_out):
             # Direct mode: base image + boot-time install + argv. The VM is
             # the sandbox; no docker. The bash layer turns this into a plain
             # image run with a staged repo tar and install script.
-            base = (pj.get("base_image") or "").strip()
+            base = _clamp_base_image(pj.get("base_image"))
             cmd = pj.get("command") or []
             if not base or not cmd:
                 sys.stderr.write("error: gap-fill direct plan lacks base_image or command\n")
@@ -1309,7 +1334,12 @@ def usage():
         "  intent <image> <phrase> <out>   plain-image --intent setup plan\n"
         "  cache-key <src>                 winner-cache key (bundle+compose)\n"
         "  fanout <src> <out.json>         parallel per-method planners\n"
-        "  scout <src> <out.jsonl>         streaming route scout (JSONL)\n")
+        "  scout <src> <out.jsonl>         streaming route scout (JSONL)\n"
+        "  preview <src> [--intent S] [--spec JSON] [--lane N] [--json]\n"
+        "                                  the deliverable on paper; "
+        "nothing boots\n"
+        "                                  (--plain forces the plain "
+        "writer)\n")
 
 
 KINDS = ("git-url", "dir", "image", "image-tar", "compose-file", "dockerfile",
@@ -1575,15 +1605,19 @@ def profile_cmd(kind, path):
 def fat_base_ref():
     # The fat base tag: VMF_BASE_IMAGE wins; else the ready marker that
     # scripts/build-fat-base.sh writes after a successful host build.
+    # The marker line is "<ref> <timestamp>" — one line (the writer's
+    # printf) — so only the first whitespace token is the ref; the
+    # timestamp leaked into plans before and derive died on buildah's
+    # "invalid reference format".
     ref = (os.environ.get("VMF_BASE_IMAGE") or "").strip()
     if ref:
-        return ref
+        return ref.split()[0]
     try:
         with open(os.path.join(
                 os.path.expanduser("~"),
                 ".local", "share", "vmf", "fat-base.ready")) as f:
-            return f.read().split("\n")[0].strip()
-    except OSError:
+            return f.read().split()[0]
+    except (OSError, IndexError):
         return ""
 
 
@@ -1596,7 +1630,9 @@ def base_image_note():
             'Prefer the fat base "%s" when the evidence matches its '
             "runtime set (node 22, python3, pip, sqlite3, nginx, git, "
             "curl, ca-certificates preinstalled): set base_image to it "
-            "and never install those packages. Otherwise use a stock "
+            "and never install those packages. The python is PEP 668 "
+            "externally-managed: pip needs --break-system-packages. "
+            "Otherwise use a stock "
             "oci ref: the base image is minimal, so include "
             "prerequisite installs in the install list "
             "(e.g. 'pip install uv' before 'uv sync')." % fat)
@@ -1605,11 +1641,21 @@ def base_image_note():
         "the install list (e.g. 'pip install uv' before 'uv sync').")
 
 
+# Keep-alive commands name no app: a CLI-tool plan runs `sleep` so the
+# VM survives the verify while the cmd checks probe the installed
+# binary over ssh. These first words must never synthesize a check.
+KEEPALIVE_CMDS = ("sleep", "true", "false", "tail", "top", "yes", "watch",
+                  "cat", "sh", "bash", "ash", "dash", "read")
+
+
 def _synth_checks(ports, command=None):
     # Every plan carries a verify step. Ports → tcp per port + one
     # lenient HTTP probe on the first port. No ports but a command →
-    # one exec check proving the entry binary exists on PATH (the
-    # "ssh in and check the binary" shape for non-serving artifacts).
+    # one cmd check: level one proves the binary is on the login PATH,
+    # level two runs a --version/--help ladder (the "ssh in and check
+    # the binary" shape for non-serving artifacts). Keep-alive commands
+    # name no app, so they synthesize nothing — an unverified verdict
+    # beats a vacuous `command -v sleep` pass.
     # Deterministic: same plan in, same checks out.
     cp = _clamp_ports(ports)
     out = [{"tcp": {"port": p}} for p in cp]
@@ -1618,8 +1664,10 @@ def _synth_checks(ports, command=None):
                               "expect_status_max": 399}})
     if not out and command:
         a0 = str(command[0]).strip() if command else ""
-        if a0 and "/" not in a0:
-            out.append({"exec": {"cmd": "sh -c 'command -v %s'" % a0}})
+        if a0 and "/" not in a0 and a0 not in KEEPALIVE_CMDS:
+            out.append({"cmd": {"bin": a0,
+                                "probes": ["%s --version" % a0,
+                                           "%s --help" % a0]}})
     return out
 
 
@@ -1679,7 +1727,7 @@ def _clamp_memory(raw, needs_docker):
 
 def _clamp_checks(raw):
     # Model-declared success checks for direct plans. Bounded vocabulary:
-    # probe and exec only — tcp checks are derived from declared ports
+    # probe, exec, and cmd — tcp checks are derived from declared ports
     # (a declared fact, never a model opinion), and log/rfb arrive later
     # with their runners. Junk is dropped, not guessed.
     out, dropped = [], 0
@@ -1717,10 +1765,43 @@ def _clamp_checks(raw):
                     out.append(e)
             else:
                 dropped += 1
+        elif isinstance(c, dict) and isinstance(c.get("cmd"), dict):
+            k = c["cmd"]
+            probes = []
+            for p in (k.get("probes") or [])[:4]:
+                s = str(p).strip()
+                if s and len(s) <= 200 and s not in probes:
+                    probes.append(s)
+            bin_ = str(k.get("bin") or "").strip()[:60]
+            if not probes and bin_:
+                probes = ["%s --version" % bin_, "%s --help" % bin_]
+            if not probes:
+                dropped += 1
+                continue
+            if not bin_:
+                words = probes[0].split()
+                bin_ = words[0][:60] if words else ""
+            if not bin_:
+                dropped += 1
+                continue
+            e = {"cmd": {"bin": bin_, "probes": probes}}
+            ex = k.get("expect_exit")
+            if isinstance(ex, int) and 0 <= ex <= 255:
+                e["cmd"]["expect_exit"] = ex
+            eo = k.get("expect_out")
+            if isinstance(eo, str) and eo.strip():
+                try:
+                    re.compile(eo)
+                    e["cmd"]["expect_out"] = eo[:200]
+                except re.error:
+                    pass  # junk pattern: omit, keep the check
+            if e not in out:
+                out.append(e)
         elif isinstance(c, dict) and c:
             dropped += 1
     if dropped:
-        sys.stderr.write("note: %d check(s) dropped (probe|exec only)\n" % dropped)
+        sys.stderr.write(
+            "note: %d check(s) dropped (probe|exec|cmd only)\n" % dropped)
     return out
 
 
@@ -1741,6 +1822,10 @@ def proposal_head(text):
             lines.append("  check: %s" % d)
         elif "exec" in c:
             lines.append("  check: exec %s" % c["exec"]["cmd"])
+        elif "cmd" in c:
+            k = c["cmd"]
+            lines.append("  check: cmd %s (%s)" % (
+                k.get("bin", "?"), " ; ".join(k.get("probes") or [])))
     lines.append("  env: %s" % (j["env"] or "-"))
     lines.append("  needs_docker: %s" % j["needs_docker"])
     lines.append("  notes: %s" % (j["notes"] or "-"))
@@ -1948,7 +2033,7 @@ REPO_READ_FILES = (
 APPROACH_KINDS = ("compose", "dockerfile", "prebuilt_image",
                   "install_script", "source_build")
 APPROACH_COST = {"compose": "fast", "dockerfile": "slow",
-                 "prebuilt_image": "fast", "install_script": "slowest",
+                 "prebuilt_image": "fast", "install_script": "slow",
                  "source_build": "slowest"}
 
 
@@ -2103,6 +2188,38 @@ def _root_compose_variants(root):
     return out[:6]
 
 
+def _clamp_base_image(raw):
+    # One OCI ref for a direct plan: a reference never contains
+    # whitespace. A model echo of "ref timestamp" (the fat-base ready
+    # marker line) reaches derive verbatim and dies on buildah's
+    # "invalid reference format" — keep the first token only.
+    s = str(raw or "").strip()
+    return s.split()[0][:200] if s else ""
+
+
+def _clamp_env(raw):
+    # Declared env for a plan: plain string pairs, upper-case keys (the
+    # env-var convention), bounded. Junk keys drop silently.
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in list(raw.items())[:20]:
+        s = str(k).strip()
+        if s and s.isupper() and len(s) <= 60:
+            out[s] = str(v).strip()[:200]
+    return out
+
+
+def _clamp_user(raw):
+    # The account the app runs as: the install list must create it
+    # (useradd -m); the guest init drops to it via setuidgid. Apps that
+    # refuse root (embedded postgres measured) need this.
+    s = str(raw or "").strip().lower()
+    if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", s):
+        return s
+    return ""
+
+
 def _clamp_direct(j, ports):
     # The pkg/release/source payload the guest boot replays (the
     # gap-fill direct shape). A command is mandatory; everything else
@@ -2110,26 +2227,268 @@ def _clamp_direct(j, ports):
     cmd = [str(x) for x in (j.get("command") or [])][:16]
     if not cmd:
         return None
-    return {"base_image": str(j.get("base_image") or ""),
+    return {"base_image": _clamp_base_image(j.get("base_image")),
             "install": [str(x) for x in (j.get("install") or [])][:20],
             "command": cmd, "ports": ports,
             "checks": _clamp_checks(j.get("checks")),
             "images": _clamp_images(j.get("images")),
             "env": {str(k): str(v)
                     for k, v in (j.get("env") or {}).items()},
+            "user": _clamp_user(j.get("user")),
             "needs_docker": bool(j.get("needs_docker")),
             "memory_mb": _clamp_memory(j.get("memory_mb"),
                                        j.get("needs_docker")),
             "notes": str(j.get("notes") or "")[:120]}
 
 
-def fanout_cmd(src, out):
+# ---- target-state spec ----
+# The deliverable contract: what "done" means for this repo, derived
+# from the intent phrase plus the repo evidence, clamped to a bounded
+# vocabulary, and injected into every planner prompt. The verify floor
+# already disposes; the spec makes the models propose plans that serve
+# the stated target (measured: paperclip kept crowning cli:// while
+# the user asked for a web server on port 3100).
+
+def _intent_port(phrase):
+    # The port the user named ("run the web server on port 3100").
+    m = re.search(r"(?i)\bport\s+(\d{1,5})\b", phrase or "")
+    if m and 1 <= int(m.group(1)) <= 65535:
+        return int(m.group(1))
+    return 0
+
+
+def _is_keepalive(cmd):
+    # The keep-alive shape: a command that serves nothing and exists
+    # only to keep the VM alive for the verify. A bare shell is a
+    # keep-alive; a shell carrying a payload (`bash -c 'service … &&
+    # exec apache2ctl …'`) is the app — judge the payload's first word
+    # (measured: DVWA's serving plan wore a false keep-alive tag).
+    if not cmd:
+        return False
+    a0 = str(cmd[0]).strip()
+    if a0 not in KEEPALIVE_CMDS:
+        return False
+    if a0 in ("sh", "bash", "ash", "dash") and len(cmd) >= 3 \
+            and str(cmd[1]).strip() == "-c":
+        words = str(cmd[2]).strip().split()
+        first = words[0] if words else ""
+        return first == "" or first in KEEPALIVE_CMDS
+    return True
+
+
+def _clamp_spec(raw, intent=""):
+    # Bounded spec vocabulary. Junk drops or degrades, never guesses.
+    # The intent phrase is authoritative for the port.
+    if not isinstance(raw, dict):
+        return None
+    intent = (intent or str(raw.get("intent") or "")).strip()
+    d = {"version": 1, "intent": intent[:200]}
+    deliv = str(raw.get("deliverable") or "").strip().lower()
+    d["deliverable"] = deliv if deliv in ("web", "cli") else ""
+    serve = raw.get("serve") if isinstance(raw.get("serve"), dict) else {}
+    port = _intent_port(intent)
+    if not port:
+        try:
+            port = int(serve.get("port"))
+        except (TypeError, ValueError):
+            port = 0
+    proto = str(serve.get("proto") or "http").strip().lower()
+    d["serve"] = {"proto": proto if proto in ("http", "https", "tcp")
+                  else "http",
+                  "port": port if 1 <= port <= 65535 else 0,
+                  "path": serve.get("path")
+                  if isinstance(serve.get("path"), str)
+                  and serve["path"].startswith("/") else "/"}
+    auth = raw.get("auth") if isinstance(raw.get("auth"), dict) else {}
+    d["auth"] = {"required": bool(auth.get("required")),
+                 "note": str(auth.get("note") or "")[:120]}
+    env = []
+    for k in (raw.get("env_required") or [])[:10]:
+        s = str(k).strip()
+        if s.isupper() and len(s) <= 60 and s not in env:
+            env.append(s)
+    d["env_required"] = env
+    u = str(raw.get("user") or "").strip().lower()
+    d["user"] = "non-root" if u in ("non-root", "nonroot", "!root") \
+        else _clamp_user(u)
+    try:
+        hold = int(raw.get("hold"))
+    except (TypeError, ValueError):
+        hold = 25
+    d["hold"] = min(max(hold, 1), 120)
+    d["why"] = str(raw.get("why") or "")[:60]
+    return d
+
+
+def _fallback_spec(root, intent):
+    # Deterministic degrade when the model is unavailable: an intent
+    # port or compose-declared ports name a web deliverable; otherwise
+    # cli. Same policy as the derive prompt, minus the reading.
+    port = _intent_port(intent)
+    if not port:
+        for cand in NAMES:
+            p = os.path.join(root, cand)
+            if os.path.isfile(p):
+                _n, _s, ports = meta(p)
+                cp = _clamp_ports(ports)
+                if cp:
+                    port = cp[0]
+                    break
+    web = bool(port) or bool(re.search(r"(?i)\bweb\b|\bserver\b|http",
+                                       intent or ""))
+    return _clamp_spec({"deliverable": "web" if web else "cli",
+                        "serve": {"port": port},
+                        "why": "deterministic fallback"},
+                       intent=intent)
+
+
+def derive_spec(root, intent, bundle=None):
+    # One LLM call after the read: intent + evidence → the spec.
+    # Degrades deterministically when the transport is down.
+    bundle = bundle if bundle is not None else _gapfill_bundle(root)
+    intent = (intent or "").strip()
+    prompt = (
+        "Derive the target state (the deliverable contract) for this "
+        "repository%s. Reply with ONE JSON object:\n"
+        '{"deliverable": "web"|"cli", '
+        '"serve": {"proto": "http", "port": N, "path": "/"}, '
+        '"auth": {"required": bool, "note": "<max 12 words>"}, '
+        '"env_required": ["UPPER_KEYS"], '
+        '"user": "non-root"|"<account>"|"", '
+        '"hold": 25, "why": "<max 8 words>"}\n'
+        "deliverable=web when the repo serves something on a port (a "
+        "web UI, an API); cli when the deliverable is a command-line "
+        "tool. Read the evidence: compose files, .env.example and "
+        "README quick-start lines name the port and the required env. "
+        "When an intent phrase is present it is authoritative.\n"
+        % ((" — user intent: %s" % intent) if intent else ""))
+    if intent:
+        prompt += "Intent phrase (authoritative): %s\n" % intent
+    prompt += "Evidence:\n%s" % bundle[:16384]
+    rc, o, _e = vmf_llm.llm_call("gapfill", prompt, timeout=120)
+    if rc == 0:
+        try:
+            s = _clamp_spec(vmf_llm.parse_llm_json(o), intent=intent)
+            if s and s["deliverable"]:
+                return s
+        except Exception:
+            pass
+    return _fallback_spec(root, intent)
+
+
+def spec_block(spec):
+    # The prompt fragment: the target state, authoritative. Empty when
+    # no spec — the planner prompts keep their exact prior shape then.
+    if not spec or not spec.get("deliverable"):
+        return ""
+    s = spec.get("serve") or {}
+    lines = ["Target state (the deliverable contract — authoritative, "
+             "from the user's intent and the repo evidence):",
+             "- deliverable: %s" % spec["deliverable"]]
+    if spec["deliverable"] == "web" and s.get("port"):
+        lines.append("- serve: %s://0.0.0.0:%s path %s"
+                     % (s.get("proto") or "http", s["port"],
+                        s.get("path") or "/"))
+    a = spec.get("auth") or {}
+    if a.get("required"):
+        lines.append("- auth: required%s"
+                     % ((" (%s)" % a["note"]) if a.get("note") else ""))
+    if spec.get("env_required"):
+        lines.append("- required env keys: %s"
+                     % ", ".join(spec["env_required"]))
+    if spec.get("user"):
+        lines.append("- run user: %s" % spec["user"])
+    if spec["deliverable"] == "web":
+        lines.append("Every plan must serve this target: declare the "
+                     "ports and a command that serves (never a "
+                     "keep-alive sleep), and checks that prove the "
+                     "serve target answers (tcp on the port plus an "
+                     "HTTP probe).")
+    return "\n".join(lines) + "\n"
+
+
+def _spec_h(spec):
+    # The spec fingerprint in each cached plan: a spec change
+    # invalidates the plans, a same-spec rerun replays them.
+    if not spec:
+        return ""
+    return hashlib.sha256(
+        json.dumps(spec, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def load_or_derive_spec(root, gen, bundle=None):
+    # VMF_PLAN_SPEC (JSON) overrides; else spec.json when the intent
+    # matches; else one derive call. The spec lands in gen/spec.json so
+    # the preview and the race consume the same contract. No intent and
+    # no override means no spec: the planner prompts stay unconstrained
+    # and byte-identical to the previous shape (zero extra LLM calls).
+    intent = os.environ.get("VMF_RUN_INTENT", "").strip()
+    spec_src = os.environ.get("VMF_PLAN_SPEC", "").strip()
+    if spec_src:
+        try:
+            s = _clamp_spec(json.loads(spec_src), intent=intent)
+            if s and s["deliverable"]:
+                return s
+        except Exception:
+            pass
+    if not intent:
+        return None
+    sp = os.path.join(gen, "spec.json")
+    if os.path.isfile(sp):
+        try:
+            old = json.load(open(sp))
+            if (old.get("intent") or "").strip() == intent \
+                    and old.get("deliverable") \
+                    and old.get("why") != "deterministic fallback":
+                return old
+        except (OSError, ValueError):
+            pass
+    s = derive_spec(root, intent, bundle=bundle)
+    try:
+        os.makedirs(gen, exist_ok=True)
+        with open(sp, "w") as f:
+            json.dump(s, f, indent=2)
+    except OSError:
+        pass
+    return s
+
+
+def fanout_cmd(src, out, progress=None, quiet=False):
     # Parallel per-method planners over one shared evidence bundle.
     # Every method answers plan-or-blocked on paper; the race boots
     # only runnable plans. Per-method results cache under the bundle
-    # key: a rerun costs zero LLM calls.
+    # key: a rerun costs zero LLM calls. progress (when given) receives
+    # ("skipped"|"grounding"|"grounded"|"method"|"spec"|"done", ...)
+    # events as they happen - the preview's live board feeds on them;
+    # results are written the moment each call lands. quiet silences
+    # the stderr lines (the board renders them instead).
+    def emit(ev, *a):
+        if progress:
+            try:
+                progress(ev, *a)
+            except Exception:
+                pass
+
+    def err(msg):
+        # The live board carries these lines in its events pane; the
+        # stderr channel stays for the race and the plain path.
+        if not quiet:
+            sys.stderr.write(msg)
     root = src
     gen = os.path.join(_gen_root(), winner_key(root))
+    spec = load_or_derive_spec(root, gen)
+    sh = _spec_h(spec)
+    if spec and spec.get("deliverable"):
+        s = spec.get("serve") or {}
+        err("fanout: spec %s%s (%s)\n"
+                         % (spec["deliverable"],
+                            (" %s://0.0.0.0:%s%s"
+                             % (s.get("proto") or "http", s["port"],
+                                s.get("path") or "/"))
+                            if spec["deliverable"] == "web" and s.get("port")
+                            else "",
+                            spec.get("why") or "target state"))
+        emit("spec", spec)
     has_compose = bool(_root_compose_variants(root)) or \
         any(os.path.isfile(os.path.join(root, n)) for n in NAMES) or \
         bool(scan(root))
@@ -2146,6 +2505,9 @@ def fanout_cmd(src, out):
             skipped[m] = "no build manifest"
         else:
             slots.append(m)
+    for m, why in skipped.items():
+        err("fanout: %-9s .. skipped   %s\n" % (m, why))
+        emit("skipped", m, why)
 
     plans, blocked = {}, {}
     for m in slots:
@@ -2153,12 +2515,29 @@ def fanout_cmd(src, out):
         bj = pj + ".blocked"
         if os.path.isfile(pj):
             try:
-                plans[m] = json.load(open(pj)).get("approach") or {}
+                loaded = json.load(open(pj))
+                if loaded.get("spec_h", "") == sh:
+                    plans[m] = loaded.get("approach") or {}
+                    ap = plans[m]
+                    detail = (ap.get("notes") or ap.get("image")
+                              or ap.get("compose_file") or "")
+                    err(
+                        "fanout: %-9s .. plan      %-40s %s/T%d\n"
+                        % (m, detail[:40], FANOUT_COST[m],
+                           COST_RANK[FANOUT_COST[m]]))
+                    emit("method", m, "plan", detail, True)
+                # else: the plan predates this spec — replan under it
             except (OSError, ValueError):
                 pass
         elif os.path.isfile(bj):
             try:
-                blocked[m] = str(json.load(open(bj)).get("why") or "blocked")
+                b = json.load(open(bj))
+                if b.get("spec_h", "") == sh:
+                    blocked[m] = str(b.get("why") or "blocked")
+                    err("fanout: %-9s .. blocked   %s\n"
+                                     % (m, blocked[m]))
+                    emit("method", m, "blocked", blocked[m], True)
+                # else: a blocked verdict under an old spec — retry
             except (OSError, ValueError):
                 blocked[m] = "blocked"
     todo = [m for m in slots if m not in plans and m not in blocked]
@@ -2180,6 +2559,7 @@ def fanout_cmd(src, out):
             "(package names, install steps, official images). Reply ONE "
             'JSON object: {"lookup": ["<doc topic>"], '
             '"why": "<max 8 words>"}\nEvidence:\n' + bundle[:16384])
+        emit("grounding")
         rc, o, _e = vmf_llm.llm_call("gapfill", draft, timeout=180)
         lookup = []
         if rc == 0:
@@ -2189,6 +2569,7 @@ def fanout_cmd(src, out):
             except Exception:
                 lookup = []
         grounded, c7_ids = vmf_llm.ground(lookup)
+        emit("grounded", c7_ids)
 
     def plan_method(m):
         prompt = (
@@ -2199,29 +2580,100 @@ def fanout_cmd(src, out):
             "cannot work for this repo, reply status=blocked with a "
             "short why (max 8 words) instead of a guess.\n"
             "Reply with ONE JSON object:\n" % FANOUT_GOAL[m])
+        sb = spec_block(spec)
+        if sb:
+            prompt += sb
         if m == "prebuilt":
             prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
                        '"image": "<exact ref, e.g. docker.io/library/ghost:5>", '
-                       '"ports": [<guest tcp ports>], "notes": "<max 8 words>"}\n')
+                       '"ports": [<guest tcp ports>], '
+                       '"install": ["<shell commands run once in the guest '
+                       'BEFORE the image starts>"], '
+                       '"env": {"K": "<literal value>"}, '
+                       '"checks": [{"probe": {"port": N, "path": "/", '
+                       '"expect_status_max": 399}} or an exec check that '
+                       'proves the app answers], '
+                       '"notes": "<max 8 words>"}\n')
+            prompt += ("The image boots as one compose service; the "
+                       "install list runs in the guest before it starts, "
+                       "so it can prepare files or services the image "
+                       "expects but does not carry. The boot is "
+                       "unattended: nothing can click a button or answer "
+                       "a wizard. Declare env the app requires from the "
+                       "repo's .env.example or README — missing env "
+                       "secrets kill apps after they bind. Env values "
+                       "are literal: never put an explanation inside a "
+                       "value; explanations belong in notes. A login "
+                       "page is not success: if the app ships default "
+                       "credentials, declare an exec check that logs in "
+                       "and asserts post-auth content. If the image "
+                       "cannot work without a sidecar this plan cannot "
+                       "provide, reply status=blocked with a short why "
+                       "— the verify fails a broken app honestly.\n")
         elif m == "compose":
             prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
                        '"compose_file": "<compose file in the repo ROOT>", '
                        '"ports": [<guest tcp ports of the primary>], '
+                       '"install": ["<shell commands run once in the guest '
+                       'BEFORE compose up>"], '
+                       '"checks": [{"probe": {"port": N, "path": "/", '
+                       '"expect_status_max": 399}} or an exec check that '
+                       'proves the app answers], '
                        '"notes": "<max 8 words>"}\n')
+            prompt += ("The boot is unattended: nothing can click a "
+                       "button or answer a wizard, so any one-time "
+                       "initialization (database schema, migrations, a "
+                       "setup page, a config file the stack expects) "
+                       "must ride the install list as a deterministic "
+                       "command run before compose up. A login page is "
+                       "not success: if the app ships default "
+                       "credentials, declare an exec check that logs in "
+                       "and asserts post-auth content.\n")
         elif m == "build":
             prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
                        '"dockerfile": "Dockerfile", '
-                       '"ports": [<guest tcp ports>], "notes": "<max 8 words>"}\n')
+                       '"ports": [<guest tcp ports>], '
+                       '"env": {"K": "<literal value>"}, '
+                       '"notes": "<max 8 words>"}\n')
+            prompt += ("Declare env the app requires: missing env "
+                       "secrets kill apps seconds after they bind "
+                       "(paperclip measured BETTER_AUTH_SECRET). Env "
+                       "values are literal: never put an explanation "
+                       "inside a value; explanations belong in notes. "
+                       "A login "
+                       "page is not success: if the app ships default "
+                       "credentials, say so in notes.\n")
         else:
             prompt += ('{"status": "plan"|"blocked", "why": "<max 8 words>", '
                        '"install": ["<shell commands run once>"], '
                        '"command": ["<argv that starts the app>"], '
                        '"ports": [<guest tcp ports>], '
                        '"checks": [{"probe": {"port": N, "path": "/", '
-                       '"expect_status_max": 399}}], '
+                       '"expect_status_max": 399}} or for a CLI tool '
+                       '{"cmd": {"bin": "<tool>", "probes": '
+                       '["<tool> --version", "<tool> --help"]}}, '
+                       '"user": "<run the app as this account>", '
                        '"images": ["<container image the app needs>"], '
                        '"env": {"K": "V"}, "needs_docker": <bool>, '
                        '"memory_mb": <1024-8192>, "notes": "<max 8 words>"}\n')
+            if not (spec and spec.get("deliverable") == "web"):
+                prompt += ("If the app is a CLI tool (no server, no "
+                           "ports), set command to [\"sleep\", "
+                           "\"100000000\"] (a keep-alive so the VM "
+                           "survives the verify), leave ports empty, "
+                           "and declare the cmd check.\n")
+            prompt += ("The boot is unattended: nothing can click a "
+                       "button or answer a wizard, so any one-time "
+                       "initialization (database schema, migrations, a "
+                       "setup page) must ride the install list as a "
+                       "deterministic command (a CLI runner, an SQL "
+                       "import, or a scripted curl of the setup "
+                       "endpoint). A login page is not success: if the "
+                       "app ships default credentials, declare a check "
+                       "that logs in and asserts post-auth content. If "
+                       "the app refuses root (embedded postgres does), "
+                       "create a dedicated account in the install list "
+                       "(useradd -m app) and declare user.\n")
         prompt += "Grounding:\n%s\nEvidence:\n%s" % (grounded, bundle[:32768]) \
             if grounded else "Evidence:\n%s" % bundle[:32768]
         rc, o, _e = vmf_llm.llm_call(
@@ -2234,72 +2686,127 @@ def fanout_cmd(src, out):
         except Exception:
             return m, None, "unparseable output"
 
-    results = {}
-    if todo:
-        from concurrent.futures import ThreadPoolExecutor
-        workers = max(1, int(os.environ.get("VMF_PLAN_PARALLEL")
-                             or len(todo)))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for m, j, err in ex.map(plan_method, todo):
-                results[m] = (j, err)
-
     def clamp_method(m, j):
         if not isinstance(j, dict):
             return None, "bad output shape"
         if str(j.get("status") or "").lower() == "blocked":
             return None, str(j.get("why") or "model blocked it")[:40]
         ports = _clamp_ports(j.get("ports"))
-        notes = str(j.get("notes") or "")[:40]
+        notes = str(j.get("notes") or "")[:120]
         if m == "prebuilt":
             img = _clamp_images(j.get("images") or
                                 ([j.get("image")] if j.get("image") else []))
             if not img:
                 return None, "no exact image ref"
+            inst = [str(x).strip() for x in (j.get("install") or [])
+                    if str(x).strip()][:20]
             return {"kind": FANOUT_KIND[m], "image": img[0],
-                    "ports": ports, "notes": notes}, None
+                    "ports": ports, "notes": notes,
+                    "install": inst,
+                    "env": _clamp_env(j.get("env")),
+                    "checks": _clamp_checks(j.get("checks"))}, None
         if m == "compose":
             cf = _clamp_compose_file(j.get("compose_file"), root)
             if not cf:
                 return None, "no standalone compose file"
+            inst = [str(x).strip() for x in (j.get("install") or [])
+                    if str(x).strip()][:20]
             return {"kind": FANOUT_KIND[m], "compose_file": cf,
-                    "ports": ports, "notes": notes}, None
+                    "ports": ports, "notes": notes,
+                    "install": inst,
+                    "checks": _clamp_checks(j.get("checks"))}, None
         if m == "build":
             df = str(j.get("dockerfile") or "Dockerfile")
             if "/" in df or not os.path.isfile(os.path.join(root, df)):
                 return None, "no root Dockerfile"
             return {"kind": FANOUT_KIND[m], "ports": ports,
+                    "env": _clamp_env(j.get("env")),
                     "notes": notes}, None
         cmd = [str(x) for x in (j.get("command") or [])][:16]
         if not cmd:
             return None, "no command"
-        return {"kind": FANOUT_KIND[m], "ports": ports,
-                "direct": _clamp_direct(j, ports), "notes": notes}, None
+        ap = {"kind": FANOUT_KIND[m], "ports": ports,
+              "direct": _clamp_direct(j, ports), "notes": notes}
+        if spec and spec.get("deliverable") == "web" \
+                and _is_keepalive((ap["direct"] or {}).get("command")):
+            return None, "plan ignores the web target"
+        return ap, None
 
-    os.makedirs(gen, exist_ok=True)
     runnable = {}
-    for m in todo:
-        j, err = results.get(m, (None, "no result"))
-        ap, why = clamp_method(m, j)
-        if ap:
-            plans[m] = ap
-            with open(os.path.join(gen, "plan-%s.json" % m), "w") as f:
-                json.dump({"method": m, "approach": ap,
-                           "context7": c7_ids}, f, indent=2)
-        elif isinstance(j, dict) \
-                and str(j.get("status") or "").lower() == "blocked":
-            # An honest model verdict: cached, so the method stays off
-            # until the bundle changes.
-            blocked[m] = (why or "blocked")[:40]
-            with open(os.path.join(gen, "plan-%s.json.blocked" % m),
-                      "w") as f:
-                json.dump({"why": blocked[m]}, f, indent=2)
-        else:
-            # Transport or parse failure: NOT the model's verdict —
-            # never cached; the next run retries the method.
-            blocked[m] = ((why or err or "blocked")
-                          + " (transient; will retry)")[:40]
-        if ap:
-            runnable[m] = ap
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = max(1, int(os.environ.get("VMF_PLAN_PARALLEL")
+                             or len(todo)))
+        os.makedirs(gen, exist_ok=True)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(plan_method, m): m for m in todo}
+            # Results land one by one: each is clamped, written, and
+            # announced the moment its call returns — an interrupt
+            # keeps the finished plans, and a live board watches the
+            # lanes flip instead of a silent stretch.
+            for fut in as_completed(futs):
+                m = futs[fut]
+                try:
+                    _m, j, call_err = fut.result()
+                except Exception:
+                    j, call_err = None, "model error"
+                ap, why = clamp_method(m, j)
+                if ap:
+                    plans[m] = ap
+                    runnable[m] = ap
+                    detail = (ap.get("notes") or ap.get("image")
+                              or ap.get("compose_file") or "")
+                    with open(os.path.join(gen, "plan-%s.json" % m),
+                              "w") as f:
+                        json.dump({"method": m, "approach": ap,
+                                   "context7": c7_ids, "spec_h": sh},
+                                  f, indent=2)
+                    err(
+                        "fanout: %-9s .. plan      %-40s %s/T%d\n"
+                        % (m, detail[:40], FANOUT_COST[m],
+                           COST_RANK[FANOUT_COST[m]]))
+                    emit("method", m, "plan", detail)
+                elif isinstance(j, dict) \
+                        and str(j.get("status") or "").lower() == "blocked":
+                    # An honest model verdict: cached, so the method
+                    # stays off until the bundle changes.
+                    blocked[m] = (why or "blocked")[:40]
+                    with open(os.path.join(gen,
+                                           "plan-%s.json.blocked" % m),
+                              "w") as f:
+                        json.dump({"why": blocked[m], "spec_h": sh},
+                                  f, indent=2)
+                    err("fanout: %-9s .. blocked   %s\n"
+                                     % (m, blocked[m]))
+                    emit("method", m, "blocked", blocked[m])
+                else:
+                    why_c = (why or call_err or "blocked")
+                    if isinstance(j, dict) \
+                            and str(j.get("status") or "").lower() == "plan":
+                        # A model plan the deterministic clamp rejected
+                        # (e.g. a keep-alive command under a web
+                        # target): the spec decided, not the transport
+                        # — cache the honest verdict.
+                        blocked[m] = why_c[:40]
+                        with open(os.path.join(gen,
+                                               "plan-%s.json.blocked" % m),
+                                  "w") as f:
+                            json.dump({"why": blocked[m], "spec_h": sh},
+                                      f, indent=2)
+                        err("fanout: %-9s .. blocked   %s\n"
+                                         % (m, blocked[m]))
+                        emit("method", m, "blocked", blocked[m])
+                    else:
+                        # Transport or parse failure: NOT the model's
+                        # verdict — never cached; the next run retries
+                        # the method.
+                        blocked[m] = (why_c
+                                      + " (transient; will retry)")[:40]
+                        err("fanout: %-9s .. blocked   %s\n"
+                                         % (m, blocked[m]))
+                        emit("method", m, "blocked",
+                             "transient; will retry")
+
 
     # The pkg/source plan doubles as the gap-fill cache entry: the boot
     # (VMF_PLAN_SKIP_COMPOSE=1) then replays it with zero LLM calls.
@@ -2323,25 +2830,19 @@ def fanout_cmd(src, out):
                            "notes": ap["notes"], "created": "",
                            "context7": c7_ids, "refined": False,
                            "turns": 0, "fanout": m}, f, indent=2)
-            sys.stderr.write("fanout: %s plan cached as the gap-fill "
+            err("fanout: %s plan cached as the gap-fill "
                              "direct plan\n" % m)
             break
 
     out_approaches = []
     for m in FANOUT_METHODS:
-        if m in skipped:
-            sys.stderr.write("fanout: %-9s .. skipped   %s\n"
-                             % (m, skipped[m]))
-        elif m in blocked:
-            sys.stderr.write("fanout: %-9s .. blocked   %s\n"
-                             % (m, blocked[m]))
-        elif m in plans:
+        # Skipped and per-method lines printed where they happened
+        # (prefilter and landing); this loop only assembles the
+        # approaches file, in stable method order.
+        if m in plans:
             ap = plans[m]
             detail = ap.get("notes") or ap.get("image") \
                 or ap.get("compose_file") or ""
-            sys.stderr.write("fanout: %-9s .. plan      %-40s %s/T%d\n"
-                             % (m, detail[:40], FANOUT_COST[m],
-                                COST_RANK[FANOUT_COST[m]]))
             e = {"kind": ap["kind"],
                  "evidence": ("fanout: %s %s" % (m, detail))[:120],
                  "cost": FANOUT_COST[m], "method": m}
@@ -2351,15 +2852,24 @@ def fanout_cmd(src, out):
                 e["compose_file"] = ap["compose_file"]
             if ap.get("ports"):
                 e["ports"] = ap["ports"]
+            if ap.get("install"):
+                e["install"] = ap["install"]
+            if ap.get("checks"):
+                e["checks"] = ap["checks"]
+            if ap.get("env"):
+                e["env"] = ap["env"]
+            if ap.get("notes"):
+                e["notes"] = ap["notes"]
             out_approaches.append(e)
     with open(out, "w") as f:
         json.dump({"approaches": out_approaches}, f, indent=2)
     n_blocked = len(blocked) + len(skipped)
-    sys.stderr.write("fanout: %d runnable, %d blocked/skipped, %d llm "
+    err("fanout: %d runnable, %d blocked/skipped, %d llm "
                      "call(s)%s\n" % (len(out_approaches), n_blocked,
                                       len(todo) + (1 if todo else 0),
                                       (", grounded: %s"
                                        % ", ".join(c7_ids[:2])) if c7_ids else ""))
+    emit("done", len(out_approaches), n_blocked)
     return 0 if out_approaches else 1
 
 
@@ -2470,6 +2980,15 @@ def _route_detail(route):
         return "root Dockerfile"
     d = route.get("direct") or {}
     if d.get("command"):
+        # A keep-alive command names no app; the CLI check does.
+        if str(d["command"][0]) in KEEPALIVE_CMDS:
+            for c in d.get("checks") or []:
+                if isinstance(c, dict) and isinstance(c.get("cmd"), dict):
+                    k = c["cmd"]
+                    name = (k.get("bin")
+                            or ((k.get("probes") or ["?"])[0].split()
+                                or ["?"])[0])
+                    return "cli: %s" % str(name)[:32]
         return " ".join(str(x) for x in d["command"])[:40]
     return (route.get("evidence") or "")[:40]
 
@@ -2546,12 +3065,14 @@ def _url_alive(url):
     return True, None
 
 
-def _clamp_route(r, root):
+def _clamp_route(r, root, spec=None):
     # One scouted route -> a flat approach entry the race can boot.
     # Returns (route, drop_why). Structure is pruned HERE, not at boot:
     # boot kinds need an exact surface (image ref, compose file,
     # Dockerfile) and a tcp port to verify; direct kinds need a
     # command. A dropped route is a scan finding, never a boot.
+    # The spec (when present) drops direct keep-alive routes: a web
+    # target is not served by `sleep 100000000`.
     if not isinstance(r, dict):
         return None, "bad shape"
     m = str(r.get("method") or "").strip().lower()
@@ -2598,6 +3119,9 @@ def _clamp_route(r, root):
     direct = _clamp_direct(r, ports)
     if not direct:
         return None, "no command"
+    if spec and spec.get("deliverable") == "web" \
+            and _is_keepalive(direct.get("command")):
+        return None, "plan ignores the web target"
     if m == "release":
         ok, why = _url_alive(_scout_asset_url(r))
         if not ok:
@@ -2607,7 +3131,7 @@ def _clamp_route(r, root):
     return route, None
 
 
-def _scout_scan(root, out, raw, routes):
+def _scout_scan(root, out, raw, routes, spec=None):
     # The bounded scout loop. Turn 1 emits the obvious routes (official
     # image, release asset, compose stack); later turns keep reading
     # for OTHER routes until the model says exhausted or the turn
@@ -2659,7 +3183,22 @@ def _scout_scan(root, out, raw, routes):
             "published release asset and run it; often the fastest route "
             "of all, check the release inventory). When a method cannot "
             "work for this repo, do not emit it. Never invent versions, "
-            "ports, or env values.\n"
+            "ports, or env values. ")
+        if not (spec and spec.get("deliverable") == "web"):
+            prompt += ("If the app is a CLI tool (no server, no ports), "
+                       "set command to [\"sleep\", \"100000000\"] (a "
+                       "keep-alive so the VM survives the verify), leave "
+                       "ports empty, and declare a cmd check naming the "
+                       "tool binary. ")
+        prompt += spec_block(spec)
+        prompt += ("The boot is unattended: nothing can click a button or "
+            "answer a wizard, so any one-time initialization (database "
+            "schema, migrations, a setup page) must ride the install "
+            "list as a deterministic command (a CLI runner, an SQL "
+            "import, or a scripted curl of the setup endpoint). A login "
+            "page is not success: if the app ships default credentials, "
+            "declare a check that logs in and asserts post-auth "
+            "content.\n"
             "Reply with ONE JSON object:\n"
             '{"routes": [{"method": "<vocab>", "why": "<max 8 words>", '
             '"cost": "fast|medium|slow|slowest", '
@@ -2674,7 +3213,9 @@ def _scout_scan(root, out, raw, routes):
             '"command": ["<pkg/release/source: argv that starts the app>"], '
             '"ports": [<guest tcp ports>], '
             '"checks": [{"probe": {"port": N, "path": "/", '
-            '"expect_status_max": 399}}], '
+            '"expect_status_max": 399}} or for a CLI tool '
+            '{"cmd": {"bin": "<tool>", "probes": ["<tool> --version", '
+            '"<tool> --help"]}}, '
             '"images": ["<container images the app needs>"], '
             '"env": {"K": "V"}, "needs_docker": <bool>, '
             '"memory_mb": <1024-8192>}], '
@@ -2709,7 +3250,7 @@ def _scout_scan(root, out, raw, routes):
         new = 0
         for r in (j.get("routes") or [])[:6]:
             raw.append(r)
-            route, why = _clamp_route(r, root)
+            route, why = _clamp_route(r, root, spec)
             if not route:
                 sys.stderr.write("scout: dropped %-9s .. %s\n"
                                  % (str(r.get("method") or "?")[:9],
@@ -2769,16 +3310,20 @@ def scout_cmd(src, out):
     root = src
     gen = os.path.join(_gen_root(), winner_key(root))
     os.makedirs(gen, exist_ok=True)
+    spec = load_or_derive_spec(root, gen)
+    sh = _spec_h(spec)
     cache = os.path.join(gen, "scout-v2.json")
     if os.path.isfile(cache):
         try:
             c = json.load(open(cache))
+            if c.get("spec_h", "") != sh:
+                raise ValueError("stale spec")
             raw = c.get("routes") or []
             summary = c.get("summary") or {}
             routes = []
             emitted = set()
             for r in raw:
-                route, why = _clamp_route(r, root)
+                route, why = _clamp_route(r, root, spec)
                 if not route:
                     sys.stderr.write("scout: dropped %-9s .. %s\n"
                                      % (str(r.get("method") or "?")[:9],
@@ -2814,8 +3359,8 @@ def scout_cmd(src, out):
         # next run scouts again.
         try:
             with open(cache, "w") as f:
-                json.dump({"routes": raw, "summary": summary}, f,
-                          indent=2)
+                json.dump({"routes": raw, "summary": summary,
+                           "spec_h": sh}, f, indent=2)
         except OSError:
             pass
     _scout_cache_direct(root, routes)
@@ -2827,6 +3372,593 @@ def scout_cmd(src, out):
                         " (transient; will retry)"
                         if summary.get("transient") else ""))
     return 0 if routes else 1
+
+
+# ---- preview: the deliverable on paper ----
+
+def _preview_found(root):
+    # The deterministic read summary: what the scout would read.
+    found = []
+    for n in list(NAMES) + _root_compose_variants(root):
+        if os.path.isfile(os.path.join(root, n)) and n not in found:
+            found.append(n)
+    for f in ("Dockerfile", "package.json", "pyproject.toml",
+              "requirements.txt", "go.mod", "Cargo.toml", "Makefile",
+              ".env.example", "README.md"):
+        if os.path.isfile(os.path.join(root, f)):
+            found.append(f)
+    return found
+
+
+def _check_word(c):
+    # One rendered check word: tcp:80 · probe:/ → 2xx · exec:curl · cmd:mvt
+    if isinstance(c, dict) and isinstance(c.get("tcp"), dict):
+        return "tcp:%s" % c["tcp"].get("port")
+    if isinstance(c, dict) and isinstance(c.get("probe"), dict):
+        p = c["probe"]
+        st = p.get("expect_status")
+        return "probe:%s → %s" % (p.get("path") or "/",
+                                  st if isinstance(st, int) else "2xx")
+    if isinstance(c, dict) and isinstance(c.get("exec"), dict):
+        w = str(c["exec"].get("cmd") or "").split()
+        return "exec:%s" % (w[0] if w else "?")
+    if isinstance(c, dict) and isinstance(c.get("cmd"), dict):
+        return "cmd:%s" % c["cmd"].get("bin")
+    return "check"
+
+
+def render_preview(spec, approaches, blocked, found, lane=None, as_json=False):
+    # The plain writer: same honesty as the board, nothing rendered that
+    # did not come out of the plan files.
+    if as_json:
+        return json.dumps({"spec": spec, "approaches": approaches,
+                           "blocked": blocked}, indent=2)
+    out = ["scout   %s" % (" · ".join(found[:8])
+                           or "(no plan-relevant files)")]
+    if spec and spec.get("deliverable"):
+        d, s, a = spec, spec.get("serve") or {}, spec.get("auth") or {}
+        out.append("spec    deliverable  %s          ← %s (--spec to override)"
+                   % (d["deliverable"],
+                      "intent + scout" if d.get("intent")
+                      else d.get("why") or "scout"))
+        if d["deliverable"] == "web" and s.get("port"):
+            out.append("        serve        %s 0.0.0.0:%s · path %s"
+                       % (s.get("proto") or "http", s["port"],
+                          s.get("path") or "/"))
+        if a.get("required"):
+            out.append("        auth         required%s"
+                       % ((" · %s" % a["note"]) if a.get("note") else ""))
+        if d.get("env_required"):
+            out.append("        env          %s"
+                       % " · ".join(d["env_required"]))
+        if d.get("user"):
+            out.append("        user         %s" % d["user"])
+        out.append("        hold         %ss" % (d.get("hold") or 25))
+    else:
+        out.append("spec    (none — pass --intent to declare the target)")
+    if lane is None:
+        if approaches:
+            out.append("lanes   " + ", ".join(
+                "%d %s/%s" % (i + 1, a.get("method") or a.get("kind"),
+                              a.get("cost") or "?")
+                for i, a in enumerate(approaches)))
+        if blocked:
+            out.append("        blocked: " + ", ".join(
+                "%s (%s)" % (m, w) for m, w in sorted(blocked.items())))
+    for i, a in enumerate(approaches):
+        n = i + 1
+        if lane is not None and n != lane:
+            continue
+        dm = a.get("method") or a.get("kind") or "?"
+        if a.get("kind") in ("install_script", "source_build"):
+            dm = "direct"
+        out.append("plan %d  %s · %s · %s"
+                   % (n, dm, a.get("kind") or "?", a.get("cost") or "?"))
+        if a.get("image"):
+            out.append("        image     %s" % a["image"])
+        if a.get("compose_file"):
+            out.append("        compose   %s" % a["compose_file"])
+        direct = a.get("direct") or {}
+        if direct.get("base_image"):
+            out.append("        base      %s" % direct["base_image"])
+        inst = list(a.get("install") or direct.get("install") or [])
+        for line in inst[:3]:
+            out.append("        install   %s" % line)
+        if len(inst) > 3:
+            out.append("                  … +%d more" % (len(inst) - 3))
+        cmd = direct.get("command") or []
+        if cmd:
+            ru = " ".join(str(x) for x in cmd[:6])
+            if _is_keepalive(cmd):
+                ru += "    keep-alive"
+            if direct.get("user") and direct["user"] != "root":
+                ru += "    as %s" % direct["user"]
+            out.append("        run       %s" % ru)
+        env = a.get("env") or direct.get("env") or {}
+        if env:
+            out.append("        env       %s" % " · ".join(
+                "%s=%s" % (k, v) for k, v in list(env.items())[:6]))
+        checks = a.get("checks") or direct.get("checks") or []
+        words = [w for w in (_check_word(c) for c in checks) if w]
+        if a.get("ports") and not any(w.startswith("tcp:") for w in words):
+            words = ["tcp:%s" % p for p in a["ports"]] + words
+        out.append("        checks    %s · hold %ss"
+                   % (" · ".join(words) or "(none declared)",
+                      (spec or {}).get("hold") or 25))
+        model = sorted({w.split(":")[0] for w in words
+                        if not w.startswith("tcp:")})
+        out.append("        verdict   winner needs %d/%d checks · floor: "
+                   "tcp + hold · model adds: %s"
+                   % (len(words), len(words), " · ".join(model) or "—"))
+        if a.get("notes") or direct.get("notes"):
+            out.append("        notes     %s" % (a.get("notes")
+                                                 or direct.get("notes")))
+    out.append("dry run — nothing booted · `just run <src> --intent …` "
+               "executes")
+    return "\n".join(out) + "\n"
+
+
+# ---- the rich render (terminals only; the plain writer stays the
+# fallback for pipes, tests, and --plain). The contract is the mock's:
+# every line traces to a plan file or the spec, the floor/model split
+# stays visible, the footer never claims anything booted.
+
+def _wrap_chunks(text, cap):
+    # Word-wrap one value into display chunks (the mock's _chunks).
+    out, cur = [], []
+    for w in str(text).split():
+        if cur and len(" ".join(cur)) + 1 + len(w) > cap:
+            out.append(" ".join(cur))
+            cur = []
+        cur.append(w)
+    if cur:
+        out.append(" ".join(cur))
+    return out
+
+
+def _preview_console(force_plain=False):
+    # Rich when the module is importable and stdout is a terminal;
+    # plain otherwise (pipes, tests, --plain). The renderer is an
+    # accelerator, never a dependency — the same policy as the model.
+    if force_plain or os.environ.get("VMF_PLAN_PLAIN") == "1":
+        return None
+    if not sys.stdout.isatty():
+        return None
+    try:
+        from rich.console import Console
+    except ImportError:
+        return None
+    return Console(highlight=False, soft_wrap=False)
+
+
+def render_preview_rich(cons, spec, approaches, blocked, found,
+                        argv_parts, lane=None, tally=None):
+    # The mocks/plan/plan.py render, driven by the real preview data.
+    import rich.panel as rich_panel
+    import rich.table as rich_table
+    import rich.text as rich_text
+    from rich.console import Group
+    Text = rich_text.Text
+    width = cons.width or 100
+    cons.print()
+    head = Text("  ")
+    head.append("vmf plan", style="bold")
+    for i, a in enumerate(argv_parts):
+        head.append("\n    " + a if i else "  " + a,
+                    style="cyan" if i else "bold")
+    cons.print(head)
+    cons.print()
+
+    def kv(label, text, style="", pad=12):
+        rows = []
+        cap = max(20, width - 4 - pad - 6)
+        for i, chunk in enumerate(_wrap_chunks(text, cap) or [""]):
+            t = Text("  ")
+            t.append("%-*s " % (pad, label if not i else ""),
+                     style="bright_black")
+            t.append(chunk, style=style)
+            rows.append(t)
+        return rows
+
+    cons.print(Text("  scout   "
+                    + (" · ".join(found[:8])
+                       or "(no plan-relevant files)"),
+                    style="bright_black"))
+    if spec and spec.get("deliverable"):
+        s, a = spec.get("serve") or {}, spec.get("auth") or {}
+        for t in kv("deliverable", spec["deliverable"], "bold green"):
+            cons.print(t)
+        tail = Text("               ")
+        tail.append("← %s " % ("intent + scout" if spec.get("intent")
+                               else spec.get("why") or "scout"),
+                    style="bright_black")
+        tail.append("(--spec to override)", style="bright_black")
+        cons.print(tail)
+        if spec["deliverable"] == "web" and s.get("port"):
+            for t in kv("serve", "%s 0.0.0.0:%s · path %s"
+                        % (s.get("proto") or "http", s["port"],
+                           s.get("path") or "/"), "cyan"):
+                cons.print(t)
+        if a.get("required"):
+            for t in kv("auth", "required%s"
+                        % ((" · %s" % a["note"]) if a.get("note") else ""),
+                        "yellow"):
+                cons.print(t)
+        if spec.get("env_required"):
+            for t in kv("env", " · ".join(spec["env_required"]), "cyan"):
+                cons.print(t)
+        if spec.get("user"):
+            for t in kv("user", spec["user"], "magenta"):
+                cons.print(t)
+        for t in kv("hold", "%ss" % (spec.get("hold") or 25)):
+            cons.print(t)
+    else:
+        cons.print(Text("  spec    (none — pass --intent to declare "
+                        "the target)", style="yellow"))
+    cons.print()
+    hold = (spec or {}).get("hold") or 25
+    lanes = []
+    for ap in approaches:
+        direct = ap.get("direct") or {}
+        checks = ap.get("checks") or direct.get("checks") or []
+        words = [w for w in (_check_word(c) for c in checks) if w]
+        if ap.get("ports") and not any(w.startswith("tcp:")
+                                       for w in words):
+            words = ["tcp:%s" % p for p in ap["ports"]] + words
+        dm = ap.get("method") or ap.get("kind") or "?"
+        if ap.get("kind") in ("install_script", "source_build"):
+            dm = "direct"
+        lanes.append((ap, dm, direct, words))
+    if lane is None:
+        t = rich_table.Table(box=None, pad_edge=False, padding=(0, 1),
+                             show_header=False)
+        for w in (9, 10, 8, 14, 7, 6):
+            t.add_column(width=w)
+        for i, (ap, dm, _direct, words) in enumerate(lanes):
+            t.add_row("lane %d" % (i + 1), dm, ap.get("cost") or "?",
+                      ap.get("kind") or "?",
+                      "%d chk" % len(words),
+                      "%d/%d" % (len(words), len(words)))
+        cons.print(t)
+        for m, why in sorted(blocked.items()):
+            row = Text("        ✗ ")
+            row.append("%-9s " % m, style="red")
+            row.append(why, style="bright_black")
+            cons.print(row)
+        cons.print()
+    for i, (ap, dm, direct, words) in enumerate(lanes):
+        n = i + 1
+        if lane is not None and n != lane:
+            continue
+        rows = []
+        pad = 12
+
+        def row(label, value, style=""):
+            if value:
+                rows.extend(kv(label, value, style, pad=pad))
+        row("image", ap.get("image"), "cyan")
+        row("compose", ap.get("compose_file"), "cyan")
+        row("base", direct.get("base_image"), "cyan")
+        inst = list(ap.get("install") or direct.get("install") or [])
+        for j, c in enumerate(inst[:3]):
+            row("install" if not j else "", str(c))
+        if len(inst) > 3:
+            row("", "… +%d more" % (len(inst) - 3), "bright_black")
+        cmd = direct.get("command") or []
+        if cmd:
+            t = Text("  ")
+            t.append("%-*s " % (pad, "run"), style="bright_black")
+            t.append(" ".join(str(x) for x in cmd[:6]))
+            if _is_keepalive(cmd):
+                t.append("    keep-alive", style="yellow")
+            if direct.get("user") and direct["user"] != "root":
+                t.append("    as %s" % direct["user"], style="magenta")
+            rows.append(t)
+        env = ap.get("env") or direct.get("env") or {}
+        if env:
+            row("env", " · ".join("%s=%s" % (k, v)
+                                  for k, v in list(env.items())[:6]),
+                "cyan")
+        ck = Text("  ")
+        ck.append("%-*s " % (pad, "checks"), style="bright_black")
+        for j, w in enumerate(words):
+            if j:
+                ck.append(" · ", style="bright_black")
+            ck.append(w, style="green")
+        ck.append(" · hold %ss" % hold, style="bright_black")
+        rows.append(ck)
+        model = sorted({w.split(":")[0] for w in words
+                        if not w.startswith("tcp:")})
+        v = Text("  ")
+        v.append("%-*s " % (pad, "verdict"), style="bright_black")
+        v.append("winner needs %d/%d checks" % (len(words), len(words)),
+                 style="bold")
+        v.append(" · floor: tcp + hold", style="bright_black")
+        v.append(" · model adds: %s" % (" · ".join(model) or "—"),
+                 style="bright_black")
+        rows.append(v)
+        notes = ap.get("notes") or direct.get("notes")
+        if notes:
+            row("notes", notes, "bright_black")
+        cons.print(rich_panel.Panel(
+            Group(*rows),
+            title="plan %d · %s · %s · %s"
+                  % (n, dm, ap.get("kind") or "?",
+                     ap.get("cost") or "?"),
+            border_style="dim", padding=(0, 1)))
+    foot = Text("  ")
+    foot.append("dry run — nothing booted", style="bold yellow")
+    if tally:
+        foot.append("  ·  %d runnable, %d blocked/skipped · %d llm"
+                    % tally, style="bright_black")
+    foot.append("  ·  `just run <src> --intent …` executes",
+                style="bright_black")
+    cons.print(foot)
+    cons.print()
+
+
+
+class _PlanLive:
+    # The live plan assembly — the mocks/plan replay as the real
+    # surface: spinner head, spec line, per-method state rows, rolling
+    # events. Feeds on fanout_cmd's progress events; renders through
+    # rich.live.Live (auto-refresh rotates the spinner).
+    def __init__(self, name):
+        self.name = name
+        self.t0 = time.time()
+        self.stage = "clone"
+        self.spec = None
+        self.spec_wait = False
+        self.found = []
+        self.states = {}       # method -> (state, detail)
+        self.events = []       # (clock, tag, text)
+        self.llm = 0
+        self.skipped = 0
+        self.n_plan = 0
+        self.n_blocked = 0
+        self.done = False
+        self.frame = 0
+
+    def clock(self):
+        s = max(0, int(time.time() - self.t0))
+        return "t+%d:%02d" % (s // 60, s % 60)
+
+    def note(self, tag, text):
+        self.events.append((self.clock(), tag, text))
+        del self.events[:-8]
+
+    def feed(self, ev, *a):
+        fr = FRAMES_LIVE[self.frame % len(FRAMES_LIVE)]
+        if ev == "stage":
+            self.stage = a[0]
+        elif ev == "found":
+            self.found = list(a[0])
+        elif ev == "spec_wait":
+            self.spec_wait, self.stage = True, "spec"
+        elif ev == "spec":
+            self.spec, self.spec_wait = a[0], False
+            if a[0] and a[0].get("deliverable"):
+                s = a[0].get("serve") or {}
+                self.note("spec", "spec: deliverable %s%s (%s)"
+                          % (a[0]["deliverable"],
+                             (" · serve %s://%s:%s"
+                              % (s.get("proto") or "http", "0.0.0.0",
+                                 s["port"]))
+                             if s.get("port") else "",
+                             a[0].get("why") or "target state"))
+                self.llm += 1
+        elif ev == "skipped":
+            self.states[a[0]] = ("skipped", a[1])
+            self.skipped += 1
+        elif ev == "grounding":
+            self.stage, self.llm = "grounding", self.llm + 1
+            self.note("*", "grounding: fetching current docs …")
+        elif ev == "grounded":
+            ids = a[0] or []
+            if ids:
+                self.note("*", "grounded: %s"
+                          % ", ".join(str(x) for x in ids[:2]))
+        elif ev == "method":
+            m, st, detail = a[0], a[1], (a[2] or "")
+            cached = bool(a[3]) if len(a) > 3 else False
+            self.states[m] = (st, detail)
+            self.stage = "plan %s" % m
+            if st == "plan":
+                self.n_plan += 1
+            else:
+                self.n_blocked += 1
+            if not cached:
+                self.llm += 1
+            self.note(m, "fanout: %-9s .. %-9s %s" % (m, st, detail))
+        elif ev == "done":
+            self.done, self.stage = True, "dry run"
+
+    def __rich_console__(self, cons, options):
+        import rich.text as rich_text
+        Text = rich_text.Text
+        fr = FRAMES_LIVE[self.frame % len(FRAMES_LIVE)]
+        self.frame += 1
+        busy = not self.done
+        w = options.max_width or 100
+        sp = Text(fr + " ", style="magenta") if busy else Text("  ")
+        head = Text("  ")
+        head.append_text(sp)
+        head.append("%s · " % self.name[:20], style="bold")
+        head.append(self.stage, style="bright_black")
+        if self.skipped:
+            head.append("  %d skipped" % self.skipped, style="yellow")
+        if self.llm:
+            head.append("  %d llm" % self.llm, style="bright_black")
+        head.append(" " * max(1, w - head.cell_len - 8))
+        head.append(self.clock(), style="bright_black")
+        yield head
+        yield Text("")
+        if self.spec_wait:
+            yield Text("  %s spec    deriving from the intent + the "
+                       "read …" % (fr if busy else " "),
+                       style="bright_black")
+        elif self.spec and self.spec.get("deliverable"):
+            s = self.spec.get("serve") or {}
+            t = Text("  spec    ")
+            t.append(self.spec["deliverable"], style="bold green")
+            if s.get("port"):
+                t.append(" · %s 0.0.0.0:%s · path %s"
+                         % (s.get("proto") or "http", s["port"],
+                            s.get("path") or "/"), style="cyan")
+            a = self.spec.get("auth") or {}
+            if a.get("required"):
+                t.append(" · auth required", style="yellow")
+            if self.spec.get("user"):
+                t.append(" · user %s" % self.spec["user"],
+                         style="magenta")
+            t.append("  ← intent + scout", style="bright_black")
+            yield t
+        else:
+            yield Text("  spec    (none — pass --intent to declare "
+                       "the target)", style="yellow")
+        yield Text("")
+        for m in FANOUT_METHODS:
+            st, detail = self.states.get(m, ("waiting", ""))
+            act = st == "waiting"
+            row = Text("  ")
+            row.append((fr + " ") if act and busy else "  ",
+                       style="magenta")
+            row.append("%-10s " % m, style="bold")
+            style = {"plan": "cyan", "blocked": "yellow",
+                     "skipped": "bright_black",
+                     "waiting": "bright_black"}.get(st, "")
+            row.append("%-9s " % st, style=style)
+            row.append(detail[:w - 34])
+            yield row
+        yield Text("")
+        cap = Text("── events ", style="bright_black")
+        cap.append("─" * max(2, w - 12 - cap.cell_len),
+                   style="bright_black")
+        yield cap
+        if not self.events:
+            yield Text("  (the plan is on paper; events land here)",
+                       style="dim")
+        for clock, tag, text in self.events[-6:]:
+            row = Text("  %8s  " % clock, style="bright_black")
+            if tag not in ("*",):
+                row.append("[%s] " % tag, style="bright_black")
+            style = "dim"
+            if "blocked" in text:
+                style = "yellow"
+            elif "plan" in text and "fanout" in text:
+                style = "cyan"
+            row.append(text, style=style)
+            yield row
+
+
+FRAMES_LIVE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def preview_cmd(src, intent=None, spec_json=None, lane=None, as_json=False,
+                plain=False):
+    # The plan surface: clone/read, derive the target-state spec, run
+    # the per-method fan-out on paper, print what a race would boot.
+    # Nothing boots; the artifacts are exactly what a race consumes
+    # (gen/<key>/plan-*.json), so a race right after replays the plans
+    # with zero LLM calls.
+    src_arg = src
+    cons = _preview_console(force_plain=plain or as_json)
+    board = None
+    if cons is not None:
+        from rich.live import Live
+        name = os.path.basename((src_arg or "").rstrip("/")) or "plan"
+        board = _PlanLive(name)
+        # transient: the board is scaffolding for the wait; the final
+        # render stands alone when it clears (the mock's contract).
+        live_ctx = Live(board, console=cons, refresh_per_second=4,
+                        transient=True)
+        live_ctx.__enter__()
+    try:
+        if URL_SCHEME_RE.match(src or ""):
+            url = src
+            d = tempfile.mkdtemp(prefix="vmf-preview-")
+            rc = subprocess.run(["git", "clone", "--depth", "1", url, d],
+                                capture_output=True, text=True,
+                                timeout=300)
+            if rc.returncode != 0:
+                err = (rc.stderr or "").strip().splitlines()
+                sys.stderr.write("error: clone failed: %s\n"
+                                 % (err[-1] if err
+                                    else "exit %s" % rc.returncode))
+                shutil.rmtree(d, ignore_errors=True)
+                return 1
+            src = d
+        if not os.path.isdir(src):
+            sys.stderr.write("error: no such directory: %s\n" % src)
+            return 2
+        if board is not None:
+            board.feed("stage", "read")
+            board.feed("found", _preview_found(src))
+        if intent:
+            os.environ["VMF_RUN_INTENT"] = intent
+        if spec_json:
+            os.environ["VMF_PLAN_SPEC"] = spec_json
+        root = src
+        gen = os.path.join(_gen_root(), winner_key(root))
+        if board is not None:
+            board.feed("spec_wait")
+        spec = load_or_derive_spec(root, gen)
+        if board is not None and not (spec and spec.get("deliverable")):
+            # Fanout re-emits a real spec; clear the wait for None.
+            board.feed("spec", spec)
+        if spec and spec.get("deliverable"):
+            os.environ["VMF_PLAN_SPEC"] = json.dumps(spec)
+        out = os.path.join(gen, ".preview-approaches.json")
+        rc = fanout_cmd(root, out,
+                        progress=board.feed if board is not None else None,
+                        quiet=board is not None)
+    finally:
+        if board is not None:
+            live_ctx.__exit__(None, None, None)
+    approaches = []
+    try:
+        approaches = json.load(open(out)).get("approaches") or []
+    except (OSError, ValueError):
+        pass
+    sh = _spec_h(spec)
+    blocked = {}
+    for m in FANOUT_METHODS:
+        bj = os.path.join(gen, "plan-%s.json.blocked" % m)
+        if os.path.isfile(bj):
+            try:
+                b = json.load(open(bj))
+                if b.get("spec_h", "") == sh:
+                    blocked[m] = str(b.get("why") or "blocked")
+            except (OSError, ValueError):
+                blocked[m] = "blocked"
+    for a in approaches:
+        m = a.get("method")
+        if m and a.get("kind") in ("install_script", "source_build"):
+            pj = os.path.join(gen, "plan-%s.json" % m)
+            try:
+                a["direct"] = (json.load(open(pj)).get("approach")
+                               or {}).get("direct") or {}
+            except (OSError, ValueError):
+                a["direct"] = {}
+    argv_parts = ["just plan %s" % src_arg]
+    if intent:
+        argv_parts.append('    --intent "%s"' % intent)
+    if spec_json:
+        argv_parts.append("    --spec %s" % spec_json[:64])
+    if lane is not None:
+        argv_parts.append("    --lane %d" % lane)
+    cons = _preview_console(force_plain=plain or as_json)
+    if cons is not None:
+        tally = (board.n_plan, board.n_blocked + board.skipped, board.llm) \
+            if board is not None else None
+        render_preview_rich(cons, spec, approaches, blocked,
+                            _preview_found(root), argv_parts, lane=lane,
+                            tally=tally)
+    else:
+        sys.stdout.write(render_preview(spec, approaches, blocked,
+                                        _preview_found(root), lane=lane,
+                                        as_json=as_json))
+    return 0 if approaches else 1
 
 
 def enumerate_cmd(src, out, verbose=False):
@@ -2950,6 +4082,39 @@ def main(argv):
         return fanout_cmd(rest[0], rest[1])
     elif cmd == "scout" and len(rest) >= 2:
         return scout_cmd(rest[0], rest[1])
+    elif cmd == "preview" and len(rest) >= 1:
+        src = rest[0]
+        intent = spec_json = None
+        lane = None
+        as_json = False
+        plain = False
+        i = 1
+        while i < len(rest):
+            a = rest[i]
+            if a == "--intent" and i + 1 < len(rest):
+                intent = rest[i + 1]
+                i += 2
+            elif a == "--spec" and i + 1 < len(rest):
+                spec_json = rest[i + 1]
+                i += 2
+            elif a == "--lane" and i + 1 < len(rest):
+                try:
+                    lane = int(rest[i + 1])
+                except ValueError:
+                    usage()
+                    return 2
+                i += 2
+            elif a == "--json":
+                as_json = True
+                i += 1
+            elif a == "--plain":
+                plain = True
+                i += 1
+            else:
+                usage()
+                return 2
+        return preview_cmd(src, intent=intent, spec_json=spec_json,
+                           lane=lane, as_json=as_json, plain=plain)
     else:
         usage()
         return 2

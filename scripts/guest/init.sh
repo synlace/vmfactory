@@ -132,7 +132,14 @@ if [ -s /vmf-run/install.sh ]; then
   $BB echo "vmf-init: running install.sh"
   # Non-interactive and stdin-free: base-image packages (tzdata) must
   # not open debconf dialogs, and the app must never read the console.
-  if DEBIAN_FRONTEND=noninteractive sh /vmf-run/install.sh \
+  # PIP_BREAK_SYSTEM_PACKAGES: the fat base is Debian with an
+  # externally-managed python (PEP 668) — a plain `pip install` dies
+  # there; the plan vocabulary says pip works, so make it true.
+  # PIP_PROGRESS_BAR: the spinner would flood any install log with
+  # carriage-return noise.
+  if PIP_BREAK_SYSTEM_PACKAGES=1 PIP_PROGRESS_BAR=off \
+      DEBIAN_FRONTEND=noninteractive \
+      sh /vmf-run/install.sh \
       </dev/null >/tmp/install.log 2>&1; then
     $BB echo "vmf-init: install.sh ok"
   else
@@ -235,8 +242,16 @@ fi
 }
 uid="$($BB cat /vmf-run/uid 2>/dev/null || true)"
 
-# Image USER (numeric uid[:gid]) or root.
+# Image USER (numeric uid[:gid]), or a NAME the plan declared — the
+# plan's user field lands here verbatim and busybox setuidgid resolves
+# either. HOME must follow the target account: setuidgid switches the
+# uid but the init's exported environment still says HOME=/root, and
+# apps write their state there as the wrong user (paperclip's
+# instance dir measured under /root).
 if [ -n "$uid" ]; then
+  u=${uid%%:*}
+  h=$($BB awk -F: -v u="$u" '$1==u || $3==u {print $6; exit}' /etc/passwd 2>/dev/null || true)
+  [ -n "$h" ] && export HOME="$h"
   $BB setuidgid "$uid" "$@" &
 else
   "$@" &

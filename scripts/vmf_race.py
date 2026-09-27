@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vmf_status
 import vmf_ui
+import vmf_plan
 
 RUNS = os.environ.get("VMF_RUNS") or os.path.expanduser("~/.vmf/runs")
 GEN = os.environ.get("VMF_GENERATED") \
@@ -327,6 +328,9 @@ def _keep_entry(i, r, logdir, base):
             "lp": os.path.join(logdir, "%s.log" % cand),
             "image": r.get("image"), "ports": r.get("ports") or [],
             "compose_file": r.get("compose_file"),
+            "install": r.get("install") or [],
+            "checks": r.get("checks") or [],
+            "env": r.get("env") or {},
             "method": r.get("method") or "", "cite": r.get("cite") or "",
             "cost": r.get("cost") or "", "detail": str(detail)[:40]}
 
@@ -429,17 +433,20 @@ def _expose_ports(src):
     return ports[:8]
 
 
-def synth_dir(kind, src, image, ports):
+def synth_dir(kind, src, image, ports, env=None):
     # Synthetic single-service compose dir for the dockerfile and
     # prebuilt_image kinds; the compose kind uses the real repo dir.
     # Ports come from the Dockerfile's EXPOSE lines, falling back to the
-    # enumeration's documented ports.
+    # enumeration's documented ports. The approach's declared env maps
+    # into the service environment: missing env secrets kill apps
+    # seconds after they bind (paperclip measured BETTER_AUTH_SECRET).
     d = tempfile.mkdtemp(prefix="vmf-race-%s-" % kind)
     ports = _expose_ports(src) or ports or []
     svc = {"image": image} if kind != "dockerfile" else \
         {"build": {"context": src, "dockerfile": "Dockerfile"}}
     doc = {"services": {"app": dict(
-        svc, ports=["%d:%d" % (p, p) for p in ports], environment={})}}
+        svc, ports=["%d:%d" % (p, p) for p in ports],
+        environment={str(k): str(v) for k, v in (env or {}).items()})}}
     with open(os.path.join(d, "docker-compose.yml"), "w") as f:
         json.dump(doc, f, indent=2)
     return d
@@ -491,7 +498,7 @@ def satisfiable(kind, src, image, ports, log, compose_file=None):
 
 
 def runner_cmd(kind, name, src, image, ports=None, compose_file=None,
-               method=None):
+               method=None, install=None, checks=None, plan_env=None):
     # Candidates re-enter oci-run as children; the marker env stops the
     # race from re-entering. --yes/--ssh ride the runner args.
     env = dict(os.environ)
@@ -501,6 +508,28 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None,
     env["VMF_RUN_YES"] = "1"
     env["VMF_RUN_DETACH"] = "1"
     env["VMF_RUN_SSH"] = "1"
+    # Synthetic-stack kinds (prebuilt_image, dockerfile) boot via the
+    # compose flow with no plan of their own: the approach's install
+    # list rides VMF_INSTALL_CMD (the guest runs it before the stack),
+    # its declared checks ride VMF_PLAN_CHECKS (the verify merges them
+    # beside the derived tcp checks), and its env rides VMF_PLAN_ENV
+    # (synth_dir maps it into the service environment). The compose
+    # kind gets the same channel: its install lines run before compose
+    # up, and its declared checks join the compose plan's derived ones
+    # (DVWA measured: a config file the stack expects, and a login
+    # check to prove it).
+    if kind in ("prebuilt_image", "dockerfile", "compose"):
+        if install:
+            env["VMF_INSTALL_CMD"] = "\n".join(
+                str(x) for x in install)[:8000]
+        clamped = vmf_plan._clamp_checks(checks or [])
+        if clamped:
+            env["VMF_PLAN_CHECKS"] = json.dumps(clamped)
+    # The declared env only reaches synth_dir (the service environment)
+    # for the synthetic-stack kinds; the compose kind's env lives in the
+    # repo's own compose file.
+    if kind in ("prebuilt_image", "dockerfile") and plan_env:
+        env["VMF_PLAN_ENV"] = json.dumps(plan_env)
     # Candidates pay boot + in-guest install latency; the default
     # verify deadline (built for fast images) expires mid-install.
     # Compose dev stacks boot even slower: ghost's first-run
@@ -533,7 +562,7 @@ def runner_cmd(kind, name, src, image, ports=None, compose_file=None,
         say("spawn %s: VMF_COMPOSE_HINT_FILE=%r" % (
             name, env.get("VMF_COMPOSE_HINT_FILE")))
     else:
-        args = [synth_dir(kind, src, image, ports)]
+        args = [synth_dir(kind, src, image, ports, plan_env)]
     return ["bash", os.path.join(SCRIPTS, "oci-run.sh"), "--yes",
             "--name", name] + args, env
 
@@ -650,6 +679,9 @@ def main(argv):
                      "lp": os.path.join(logdir, "%s.log" % cand),
                      "image": w.get("image"), "ports": w.get("ports") or [],
                      "compose_file": w.get("compose_file"),
+                     "install": w.get("install") or [],
+                     "checks": w.get("checks") or [],
+                     "env": w.get("env") or {},
                      "method": w.get("method") or "",
                      "cost": w.get("cost") or "",
                      "detail": w.get("image") or w.get("compose_file")
@@ -720,7 +752,10 @@ def main(argv):
         if ok:
             keep.append({"i": i, "kind": a["kind"], "cand": cand, "lp": lp,
                          "image": a.get("image"), "ports": a.get("ports") or [],
-                         "compose_file": a.get("compose_file")})
+                         "compose_file": a.get("compose_file"),
+                         "install": a.get("install") or [],
+                         "checks": a.get("checks") or [],
+                         "env": a.get("env") or {}})
         else:
             say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
     if not keep:
@@ -817,6 +852,13 @@ def race(keep, src, base, feed=None, board=None):
     # entries add method/cite/cost/detail. A live feed streams more
     # keep entries in as the scout emits them; the board (when active)
     # renders the same events as lanes.
+    # The board is a property of the terminal, not of the path that
+    # reached this loop: every entry point (winner-cache replay, scout
+    # fast path, the plain fan-out fallback) renders the same view when
+    # the terminal allows it. Callers that already opened one pass it
+    # in; a None board opens here.
+    if board is None:
+        board = _open_board(base)
     running = {}
     verdicts = {}
     winner = None
@@ -906,7 +948,8 @@ def race(keep, src, base, feed=None, board=None):
             k = queue.pop(0)
             cmd, env = runner_cmd(k["kind"], k["cand"], src, k["image"],
                                   k["ports"], k.get("compose_file"),
-                                  k.get("method"))
+                                  k.get("method"), k.get("install"),
+                                  k.get("checks"), k.get("env"))
             log = open(k["lp"], "a")
             log.write("\n===== boot =====\n")
             proc = subprocess.Popen(cmd, env=env, stdout=log,
@@ -1044,9 +1087,7 @@ def race(keep, src, base, feed=None, board=None):
         say("rerun with --approach <name|number> to retry one approach")
         if board:
             board.stage("fail")
-            board.close()
-            vmf_status.set_quiet(False)
-            vmf_status.line_closed()
+            _board_close()
         vmf_status.event(base, "fail", "no working service", final=True)
         return 1
 
@@ -1134,7 +1175,8 @@ def promote(w, src, base, winner, board=None):
                            w.get("cite"), _band_label(w, band_of(w)))
         cmd, env = runner_cmd(w["kind"], base, src, w["image"],
                               w["ports"], w.get("compose_file"),
-                              w.get("method"))
+                              w.get("method"), w.get("install"),
+                              w.get("checks"), w.get("env"))
         env["VMF_NAME"] = base
         say("promotion: booting %s (~2-4 min; tail: ~/.vmf/runs/%s/log)"
             % (base, base))

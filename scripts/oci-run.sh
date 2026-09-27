@@ -262,10 +262,15 @@ case "$image" in
 esac
 if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   repo_src="$RUNS_DIR/.compose-src.$$"
-  rm -rf "$repo_src"
-  mkdir -p "$repo_src"
-  # Name and instance numbering BEFORE the clone: the board's first
-  # line carries the final instance name from the clone phase on.
+  # The source mirror: a durable shallow clone per URL. A run pays one
+  # ls-remote round trip instead of a full clone; the mirror updates
+  # only when the remote HEAD moved. The per-run tree is a plain copy,
+  # so nothing downstream sees a shared checkout.
+  mirror_root="$RUNS_DIR/.git-mirror"
+  mirror="$mirror_root/$(printf '%s' "$clone_url" | cksum | cut -d' ' -f1)"
+  mkdir -p "$mirror_root"
+  # Name and instance numbering BEFORE the acquisition: the board's
+  # first line carries the final instance name from the clone phase on.
   name="${name:-$(basename "${clone_url%%.git}")}"
   [[ $board_mode -eq 1 ]] && export VMF_SILENT_NUMBER=1
   numbered=$(vmf_number_instance "$name" "$replace_flag")
@@ -274,18 +279,51 @@ if [[ "$image" =~ ^(https?://|git@|file://) ]]; then
   if [[ $board_mode -eq 1 ]]; then
     python3 "$VMF_SCRIPTS_DIR/vmf_status.py" begin "$name" >/dev/null 2>&1 || true
     python3 "$VMF_SCRIPTS_DIR/vmf_status.py" event "$name" clone \
-      "cloning source tree" >/dev/null 2>&1 || true
-    if vmf_run git -- git clone -q --depth 1 "$clone_url" "$repo_src" \
-        2>"$RUNS_DIR/.clone-err.$$"; then
-      rm -f "$RUNS_DIR/.clone-err.$$"
-    else
-      cat "$RUNS_DIR/.clone-err.$$" >&2
-      rm -f "$RUNS_DIR/.clone-err.$$"
-      exit 1
-    fi
-  else
-    vmf_run git -- git clone --depth 1 "$clone_url" "$repo_src" 2>&1 | tail -1
+      "checking the source mirror" >/dev/null 2>&1 || true
   fi
+  echo "clone: checking the source mirror for $clone_url" >&2
+  _mirror_refresh() {
+    if [ -d "$mirror/.git" ]; then
+      head_remote=$(vmf_run git -- git ls-remote "$clone_url" HEAD \
+        2>/dev/null | awk 'NR==1{print $1}')
+      head_local=$(vmf_run git -- git -C "$mirror" rev-parse HEAD 2>/dev/null)
+      if [ -n "$head_remote" ] && [ "$head_remote" = "$head_local" ]; then
+        echo "clone: remote HEAD matches the mirror; reusing it" >&2
+        return 0
+      fi
+      if [ -z "$head_remote" ]; then
+        # Unreachable remote: the mirror is still yesterday's truth.
+        echo "clone: unreachable remote; reusing the mirror as-is" >&2
+        return 0
+      fi
+      echo "clone: remote HEAD moved; updating the mirror" >&2
+      if vmf_run git -- git -C "$mirror" fetch --depth 1 origin HEAD \
+          2>"$RUNS_DIR/.clone-err.$$" \
+          && vmf_run git -- git -C "$mirror" reset --hard FETCH_HEAD \
+             2>>"$RUNS_DIR/.clone-err.$$"; then
+        rm -f "$RUNS_DIR/.clone-err.$$"
+        return 0
+      fi
+      echo "clone: mirror update failed; recloning" >&2
+    fi
+    rm -rf "$mirror"
+    vmf_run git -- git clone -q --depth 1 "$clone_url" "$mirror" \
+      2>"$RUNS_DIR/.clone-err.$$"
+  }
+  mirror_rc=0
+  if command -v flock >/dev/null 2>&1; then
+    ( flock -x 9; _mirror_refresh ) 9>"$mirror.lock" || mirror_rc=1
+  else
+    _mirror_refresh || mirror_rc=1
+  fi
+  if [ "$mirror_rc" -ne 0 ]; then
+    cat "$RUNS_DIR/.clone-err.$$" >&2 2>/dev/null || true
+    rm -f "$RUNS_DIR/.clone-err.$$"
+    exit 1
+  fi
+  rm -f "$RUNS_DIR/.clone-err.$$"
+  rm -rf "$repo_src"
+  cp -a "$mirror" "$repo_src"
   export VMF_COMPOSE_SRC="$repo_src" VMF_COMPOSE_URL="$clone_url"
   [[ -z "$proj_hint" ]] || export VMF_COMPOSE_PROJECT="$proj_hint"
   [[ -z "$intent" ]] || export VMF_RUN_INTENT="$intent"
@@ -693,14 +731,23 @@ if override_path and os.path.exists(override_path):
 p = env.get("PATH", "")
 env["PATH"] = (p + ":/vmf/bin") if p else "/vmf/bin:/usr/bin:/bin"
 
-user = (config.get("User") or "").strip()
+# The plan's user wins over the image USER: apps that refuse root
+# (embedded postgres measured) need the plan to name the account its
+# install list creates. A name lands verbatim; busybox setuidgid
+# resolves it in the guest.
+user = (os.environ.get("VMF_APP_USER") or "").strip() \
+    or (config.get("User") or "").strip()
 uid = ""
 if user:
     u, _, g = user.partition(":")
     if u.isdigit() and (not g or g.isdigit()):
         uid = f"{u}:{g or u}"
+    elif "/" not in user and user[0].isalpha() and \
+            all(c.isalnum() or c in "_-" for c in user) and len(user) <= 32:
+        uid = user
     else:
-        sys.stderr.write(f"warning: image USER {user!r} is not numeric; running as root\n")
+        sys.stderr.write(f"warning: user {user!r} is neither numeric nor "
+                         "a plain name; running as root\n")
 
 # 'export' is required: the guest init sources this file, and shell
 # variables set by sourcing are invisible to the child processes
@@ -1080,7 +1127,7 @@ try:
     ev = json.load(open(sys.argv[1]))
 except (OSError, ValueError):
     ev = []
-print(vmf_verify.oom_floor_mb(ev) or 0)' "$rundir/verify-evidence.json" 2>/dev/null || echo 0)
+print(vmf_verify.oom_floor_mb(ev) or 0)' "$RUNS_DIR/$name.verify-evidence.json" 2>/dev/null || echo 0)
     if [[ "$floor" =~ ^[0-9]+$ && "$floor" -gt 0 ]]; then
       echo "verify: compose OOM repair: rebooting with a ${floor}MB floor..."
       bash "$SCRIPTS_DIR/stop.sh" "$name" >/dev/null 2>&1 || true
@@ -1102,7 +1149,7 @@ print(vmf_verify.oom_floor_mb(ev) or 0)' "$rundir/verify-evidence.json" 2>/dev/n
     if [[ "${VMF_INTENT_MODE:-auto}" != "plan" ]] && \
         python3 "$VMF_SCRIPTS_DIR/vmf_agent.py" --vm "$name" \
         --rundir "$rundir" --out "$inst_dir/repaired.json" \
-        --repair --context "$rundir/verify-evidence.json" \
+        --repair --context "$RUNS_DIR/$name.verify-evidence.json" \
         --resume "$inst_dir/transcript.json" \
         --image "$image" --phrase "$intent"; then
       if python3 -c 'import json,sys
@@ -1148,7 +1195,7 @@ sys.exit(0 if a.get("ports") == b.get("ports") else 1)' \
   local revised="$RUNS_DIR/$name.verify-revised.json"
   rm -f "$revised"
   if ! VMF_RUN_YES=1 python3 "$SCRIPTS_DIR/vmf_verify.py" revise "$vplan" \
-      "$revised" --evidence "$rundir/verify-evidence.json" \
+      "$revised" --evidence "$RUNS_DIR/$name.verify-evidence.json" \
       ${cache_args[@]+"${cache_args[@]}"}; then
     echo "verify: revision not applied; the failed verdict stands"
     return 0
