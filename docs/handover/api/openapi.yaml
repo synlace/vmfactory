@@ -1,0 +1,1031 @@
+openapi: 3.1.0
+
+info:
+  title: vmfactory API
+  version: 0.2.0
+  description: |
+    Local control-plane API for vmfactory.
+
+    This specification covers the first vertical slice: creating and observing
+    the `plan-v1` workflow used by `vmf plan <target>`.
+
+    The API contract is transport-facing. The same domain and event contracts
+    should also support in-process execution for the first implementation slice.
+
+servers:
+  - url: http://localhost:{port}
+    variables:
+      port:
+        default: "8787"
+
+tags:
+  - name: Workflows
+  - name: Targets
+  - name: Inspections
+  - name: Specs
+  - name: Plans
+  - name: Operations
+
+paths:
+  /v1/workflow-executions:
+    post:
+      tags: [Workflows]
+      operationId: createWorkflowExecution
+      summary: Start a workflow execution
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkflowExecutionRequest'
+      responses:
+        '202':
+          description: Workflow execution accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowExecution'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/workflow-executions/{executionId}:
+    get:
+      tags: [Workflows]
+      operationId: getWorkflowExecution
+      summary: Get workflow execution state
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '200':
+          description: Current workflow execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowExecution'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/workflow-executions/{executionId}/events:
+    get:
+      tags: [Workflows]
+      operationId: streamWorkflowExecutionEvents
+      summary: Stream workflow execution events
+      description: |
+        Streams Server-Sent Events for a workflow execution.
+
+        Clients should reconnect after interruption and may supply Last-Event-ID.
+        The same Event envelope is used by in-process execution.
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/workflow-executions/{executionId}/cancel:
+    post:
+      tags: [Workflows]
+      operationId: cancelWorkflowExecution
+      summary: Cancel a workflow execution
+      parameters:
+        - $ref: '#/components/parameters/ExecutionId'
+      responses:
+        '202':
+          description: Cancellation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowExecution'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/targets:
+    post:
+      tags: [Targets]
+      operationId: resolveTarget
+      summary: Resolve and create a target
+      description: |
+        Normalises a target input and creates or reuses a durable Target resource.
+        This is an atomic operation that may also be invoked by a workflow.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTargetRequest'
+      responses:
+        '201':
+          description: Target resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Target'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/targets/{targetId}:
+    get:
+      tags: [Targets]
+      operationId: getTarget
+      summary: Get a target
+      parameters:
+        - $ref: '#/components/parameters/TargetId'
+      responses:
+        '200':
+          description: Target
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Target'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/target-inspections:
+    post:
+      tags: [Inspections]
+      operationId: createTargetInspection
+      summary: Inspect a target
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTargetInspectionRequest'
+      responses:
+        '202':
+          description: Inspection accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TargetInspection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/target-inspections/{inspectionId}:
+    get:
+      tags: [Inspections]
+      operationId: getTargetInspection
+      summary: Get an inspection
+      parameters:
+        - $ref: '#/components/parameters/InspectionId'
+      responses:
+        '200':
+          description: Target inspection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TargetInspection'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/execution-specs:
+    post:
+      tags: [Specs]
+      operationId: deriveExecutionSpec
+      summary: Derive a bounded execution specification
+      description: |
+        Derives what success means from explicit user intent and grounded target
+        inspection evidence. Intent is optional; absence of intent must remain
+        absence rather than being replaced by a fabricated default.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExecutionSpecRequest'
+      responses:
+        '202':
+          description: Spec derivation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionSpec'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/execution-specs/{specId}:
+    get:
+      tags: [Specs]
+      operationId: getExecutionSpec
+      summary: Get an execution specification
+      parameters:
+        - name: specId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Execution specification
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionSpec'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/plans:
+    post:
+      tags: [Plans]
+      operationId: generatePlan
+      summary: Generate a plan from an inspection and execution specification
+      description: |
+        Generates candidates independently by method, applies deterministic
+        validation, and returns a Plan containing per-candidate verdicts.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePlanRequest'
+      responses:
+        '202':
+          description: Plan generation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/plans/{planId}:
+    get:
+      tags: [Plans]
+      operationId: getPlan
+      summary: Get a plan
+      parameters:
+        - $ref: '#/components/parameters/PlanId'
+      responses:
+        '200':
+          description: Plan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/plans/{planId}/validate:
+    post:
+      tags: [Plans]
+      operationId: validatePlan
+      summary: Deterministically validate a plan and its candidates
+      description: |
+        Performs semantic validation against known evidence and the ExecutionSpec.
+        Validation must reject unsupported assumptions instead of guessing.
+      parameters:
+        - $ref: '#/components/parameters/PlanId'
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanValidation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: >
+            Plan is structurally understood but is not executable under the
+            current ExecutionSpec and deterministic validation rules. This does
+            not imply workflow-engine failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanValidation'
+
+  /v1/operation-executions/{operationExecutionId}:
+    get:
+      tags: [Operations]
+      operationId: getOperationExecution
+      summary: Get an atomic operation execution
+      parameters:
+        - name: operationExecutionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Operation execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationExecution'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Prevents duplicate creation if a client retries a request.
+      schema:
+        type: string
+        maxLength: 255
+
+    ExecutionId:
+      name: executionId
+      in: path
+      required: true
+      schema:
+        type: string
+
+    TargetId:
+      name: targetId
+      in: path
+      required: true
+      schema:
+        type: string
+
+    InspectionId:
+      name: inspectionId
+      in: path
+      required: true
+      schema:
+        type: string
+
+    PlanId:
+      name: planId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Conflict:
+      description: Resource state conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    InternalError:
+      description: Internal error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    CreateWorkflowExecutionRequest:
+      type: object
+      additionalProperties: false
+      required: [workflow_id, input]
+      properties:
+        workflow_id:
+          type: string
+          enum: [plan-v1]
+        input:
+          type: object
+          required: [target]
+          additionalProperties: false
+          properties:
+            target:
+              $ref: '#/components/schemas/TargetInput'
+            intent:
+              type: string
+              minLength: 1
+              description: Optional explicit user intent. No default is implied.
+
+    WorkflowExecution:
+      type: object
+      required: [id, workflow_id, state, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          examples: [wf_01KXYZ]
+        workflow_id:
+          type: string
+          examples: [plan-v1]
+        state:
+          $ref: '#/components/schemas/WorkflowState'
+        input:
+          type: object
+          additionalProperties: true
+        output:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/Error'
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    WorkflowState:
+      type: string
+      enum: [queued, running, succeeded, blocked, failed, cancelled]
+
+    OperationExecution:
+      type: object
+      required:
+        [id, workflow_execution_id, operation, state, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        workflow_execution_id:
+          type: string
+        operation:
+          type: string
+          examples: [inspect_target]
+        state:
+          $ref: '#/components/schemas/OperationState'
+        input:
+          type: object
+          additionalProperties: true
+        output:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/Error'
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OperationState:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled]
+
+    TargetInput:
+      oneOf:
+        - $ref: '#/components/schemas/GitTargetInput'
+        - $ref: '#/components/schemas/GenericArtifactTargetInput'
+      discriminator:
+        propertyName: kind
+
+    GitTargetInput:
+      type: object
+      additionalProperties: false
+      required: [kind, url]
+      properties:
+        kind:
+          const: git
+        url:
+          type: string
+          format: uri
+        ref:
+          type: string
+
+    GenericArtifactTargetInput:
+      type: object
+      additionalProperties: false
+      required: [kind, source]
+      properties:
+        kind:
+          type: string
+          enum: [iso, apk, ova, qcow2, container, artifact]
+        source:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+
+    CreateTargetRequest:
+      type: object
+      additionalProperties: false
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/TargetInput'
+
+    Target:
+      type: object
+      required: [id, kind, source, created_at]
+      properties:
+        id:
+          type: string
+          examples: [target_01KXYZ]
+        kind:
+          type: string
+        source:
+          type: object
+          additionalProperties: true
+        content_hash:
+          type:
+            - string
+            - "null"
+        artifact_id:
+          type:
+            - string
+            - "null"
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+
+    CreateTargetInspectionRequest:
+      type: object
+      additionalProperties: false
+      required: [target_id]
+      properties:
+        target_id:
+          type: string
+
+    TargetInspection:
+      type: object
+      required: [id, target_id, state, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          examples: [inspection_01KXYZ]
+        target_id:
+          type: string
+        state:
+          $ref: '#/components/schemas/OperationState'
+        content_hash:
+          type:
+            - string
+            - "null"
+          description: Hash of the canonical bounded evidence bundle.
+        evidence:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+        limits:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+          description: Effective evidence collection bounds used by the inspector.
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/Error'
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateExecutionSpecRequest:
+      type: object
+      additionalProperties: false
+      required: [inspection_id]
+      properties:
+        inspection_id:
+          type: string
+        intent:
+          type: string
+          minLength: 1
+          description: Optional explicit user intent. No default is implied.
+        override:
+          oneOf:
+            - $ref: '#/components/schemas/ExecutionSpecInput'
+            - type: "null"
+
+    ExecutionSpecInput:
+      type: object
+      additionalProperties: false
+      properties:
+        deliverable:
+          type: string
+          enum: [web, cli]
+        serve:
+          oneOf:
+            - $ref: '#/components/schemas/ServeSpec'
+            - type: "null"
+        auth:
+          type:
+            - string
+            - "null"
+          enum: [none, required, null]
+        env_required:
+          type: array
+          items:
+            type: string
+          uniqueItems: true
+        user:
+          type:
+            - string
+            - "null"
+        hold:
+          type:
+            - boolean
+            - "null"
+
+    ExecutionSpec:
+      allOf:
+        - $ref: '#/components/schemas/ExecutionSpecInput'
+        - type: object
+          required: [id, schema_version, inspection_id, spec_hash, provenance]
+          properties:
+            id:
+              type: string
+            schema_version:
+              type: string
+              examples: ["1"]
+            inspection_id:
+              type: string
+            spec_hash:
+              type: string
+            provenance:
+              $ref: '#/components/schemas/SpecProvenance'
+
+    ServeSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        protocol:
+          type: string
+          enum: [http, https, tcp]
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        path:
+          type: string
+          pattern: '^/'
+
+    SpecProvenance:
+      type: object
+      required: [source]
+      properties:
+        source:
+          type: string
+          enum:
+            - user_override
+            - intent_and_inspection
+            - inspection_only
+            - cached_replay
+        enrichment_ids:
+          type: array
+          items:
+            type: string
+        enrichment_used:
+          type: boolean
+        intent_present:
+          type: boolean
+        inspection_content_hash:
+          type:
+            - string
+            - "null"
+
+    CreatePlanRequest:
+      type: object
+      additionalProperties: false
+      required: [inspection_id, execution_spec_id]
+      properties:
+        inspection_id:
+          type: string
+        execution_spec_id:
+          type: string
+
+    Plan:
+      type: object
+      required:
+        [id, target_id, inspection_id, execution_spec, spec_hash,
+         state, schema_version, candidates, provenance, created_at]
+      properties:
+        id:
+          type: string
+          examples: [plan_01KXYZ]
+        target_id:
+          type: string
+        inspection_id:
+          type: string
+        execution_spec:
+          $ref: '#/components/schemas/ExecutionSpec'
+        spec_hash:
+          type: string
+        state:
+          type: string
+          enum: [generating, ready, blocked, failed]
+        schema_version:
+          type: string
+          examples: ["1"]
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanCandidate'
+        provenance:
+          $ref: '#/components/schemas/PlanProvenance'
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/Error'
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+
+    PlanCandidate:
+      type: object
+      required:
+        [id, method, verdict, schema_version, spec, provenance]
+      properties:
+        id:
+          type: string
+        method:
+          type: string
+          examples: [docker-compose]
+        verdict:
+          $ref: '#/components/schemas/CandidateVerdict'
+        schema_version:
+          type: string
+          examples: ["1"]
+        base_image:
+          type:
+            - string
+            - "null"
+          examples: [ubuntu:24.04]
+        rationale:
+          type: string
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvidenceReference'
+        spec:
+          $ref: '#/components/schemas/CandidateSpec'
+        validation:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+        provenance:
+          $ref: '#/components/schemas/CandidateProvenance'
+
+    CandidateVerdict:
+      type: string
+      enum: [runnable, blocked, transient_error]
+
+    CandidateSpec:
+      type: object
+      description: |
+        Versioned candidate execution contract. Implementations must validate
+        this against the matching schema under api/schemas/candidates/.
+        v1 methods include native, container, dockerfile, docker-compose and
+        prebuilt. Semantic clamps not expressible in JSON Schema remain
+        deterministic validator duties.
+      required: [version, method, config]
+      properties:
+        version:
+          type: string
+        method:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
+
+    EvidenceReference:
+      type: object
+      required: [kind, source]
+      properties:
+        kind:
+          type: string
+          examples: [file]
+        source:
+          type: string
+          examples: [docker-compose.yml]
+        detail:
+          type: string
+
+    PlanProvenance:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [fresh, mixed, cached_replay]
+        fresh_llm_calls:
+          type: integer
+          minimum: 0
+        cached_candidates:
+          type: integer
+          minimum: 0
+        generated_candidates:
+          type: integer
+          minimum: 0
+        inspection_content_hash:
+          type:
+            - string
+            - "null"
+        spec_hash:
+          type: string
+
+    CandidateProvenance:
+      type: object
+      required: [mode, cache_hit]
+      properties:
+        mode:
+          type: string
+          enum: [generated, cached_replay, deterministic]
+        cache_hit:
+          type: boolean
+        cache_key:
+          type:
+            - string
+            - "null"
+        llm_calls:
+          type: integer
+          minimum: 0
+        source:
+          type: string
+
+    PlanValidation:
+      type: object
+      required: [plan_id, valid, runnable_candidates, blocked_candidates, errors]
+      properties:
+        plan_id:
+          type: string
+        valid:
+          type: boolean
+        runnable_candidates:
+          type: integer
+          minimum: 0
+        blocked_candidates:
+          type: integer
+          minimum: 0
+        transient_candidates:
+          type: integer
+          minimum: 0
+          default: 0
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+
+    ValidationIssue:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        path:
+          type:
+            - string
+            - "null"
+        classification:
+          type:
+            - string
+            - "null"
+          enum: [blocked, transient, structural, null]
+
+    Event:
+      type: object
+      required:
+        [id, sequence, type, timestamp, workflow_execution_id, data, schema_version]
+      properties:
+        id:
+          type: string
+        sequence:
+          type: integer
+          minimum: 1
+        type:
+          type: string
+          examples: [candidate.validated]
+        timestamp:
+          type: string
+          format: date-time
+        workflow_execution_id:
+          type: string
+        operation_execution_id:
+          type:
+            - string
+            - "null"
+        candidate_id:
+          type:
+            - string
+            - "null"
+        data:
+          type: object
+          additionalProperties: true
+        metrics:
+          oneOf:
+            - $ref: '#/components/schemas/EventMetrics'
+            - type: "null"
+        schema_version:
+          type: string
+          default: "1"
+
+    EventMetrics:
+      type: object
+      properties:
+        llm_calls:
+          type: integer
+          minimum: 0
+        cache_hit:
+          type: boolean
+        elapsed_ms:
+          type: integer
+          minimum: 0
+        tokens_in:
+          type: integer
+          minimum: 0
+        tokens_out:
+          type: integer
+          minimum: 0
+      additionalProperties:
+        type:
+          - string
+          - number
+          - integer
+          - boolean
+          - "null"
+
+    Artifact:
+      type: object
+      required: [id, content_hash, size_bytes, storage]
+      properties:
+        id:
+          type: string
+        content_hash:
+          type: string
+        size_bytes:
+          type: integer
+          minimum: 0
+        media_type:
+          type:
+            - string
+            - "null"
+        storage:
+          type: object
+          required: [kind]
+          properties:
+            kind:
+              type: string
+              enum: [filesystem, object-store]
+            locator:
+              type: string
+
+    Error:
+      type: object
+      required: [code, message, retryable, classification]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+        classification:
+          type: string
+          enum: [invalid_input, blocked, transient, internal, cancelled]
+        details:
+          type: object
+          additionalProperties: true

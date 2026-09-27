@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vmfactory.local/schemas/candidates/dockerfile-v1.schema.json",
+  "title": "vmfactory Dockerfile CandidateSpec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "method",
+    "config"
+  ],
+  "properties": {
+    "version": {
+      "const": "1"
+    },
+    "method": {
+      "const": "dockerfile"
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dockerfile",
+        "context",
+        "needs_docker"
+      ],
+      "properties": {
+        "dockerfile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_args": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Z_][A-Z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "command": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "environment": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Z_][A-Z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "uniqueItems": true
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/check"
+          }
+        },
+        "memory_mb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 512
+        },
+        "needs_docker": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    }
+  },
+  "$defs": {
+    "check": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "bin",
+            "probes"
+          ],
+          "properties": {
+            "kind": {
+              "const": "cmd"
+            },
+            "bin": {
+              "type": "string",
+              "minLength": 1
+            },
+            "probes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "port"
+          ],
+          "properties": {
+            "kind": {
+              "const": "tcp"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol",
+            "port",
+            "path"
+          ],
+          "properties": {
+            "kind": {
+              "const": "http"
+            },
+            "protocol": {
+              "enum": [
+                "http",
+                "https"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,145 @@
+id: plan-v1
+name: Plan target
+version: 1
+status: documentation-only
+description: >
+  Documentary definition of the v1 planning flow. The first Go implementation
+  should hand-code this workflow and must not introduce a generic DAG/workflow
+  interpreter solely to execute these steps.
+
+input:
+  required:
+    - target
+  properties:
+    target:
+      description: Generic target input.
+    intent:
+      type: string
+      required: false
+      description: Optional explicit user intent. No default is implied.
+    spec_override:
+      required: false
+      description: Optional human-supplied ExecutionSpec override.
+
+operations:
+  - id: resolve_target
+    operation: target.resolve
+    input:
+      target: ${workflow.input.target}
+    output:
+      target_id: ${result.id}
+
+  - id: inspect_target
+    operation: target.inspect
+    depends_on:
+      - resolve_target
+    input:
+      target_id: ${operations.resolve_target.output.target_id}
+    output:
+      inspection_id: ${result.id}
+      inspection_content_hash: ${result.content_hash}
+
+  - id: derive_execution_spec
+    operation: spec.derive
+    depends_on:
+      - inspect_target
+    input:
+      inspection_id: ${operations.inspect_target.output.inspection_id}
+      intent: ${workflow.input.intent}
+      override: ${workflow.input.spec_override}
+    output:
+      execution_spec_id: ${result.id}
+      spec_hash: ${result.spec_hash}
+
+  - id: enrich_facts
+    operation: evidence.enrich
+    optional: true
+    degradable: true
+    depends_on:
+      - derive_execution_spec
+    input:
+      inspection_id: ${operations.inspect_target.output.inspection_id}
+      execution_spec_id: ${operations.derive_execution_spec.output.execution_spec_id}
+    output:
+      enrichment_id: ${result.id}
+
+  - id: generate_candidates
+    operation: plan.generate_candidates
+    depends_on:
+      - derive_execution_spec
+    optional_inputs:
+      - enrichment_id
+    mode: per-method
+    cache:
+      key:
+        - ${operations.inspect_target.output.inspection_content_hash}
+        - ${operations.derive_execution_spec.output.spec_hash}
+        - ${candidate.method}
+        - ${planner.version}
+      cache_verdicts:
+        runnable: true
+        blocked: true
+        transient_error: false
+    input:
+      inspection_id: ${operations.inspect_target.output.inspection_id}
+      execution_spec_id: ${operations.derive_execution_spec.output.execution_spec_id}
+      enrichment_id: ${operations.enrich_facts.output.enrichment_id}
+    output:
+      candidate_ids: ${result.candidate_ids}
+
+  - id: validate_candidates
+    operation: plan.validate_candidates
+    depends_on:
+      - generate_candidates
+    semantics:
+      - semantic_validation_not_schema_only
+      - deterministic_rejection_over_guessing
+      - deliverable_guard
+      - reference_validation_where_possible
+    input:
+      candidate_ids: ${operations.generate_candidates.output.candidate_ids}
+      execution_spec_id: ${operations.derive_execution_spec.output.execution_spec_id}
+    success_condition: ${result.runnable_count >= 1}
+
+  - id: persist_plan
+    operation: plan.persist
+    depends_on:
+      - validate_candidates
+    input:
+      target_id: ${operations.resolve_target.output.target_id}
+      inspection_id: ${operations.inspect_target.output.inspection_id}
+      execution_spec_id: ${operations.derive_execution_spec.output.execution_spec_id}
+      candidate_ids: ${operations.generate_candidates.output.candidate_ids}
+    output:
+      plan_id: ${result.id}
+
+output:
+  plan_id: ${operations.persist_plan.output.plan_id}
+
+failure_policy:
+  blocked_candidates_do_not_fail_workflow: true
+  transient_candidate_failures_are_not_negative_cache_entries: true
+  no_runnable_candidates:
+    all_blocked: blocked
+    transient_or_internal_failure: failed
+
+cancellation:
+  propagate: true
+
+events:
+  - workflow.queued
+  - workflow.started
+  - operation.queued
+  - operation.started
+  - operation.progress
+  - candidate.generated
+  - candidate.cache_hit
+  - candidate.validated
+  - candidate.blocked
+  - candidate.transient_error
+  - operation.completed
+  - operation.failed
+  - workflow.completed
+  - workflow.blocked
+  - workflow.failed
+  - workflow.cancelled
