@@ -1,0 +1,67 @@
+version: 1
+recorded: 2026-09-27
+reference_commit: 607f9f7
+freeze_commit: 0f751be
+prompt_v: "14"
+# Expected verdicts are recorded reference facts, not aspirations
+# (docs/adr/0001). Two graders consume this file:
+#   python: scripts/grade_reference.py   (grades the frozen reference)
+#   port:   cmd/vmf grade                (grades the Go port; rows stay
+#                                         pending until the planner lands)
+graders:
+  python: scripts/grade_reference.py
+rows:
+  - id: cli-target
+    scenario: minimal CLI target
+    url: https://github.com/mvt-project/mvt
+    sha: 9c3db579ee73
+    intent: null
+    expect:
+      spec: null
+      exit: 0
+      min_runnable: 1
+      runnable_with_cmd_check: true
+      blocked_contains:
+        - {method: prebuilt, reason_contains: "official image"}
+  - id: web-intent
+    scenario: explicit web intent
+    url: https://github.com/paperclipai/paperclip
+    sha: 0f14d261233c
+    intent: "Run paperclip's web server on port 3100, authenticated mode"
+    expect:
+      spec:
+        deliverable: web
+        serve_port: 3100
+        user: non-root
+        provenance_fresh: true
+      exit: 0
+      min_runnable: 1
+      runnable_serves_port: true
+      runnable_keepalive_forbidden: true
+      blocked_contains:
+        - {method: prebuilt, reason_contains: "official image"}
+        - {method: compose, reason_contains: "compose"}
+  - id: sidecar-block
+    scenario: blocked sidecar candidate
+    url: https://github.com/digininja/DVWA
+    sha: b496a5d3de6b
+    intent: null
+    expect:
+      spec: null
+      exit: 0
+      min_runnable: 1
+      blocked_contains:
+        - {method: prebuilt, reason_contains: "sidecar"}
+        - {method: compose, reason_contains: "compose"}
+  - id: cached-replay
+    scenario: cached replay
+    url: https://github.com/digininja/DVWA
+    sha: b496a5d3de6b
+    intent: null
+    repeat_of: sidecar-block
+    expect:
+      spec: null
+      exit: 0
+      min_runnable: 1
+      fresh_model_calls: 0
+      verdicts_match_repeat_of: true

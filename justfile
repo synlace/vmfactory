@@ -86,6 +86,12 @@ boot lab=lab:
 @plan *args:
     exec {{ uvrun }} --with pyyaml --with rich python scripts/vmf_plan.py preview "$@"
 
+# Grade the recorded acceptance rows against the Python reference.
+# The parity report is the baseline the Go port's grader must match
+# (fixtures/acceptance.yaml; docs/adr/0001 for the authority rule).
+@grade *args:
+    exec {{ uvrun }} --with pyyaml python scripts/grade_reference.py "$@"
+
 # SSH into a running box (qemu) or microVM (dropbear); pass a command to
 # run it remotely instead. Docker-style leading flags are accepted/ignored.
 ssh *args:
