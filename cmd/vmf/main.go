@@ -11,10 +11,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/synlace/vmfactory/internal/acceptance"
+	"github.com/synlace/vmfactory/internal/events"
 	"github.com/synlace/vmfactory/internal/model"
 	"github.com/synlace/vmfactory/internal/plan"
+	"github.com/synlace/vmfactory/internal/render"
 	"github.com/synlace/vmfactory/internal/store"
 	"github.com/synlace/vmfactory/internal/target"
 )
@@ -58,6 +61,26 @@ func run(args []string) int {
 	}
 }
 
+// interleave lets flags appear anywhere on the line (CLI.md's shape:
+// `vmf plan <target> --intent …`): flags first, positionals last, one
+// fs.Parse.
+func interleave(args []string) ([]string, []string) {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "-") {
+			flags = append(flags, args[i])
+			if !strings.Contains(args[i], "=") && i+1 < len(args) &&
+				!strings.HasPrefix(args[i+1], "-") {
+				flags = append(flags, args[i+1])
+				i++
+			}
+			continue
+		}
+		pos = append(pos, args[i])
+	}
+	return append(flags, pos...), pos
+}
+
 // planCmd runs the planning pipeline: resolve → inspect → derive →
 // generate. Exit codes are CLI.md's: 0 usable plan, 1 no usable
 // candidate, 2 usage, 3 model unconfigured.
@@ -67,7 +90,8 @@ func planCmd(args []string) int {
 	intent := fs.String("intent", "", "explicit user intent (never synthesized)")
 	specPath := fs.String("spec", "", "human-authored ExecutionSpec override (JSON path)")
 	asJSON := fs.Bool("json", false, "machine surface: spec, approaches, blocked")
-	if err := fs.Parse(args); err != nil {
+	ordered, _ := interleave(args)
+	if err := fs.Parse(ordered); err != nil {
 		return 2
 	}
 	if fs.NArg() != 1 {
@@ -83,9 +107,24 @@ func planCmd(args []string) int {
 		}
 		override = string(b)
 	}
+	em := events.NewEmitter()
+	// Live progress on a terminal (the mock's replay vocabulary);
+	// silent for pipes and --plain.
+	var stop chan struct{}
+	if render.IsTTY() && !*asJSON {
+		stop = make(chan struct{})
+		id, ev := em.Subscribe()
+		go func() {
+			render.Progress(ev, stop)
+			em.Unsubscribe(id)
+		}()
+	}
 	o, err := plan.Plan(context.Background(), model.Seam{}, fs.Arg(0),
-		*intent, override, nil)
+		*intent, override, em)
 	if err != nil {
+		if stop != nil {
+			close(stop)
+		}
 		if errors.Is(err, target.ErrNoSource) {
 			fmt.Fprintf(os.Stderr, "plan: %v\n", err)
 			return 2
@@ -96,6 +135,8 @@ func planCmd(args []string) int {
 	record(o, o.ExitCode())
 	if *asJSON {
 		o.WriteJSON(os.Stdout)
+	} else if render.IsTTY() {
+		fmt.Print(render.Styled(o))
 	} else {
 		fmt.Print(plan.RenderPlain(o))
 	}
