@@ -74,7 +74,21 @@ func TestFanoutSkipsAndLanes(t *testing.T) {
 	id, ch := em.Subscribe()
 	res := Fanout(context.Background(), model.Seam{Runner: r}, root, nil, em)
 	em.Unsubscribe(id)
-	for range ch { // drained: the channel closes on unsubscribe
+	var last events.Envelope
+	n := 0
+	for e := range ch {
+		last = e
+		n++
+	}
+	// The closing tally rides the envelope: the run's cost story.
+	// two skips + two blocked = 4 not runnable; grounding + three
+	// lanes = 4 calls.
+	if last.Type != "lanes.done" {
+		t.Fatalf("last event: %s", last.Type)
+	}
+	if last.Metrics["runnable"] != 1 || last.Metrics["not_runnable"] != 4 ||
+		last.Metrics["llm"] != 4 {
+		t.Fatalf("tally metrics: %v", last.Metrics)
 	}
 	if res.Skipped["compose"] != "no compose file" ||
 		res.Skipped["build"] != "no root Dockerfile" {

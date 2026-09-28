@@ -208,6 +208,12 @@ func progressLine(e events.Envelope) string {
 		return fmt.Sprintf("lane %s → blocked%s", str("method"), why)
 	case "lane.skipped":
 		return fmt.Sprintf("lane %s → skipped — %s", str("method"), str("why"))
+	case "lanes.done":
+		// The closing tally: the run's cost story (the reference's
+		// stderr tally, now an envelope metric).
+		return fmt.Sprintf("lanes done: %d runnable, %d not runnable · %d llm call(s)",
+			int(e.Metrics["runnable"]), int(e.Metrics["not_runnable"]),
+			int(e.Metrics["llm"]))
 	default:
 		return e.Type
 	}

@@ -264,6 +264,16 @@ func Fanout(ctx context.Context, seam model.Seam, root string,
 		wg.Wait()
 	}
 	res.Wall = time.Since(t0)
+	// The tally: the run's cost story as a closing event (the
+	// reference's stderr tally line, now an envelope metric the
+	// renderer and the store consume).
+	if em != nil {
+		em.Emit("lanes.done", "", nil, map[string]float64{
+			"runnable":     float64(len(res.Plans)),
+			"not_runnable": float64(len(res.Blocked) + len(res.Skipped)),
+			"llm":          float64(res.LLMCalls),
+		})
+	}
 	return res
 }
 

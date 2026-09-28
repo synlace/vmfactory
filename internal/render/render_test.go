@@ -117,6 +117,8 @@ func TestProgressVocabulary(t *testing.T) {
 		"why": "no standalone compose file"}, nil)
 	em.Emit("lane.skipped", "", map[string]any{"method": "source",
 		"why": "no build manifest"}, nil)
+	em.Emit("lanes.done", "", nil, map[string]float64{
+		"runnable": 1, "not_runnable": 3, "llm": 3})
 	em.Unsubscribe(id)
 
 	var got []string
@@ -128,6 +130,7 @@ func TestProgressVocabulary(t *testing.T) {
 		"lane build → plan (cached)",
 		"lane compose → blocked — no standalone compose file",
 		"lane source → skipped — no build manifest",
+		"lanes done: 1 runnable, 3 not runnable · 3 llm call(s)",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("lines: %v", got)
