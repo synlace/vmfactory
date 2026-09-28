@@ -6,6 +6,7 @@ files/
 .gitignore.swp
 *.swp
 tests/fixtures/*/calls
+tmp/
 
 # real credentials never live in the repo
 .env
