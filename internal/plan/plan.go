@@ -293,11 +293,11 @@ func RenderPlain(o *Outcome) string {
 			}
 		}
 		out = append(out, fmt.Sprintf("        checks    %s · hold %ds",
-			strings.Join(words, " · "), hold))
+			joinOrNone(words), hold))
 		model_ := sortedNonTCP(words)
 		out = append(out, fmt.Sprintf(
 			"        verdict   winner needs %d/%d checks · floor: tcp + hold · model adds: %s",
-			len(words), len(words), strings.Join(model_, " · ")))
+			len(words), len(words), joinOrDash(model_)))
 		if n := stringOf(a["notes"]); n != "" {
 			out = append(out, "        notes     "+n)
 		}
@@ -474,6 +474,24 @@ func sortStrings(s []string) {
 			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
+}
+
+// joinOrNone mirrors the reference's checks join: an empty list reads
+// "(none declared)" (vmf_plan.py render_preview).
+func joinOrNone(words []string) string {
+	if len(words) == 0 {
+		return "(none declared)"
+	}
+	return strings.Join(words, " · ")
+}
+
+// joinOrDash mirrors the reference's model-adds join: an empty list
+// reads "—" (vmf_plan.py render_preview).
+func joinOrDash(words []string) string {
+	if len(words) == 0 {
+		return "—"
+	}
+	return strings.Join(words, " · ")
 }
 
 func stringOf(v any) string {

@@ -146,3 +146,19 @@ func TestIsTTYUnderTest(t *testing.T) {
 		t.Log("stdout is a char device in this environment")
 	}
 }
+
+// The reference's join fallbacks: a check-less plan reads
+// "(none declared)" and an empty model-adds reads "—" (the CyberChef
+// run's two parity bugs).
+func TestRenderJoinFallbacks(t *testing.T) {
+	o := testOutcome(t)
+	// Strip the pkg plan's checks so the board renders the empty case.
+	o.Approaches[0]["checks"] = []any{}
+	p := plan.RenderPlain(o)
+	if !strings.Contains(p, "checks    (none declared) · hold 25s") {
+		t.Errorf("checks line lacks the (none declared) fallback: %q", p)
+	}
+	if !strings.Contains(p, "winner needs 0/0 checks · floor: tcp + hold · model adds: —") {
+		t.Errorf("verdict line lacks the — fallback: %q", p)
+	}
+}
