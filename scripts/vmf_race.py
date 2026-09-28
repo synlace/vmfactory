@@ -96,6 +96,7 @@ def save_winner(src, w, cand):
            "compose_file": w.get("compose_file"),
            "method": w.get("method") or "",
            "cost": w.get("cost") or "",
+           "tranche": w.get("tranche") or "",
            "by": cand, "url": os.environ.get("VMF_COMPOSE_URL", ""),
            "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     d = os.path.join(GEN, k)
@@ -332,7 +333,8 @@ def _keep_entry(i, r, logdir, base):
             "checks": r.get("checks") or [],
             "env": r.get("env") or {},
             "method": r.get("method") or "", "cite": r.get("cite") or "",
-            "cost": r.get("cost") or "", "detail": str(detail)[:40]}
+            "cost": r.get("cost") or "", "detail": str(detail)[:40],
+            "tranche": "scout"}
 
 
 def reattach_allowed():
@@ -684,6 +686,7 @@ def main(argv):
                      "env": w.get("env") or {},
                      "method": w.get("method") or "",
                      "cost": w.get("cost") or "",
+                     "tranche": "replay",
                      "detail": w.get("image") or w.get("compose_file")
                      or "cached winner",
                      "cite": "", "cached": True}]
@@ -755,7 +758,14 @@ def main(argv):
                          "compose_file": a.get("compose_file"),
                          "install": a.get("install") or [],
                          "checks": a.get("checks") or [],
-                         "env": a.get("env") or {}})
+                         "env": a.get("env") or {},
+                         # The tranche: where this candidate came from.
+                         # The winner record carries it so a scout-tranche
+                         # win next to a fan-out blocked verdict is visible
+                         # in the artifact, not a mystery (measured: the
+                         # DVWA intent race crowned a prebuilt route the
+                         # fan-out had blocked on the MariaDB sidecar).
+                         "tranche": "fanout"})
         else:
             say("%d %s .. pruned (%s)" % (i, a["kind"], lp))
     if not keep:
@@ -1092,7 +1102,8 @@ def race(keep, src, base, feed=None, board=None):
         return 1
 
     w = next(k for k in keep if k["cand"] == winner)
-    say("winner %d %s; reaping losers" % (w["i"], w["kind"]))
+    say("winner %d %s (tranche %s); reaping losers"
+        % (w["i"], w["kind"], w.get("tranche") or "unknown"))
     # Kill the losers' runner chains FIRST (a candidate that is still
     # building can boot its VM after the reap otherwise), then stop any
     # VM that already rose, and re-stop after a settle for stragglers.

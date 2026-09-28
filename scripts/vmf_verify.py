@@ -171,6 +171,18 @@ def check_tcp(port, fwd, _spec, host="127.0.0.1"):
     return True, None
 
 
+# The fatal-body guard's bounded marker list: a 2xx that renders an
+# uncaught exception is not a serving app. Measured instances: the
+# DVWA prebuilt boot (PHP fatal, mysqli_sql_exception). The list grows
+# only on a second measured instance.
+FATAL_MARKERS = (
+    "Fatal error:",
+    "Uncaught ",
+    "Parse error:",
+    "Traceback (most recent call last):",
+)
+
+
 def check_probe(spec, fwd, _name, host="127.0.0.1"):
     p = spec["probe"]
     hp = fwd.get(p["port"], p["port"])
@@ -196,6 +208,18 @@ def check_probe(spec, fwd, _name, host="127.0.0.1"):
     else:
         ok = status == 200
         desc = "200"
+    if ok:
+        # The fatal-body guard: a 2xx that renders an uncaught
+        # exception is not a serving app (measured: the DVWA prebuilt
+        # boot passed tcp:80 + probe:/ while the body was a PHP fatal
+        # — "Fatal error: Uncaught mysqli_sql_exception: Connection
+        # refused"). The marker list is bounded and grows only on a
+        # second measured instance.
+        for marker in FATAL_MARKERS:
+            if marker in body:
+                ok = False
+                desc = "status ok but a fatal body"
+                break
     if ok and p.get("expect_contains"):
         ok = p["expect_contains"] in body
     ev = None

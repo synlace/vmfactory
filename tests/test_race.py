@@ -119,6 +119,20 @@ class WinnerRoundTrip(Tmp):
         self.assertEqual(rec["by"], "web-c1")
         self.assertIn("created", rec)
 
+    def test_winner_records_tranche(self):
+        # The tranche says where the winner came from: a scout-tranche
+        # win next to a fan-out blocked verdict is visible in the
+        # artifact, not a mystery (the measured DVWA case).
+        src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
+        vmf_race.save_winner(src, {"kind": "prebuilt_image",
+                                   "tranche": "scout",
+                                   "cost": "fast"}, "dvwa-c1")
+        self.assertEqual(vmf_race.load_winner(src)["tranche"], "scout")
+        vmf_race.save_winner(src, {"kind": "dockerfile",
+                                   "tranche": "fanout",
+                                   "cost": "medium"}, "dvwa-c2")
+        self.assertEqual(vmf_race.load_winner(src)["tranche"], "fanout")
+
     def test_missing_cache_returns_none(self):
         src = tempfile.mkdtemp(prefix="vmf-src-", dir=self.tmp)
         self.assertIsNone(vmf_race.load_winner(src))

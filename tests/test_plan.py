@@ -243,6 +243,33 @@ class Flatten(Tmp):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate({"replicas": {"web": 1}, "env": {}, "command": {}}, schema)
 
+    def test_loopback_env_rewrite(self):
+        # The runtime twin of the build-time db wiring: an env value
+        # pointing at 127.0.0.1:<sibling port> rides the bridge DNS
+        # (measured: a runtime db sidecar unreachable at the
+        # container's own loopback). Self-pointing and unknown-port
+        # loopbacks stay; no port → no rewrite.
+        m = self.path("manifest.json")
+        mdata = self._manifest()
+        mdata["services"][1]["ports"] = [
+            {"host": 3306, "cport": 3306, "proto": "tcp"}]
+        mdata["services"][0]["env"] = {
+            "DB_HOST": "127.0.0.1:3306",
+            "MYSQL_URL": "http://localhost:3306/path",
+            "SELF": "127.0.0.1:80",
+            "OTHER": "127.0.0.1:9999",
+            "BARE": "127.0.0.1",
+        }
+        json.dump(mdata, open(m, "w"))
+        vmf_plan.flatten_cmd(m, self.path("compose.yaml"), self.path("ports.txt"))
+        doc = yaml.safe_load(open(self.path("compose.yaml")))
+        env = doc["services"]["web"]["environment"]
+        self.assertEqual(env["DB_HOST"], "db:3306")
+        self.assertEqual(env["MYSQL_URL"], "http://db:3306/path")
+        self.assertEqual(env["SELF"], "127.0.0.1:80")
+        self.assertEqual(env["OTHER"], "127.0.0.1:9999")
+        self.assertEqual(env["BARE"], "127.0.0.1")
+
     def test_udp_ports(self):
         m = self.path("manifest.json")
         mdata = self._manifest()

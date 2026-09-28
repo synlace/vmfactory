@@ -1259,6 +1259,40 @@ def flatten_cmd(manifest_path, compose_out, ports_out, refines_path=None):
         env_over = rf.get("env") or {}
         cmd_over = rf.get("command") or {}
     SUB = "172.31.100"
+
+    def sibling_ports(m):
+        # The plan fact the rewrite keys on: every declared guest port
+        # → the service that declared it (first wins; the compose
+        # primary convention).
+        out = {}
+        for other in m["services"]:
+            for p in other["ports"]:
+                out.setdefault(int(p["cport"]), other["name"])
+        return out
+
+    def _rewrite_loopback(v, self_name, ports):
+        # The loopback rewrite: an env value pointing at
+        # 127.0.0.1:<port> or localhost:<port> where <port> is a
+        # SIBLING service's declared port rides the compose bridge
+        # instead (the container's own loopback is the container —
+        # measured: a runtime db sidecar unreachable at
+        # 127.0.0.1:3306, "Connection refused"). The sibling port is a
+        # declared fact; the rewrite is deterministic; a self-pointing
+        # loopback stays (a service listening on its own port is
+        # legitimate). Bounded: scheme preserved, path preserved, no
+        # port → no rewrite.
+        mm = re.fullmatch(
+            r"(?:(https?)://)?(?:127\.0\.0\.1|localhost):(\d{1,5})(/.*)?",
+            str(v))
+        if not mm:
+            return v
+        port = int(mm.group(2))
+        other = ports.get(port)
+        if not other or other == self_name:
+            return v
+        head = "%s://" % mm.group(1) if mm.group(1) else ""
+        return "%s%s:%d%s" % (head, other, port, mm.group(3) or "")
+
     expanded = []
     for e in m["services"]:
         reps = int(refines.get(e["name"]) or 1)
@@ -1294,6 +1328,8 @@ def flatten_cmd(manifest_path, compose_out, ports_out, refines_path=None):
         merged_env = dict(e["env"])
         if env_over.get(n):
             merged_env.update(env_over[n])
+        merged_env = {k: _rewrite_loopback(v, n, sibling_ports(m))
+                      for k, v in merged_env.items()}
         if merged_env:
             entry["environment"] = merged_env
         if e["depends_on"]:

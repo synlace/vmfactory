@@ -135,6 +135,35 @@ class ProbeChecks(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("fetch failed", ev["actual"])
 
+    def test_fatal_body_fails_even_on_2xx(self):
+        # The measured DVWA case: tcp:80 + probe:/ passed while the body
+        # was a PHP fatal — the app answers but does not serve.
+        self.stub.routes = {"/": (200,
+            "Fatal error: Uncaught mysqli_sql_exception: Connection "
+            "refused in /var/www/html/includes/dvwaPage.inc.php:570")}
+        spec = {"probe": {"port": self.stub.port, "path": "/",
+                          "expect_status_max": 399}}
+        ok, ev = vmf_verify.check_probe(spec, {}, "x")
+        self.assertFalse(ok)
+        self.assertIn("fatal body", ev["expected"])
+
+    def test_uncaught_traceback_fails_on_2xx(self):
+        self.stub.routes = {"/": (200,
+            "<html>Traceback (most recent call last): ValueError</html>")}
+        spec = {"probe": {"port": self.stub.port, "path": "/"}}
+        ok, ev = vmf_verify.check_probe(spec, {}, "x")
+        self.assertFalse(ok)
+        self.assertIn("fatal body", ev["expected"])
+
+    def test_healthy_2xx_still_passes(self):
+        # A body that merely MENTIONS nothing fatal keeps passing: the
+        # guard is a bounded marker list, not an html sniffer.
+        self.stub.routes = {"/": (200,
+            "<html><body>login page</body></html>")}
+        spec = {"probe": {"port": self.stub.port, "path": "/"}}
+        ok, ev = vmf_verify.check_probe(spec, {}, "x")
+        self.assertTrue(ok)
+
 
 class ExecChecks(unittest.TestCase):
     def test_exit_zero_passes(self):
