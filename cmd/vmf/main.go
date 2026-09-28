@@ -15,6 +15,7 @@ import (
 	"github.com/synlace/vmfactory/internal/acceptance"
 	"github.com/synlace/vmfactory/internal/model"
 	"github.com/synlace/vmfactory/internal/plan"
+	"github.com/synlace/vmfactory/internal/store"
 	"github.com/synlace/vmfactory/internal/target"
 )
 
@@ -92,12 +93,28 @@ func planCmd(args []string) int {
 		fmt.Fprintf(os.Stderr, "plan: %v\n", err)
 		return 3
 	}
+	record(o, o.ExitCode())
 	if *asJSON {
 		o.WriteJSON(os.Stdout)
 	} else {
 		fmt.Print(plan.RenderPlain(o))
 	}
 	return o.ExitCode()
+}
+
+// record persists the run to the store of record; a store failure is
+// reported but never fails the plan (the artifacts already landed in
+// the gen dir).
+func record(o *plan.Outcome, exit int) {
+	s, err := store.Open(store.DefaultPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "note: store unavailable: %v\n", err)
+		return
+	}
+	defer s.Close()
+	if _, err := s.RecordRun(store.FromOutcome(o, exit)); err != nil {
+		fmt.Fprintf(os.Stderr, "note: run not recorded: %v\n", err)
+	}
 }
 
 // gradeCmd runs the acceptance harness. Exit 0 while rows are pending

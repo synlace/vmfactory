@@ -36,6 +36,11 @@ type Outcome struct {
 	GenDir     string
 	Found      []string
 	Wall       time.Duration
+
+	// RecordedProvenance is the store's class for this run (fresh |
+	// mixed | cached_replay) when persist_plan ran; the acceptance
+	// rows grade it.
+	RecordedProvenance string
 }
 
 // Emitter is the slice of the event contract the pipeline needs

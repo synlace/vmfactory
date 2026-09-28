@@ -68,9 +68,12 @@ type Result struct {
 	Blocked    map[string]string
 	Skipped    map[string]string
 	Transients map[string]string
-	C7IDs      []string
-	LLMCalls   int
-	Wall       time.Duration
+	// Cached marks the lanes replayed from the per-method cache (the
+	// provenance the plan record and the replay rows carry).
+	Cached   map[string]bool
+	C7IDs    []string
+	LLMCalls int
+	Wall     time.Duration
 }
 
 // genDirRoot: the port's plan artifacts live beside the reference's
@@ -100,6 +103,7 @@ func Fanout(ctx context.Context, seam model.Seam, root string,
 	res := &Result{
 		Plans: map[string]map[string]any{}, Blocked: map[string]string{},
 		Skipped: map[string]string{}, Transients: map[string]string{},
+		Cached: map[string]bool{},
 	}
 	emit := func(typ string, data any) {
 		if em != nil {
@@ -152,6 +156,7 @@ func Fanout(ctx context.Context, seam model.Seam, root string,
 			}
 			if json.Unmarshal(b, &doc) == nil && doc.SpecH == sh {
 				res.Plans[m] = doc.Approach
+				res.Cached[m] = true
 				emit("lane.plan", map[string]any{"method": m, "cached": true})
 				continue
 			}
@@ -163,6 +168,7 @@ func Fanout(ctx context.Context, seam model.Seam, root string,
 			}
 			if json.Unmarshal(b, &doc) == nil && doc.SpecH == sh {
 				res.Blocked[m] = doc.Why
+				res.Cached[m] = true
 				emit("lane.blocked", map[string]any{"method": m, "why": doc.Why, "cached": true})
 				continue
 			}

@@ -22,6 +22,7 @@ import (
 	"github.com/synlace/vmfactory/internal/events"
 	"github.com/synlace/vmfactory/internal/model"
 	"github.com/synlace/vmfactory/internal/plan"
+	"github.com/synlace/vmfactory/internal/store"
 	"github.com/synlace/vmfactory/internal/target"
 	"github.com/synlace/vmfactory/internal/validate"
 	"gopkg.in/yaml.v3"
@@ -94,10 +95,17 @@ const (
 func Grade(fx *Fixture, seam model.Seam, out io.Writer) int {
 	em := events.NewEmitter()
 	go drain(em)
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		fmt.Fprintf(out, "note: store unavailable: %v\n", err)
+		st = nil
+	} else {
+		defer st.Close()
+	}
 	ok, failed, pending := 0, 0, 0
 	results := map[string]rowResult{}
 	for _, row := range fx.Rows {
-		r := gradeRow(context.Background(), row, results, seam, em)
+		r := gradeRow(context.Background(), row, results, seam, em, st)
 		results[row.ID] = r
 		switch {
 		case r.pending:
@@ -168,7 +176,7 @@ func (r *rowResult) good(name string, pass bool, detail ...string) {
 }
 
 func gradeRow(ctx context.Context, row Row, results map[string]rowResult,
-	seam model.Seam, em *events.Emitter) rowResult {
+	seam model.Seam, em *events.Emitter, st *store.Store) rowResult {
 	var r rowResult
 	// resolve: pinned checkout of the recorded SHA.
 	tgt, err := target.New().Resolve(ctx, row.URL, row.SHA)
@@ -185,6 +193,13 @@ func gradeRow(ctx context.Context, row Row, results map[string]rowResult,
 		return r
 	}
 	r.outcome = o
+	if st != nil {
+		if runID, err := st.RecordRun(store.FromOutcome(o, o.ExitCode())); err == nil {
+			if info, ierr := st.RunProvenance(runID); ierr == nil {
+				o.RecordedProvenance = info.Provenance
+			}
+		}
+	}
 	r.wall = o.Wall
 	r.llm = o.Result.LLMCalls
 	em.Emit("row.graded", "", map[string]any{
@@ -305,6 +320,14 @@ func gradeRow(ctx context.Context, row Row, results map[string]rowResult,
 				}
 				r.good("replay fresh calls", r.llm == 0 || r.llm == expected,
 					fmt.Sprintf("llm=%d (prior transients %d)", r.llm, prevT))
+			}
+			// The store's provenance class: the recorded row grades
+			// mixed or cached_replay (persist_plan, ARCHITECTURE §6.6).
+			if o.RecordedProvenance != "" {
+				r.good("provenance class",
+					o.RecordedProvenance == "mixed" ||
+						o.RecordedProvenance == "cached_replay",
+					o.RecordedProvenance)
 			}
 		}
 	}

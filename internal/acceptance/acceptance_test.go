@@ -2,6 +2,7 @@ package acceptance
 
 import (
 	"bytes"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -95,7 +96,8 @@ func TestGradePendingReport(t *testing.T) {
 	// The fixture's URLs do not resolve: every row reports pending
 	// honestly (a row that cannot resolve is an absence, not a
 	// failure — the recorded baseline is graded only when the pin
-	// materialises).
+	// materialises). VMF_DB isolates the store of record.
+	t.Setenv("VMF_DB", filepath.Join(t.TempDir(), "vmfactory.db"))
 	var out bytes.Buffer
 	code := Grade(fx, model.Seam{}, &out)
 	if code != 0 {
