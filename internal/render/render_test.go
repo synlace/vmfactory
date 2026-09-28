@@ -161,6 +161,9 @@ func TestRenderFreshShapes(t *testing.T) {
 		{"probe": map[string]any{"port": 8080, "path": "/",
 			"expect_status": 399}},
 	}
+	// The fresh install list is []string (the clamped shape).
+	o.Approaches[0]["install"] = []string{
+		"mkdir -p /srv/filebrowser", "touch /database/filebrowser.db"}
 	p := plan.RenderPlain(o)
 	if !strings.Contains(p, "checks    tcp:8080 · probe:/ → 399 · hold 25s") {
 		t.Errorf("fresh []int/[]map shapes dropped: %q", p)
@@ -168,12 +171,18 @@ func TestRenderFreshShapes(t *testing.T) {
 	if !strings.Contains(p, "winner needs 2/2 checks") {
 		t.Errorf("fresh word count dropped: %q", p)
 	}
+	if !strings.Contains(p, "install   mkdir -p /srv/filebrowser") ||
+		!strings.Contains(p, "touch /database/filebrowser.db") {
+		t.Errorf("fresh []string install dropped: %q", p)
+	}
 	// The json round-trip shape renders identically.
 	o2 := testOutcome(t)
 	o2.Approaches[0]["ports"] = []any{8080.0}
 	o2.Approaches[0]["checks"] = []any{map[string]any{
 		"probe": map[string]any{"port": 8080.0, "path": "/",
 			"expect_status": 399.0}}}
+	o2.Approaches[0]["install"] = []any{
+		"mkdir -p /srv/filebrowser", "touch /database/filebrowser.db"}
 	if plan.RenderPlain(o2) != p {
 		t.Errorf("fresh and cached shapes render differently:\n%s\nvs\n%s",
 			p, plan.RenderPlain(o2))

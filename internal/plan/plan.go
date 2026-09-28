@@ -476,16 +476,23 @@ func portsOf(raw any) []int {
 	return nil
 }
 
+// stringSlice reads a string list from either shape: []string from
+// the fresh fanout's clamped plans, []any from JSON artifacts. The
+// fresh install lines dropped silently before this case existed
+// (the filebrowser pair of runs: plan 1's install rendered only on
+// the cached replay).
 func stringSlice(raw any) []string {
-	l, ok := raw.([]any)
-	if !ok {
-		return nil
+	switch l := raw.(type) {
+	case []string:
+		return l
+	case []any:
+		var out []string
+		for _, x := range l {
+			out = append(out, fmt.Sprintf("%v", x))
+		}
+		return out
 	}
-	var out []string
-	for _, x := range l {
-		out = append(out, fmt.Sprintf("%v", x))
-	}
-	return out
+	return nil
 }
 
 func sortStrings(s []string) {
