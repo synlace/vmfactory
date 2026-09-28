@@ -117,7 +117,7 @@ func Fanout(ctx context.Context, seam model.Seam, root string,
 		}
 	}
 	variants := inspect.RootComposeVariants(root)
-	hasCompose = hasCompose || len(variants) > 0
+	hasCompose = hasCompose || len(variants) > 0 || inspect.ScanCompose(root)
 	hasDockerfile := fileExists(filepath.Join(root, "Dockerfile"))
 	hasMake := anyFileExists(root, "Makefile", "go.mod", "Cargo.toml")
 	slots := []string{}

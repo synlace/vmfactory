@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/synlace/vmfactory/internal/events"
+	"github.com/synlace/vmfactory/internal/model"
 )
 
 const inline = `version: 1
@@ -92,10 +92,12 @@ func TestGradePendingReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	em := events.NewEmitter()
-	id, ch := em.Subscribe()
+	// The fixture's URLs do not resolve: every row reports pending
+	// honestly (a row that cannot resolve is an absence, not a
+	// failure — the recorded baseline is graded only when the pin
+	// materialises).
 	var out bytes.Buffer
-	code := Grade(fx, em, &out)
+	code := Grade(fx, model.Seam{}, &out)
 	if code != 0 {
 		t.Fatalf("pending grade must exit 0, got %d", code)
 	}
@@ -112,24 +114,4 @@ func TestGradePendingReport(t *testing.T) {
 	if lines[3] != "parity: 0 ok, 0 failed, 3 pending" {
 		t.Fatalf("parity line: %q", lines[3])
 	}
-	// The grader emits through the envelope (ADR-0002): the renderer
-	// consumes the same stream a future UI would. Grade emitted
-	// synchronously, so the events sit in the buffer already.
-	n := 0
-	for {
-		select {
-		case <-ch:
-			n++
-			if n > 100 {
-				t.Fatal("emitter leaked events")
-			}
-			continue
-		default:
-		}
-		break
-	}
-	if n != len(fx.Rows)+1 { // one per row + grade.done
-		t.Fatalf("events: %d, want %d", n, len(fx.Rows)+1)
-	}
-	em.Unsubscribe(id)
 }

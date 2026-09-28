@@ -173,6 +173,70 @@ func Bundle(root string) string {
 	return strings.Join(inputs, "\n")
 }
 
+// ScanCompose finds compose files within the first two directory
+// levels (one project per directory is the monorepo layout) — the
+// reference's scan(): a nested compose still makes the compose lane
+// run (the model then blocks or plans it honestly).
+func ScanCompose(root string) bool {
+	return composeIn(root) || composeDepth1(root)
+}
+
+func composeDepth1(root string) bool {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false
+	}
+	var subs []string
+	for _, e := range entries {
+		if !e.IsDir() || skipDirs[e.Name()] {
+			continue
+		}
+		subs = append(subs, filepath.Join(root, e.Name()))
+	}
+	sort.Strings(subs)
+	for _, s := range subs {
+		if composeIn(s) || composeInLevel2(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// composeInLevel2 checks the level-2 directories' own files (the
+// reference's walk prunes at two separators: a/b/... files count).
+func composeInLevel2(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() || skipDirs[e.Name()] {
+			continue
+		}
+		if composeIn(filepath.Join(dir, e.Name())) {
+			return true
+		}
+	}
+	return false
+}
+
+func composeIn(dir string) bool {
+	list, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range list {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, "compose") {
+			continue
+		}
+		if strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml") {
+			return true
+		}
+	}
+	return false
+}
+
 // ContentHash is the canonical cache-key input: the bundle plus every
 // root-level compose file (dev overlays included — a compose edit is
 // plan-relevant). Content-only: a commit move that changes nothing

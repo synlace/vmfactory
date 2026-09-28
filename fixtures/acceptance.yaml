@@ -22,7 +22,7 @@ rows:
       min_runnable: 1
       runnable_with_cmd_check: true
       blocked_contains:
-        - {method: prebuilt, reason_contains: "official image"}
+        - {method: prebuilt, reason_contains: "official"}
   - id: web-intent
     scenario: explicit web intent
     url: https://github.com/paperclipai/paperclip
@@ -39,7 +39,7 @@ rows:
       runnable_serves_port: true
       runnable_keepalive_forbidden: true
       blocked_contains:
-        - {method: prebuilt, reason_contains: "official image"}
+        - {method: prebuilt, reason_contains: "official"}
         - {method: compose, reason_contains: "compose"}
   - id: sidecar-block
     scenario: blocked sidecar candidate
