@@ -353,12 +353,10 @@ func verdictsOf(o *plan.Outcome) string {
 func hasCmdCheck(approaches []map[string]any) bool {
 	for _, a := range approaches {
 		var checks []any
-		if l, ok := a["checks"].([]any); ok {
+		if l := checksOf(a["checks"]); l != nil {
 			checks = l
 		} else if d, ok := a["direct"].(map[string]any); ok {
-			if l, ok := d["checks"].([]any); ok {
-				checks = l
-			}
+			checks = checksOf(d["checks"])
 		}
 		for _, c := range checks {
 			if m, ok := c.(map[string]any); ok {
@@ -369,6 +367,22 @@ func hasCmdCheck(approaches []map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// checksOf reads the checks list from either shape: []map[string]any
+// from the fresh fanout, []any from JSON artifacts.
+func checksOf(raw any) []any {
+	switch l := raw.(type) {
+	case []any:
+		return l
+	case []map[string]any:
+		var out []any
+		for _, m := range l {
+			out = append(out, m)
+		}
+		return out
+	}
+	return nil
 }
 
 func blockedContains(raw any) []map[string]any {

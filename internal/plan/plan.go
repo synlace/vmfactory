@@ -287,7 +287,7 @@ func RenderPlain(o *Outcome) string {
 			out = append(out, "        env       "+strings.Join(pairs, " · "))
 		}
 		words := checkWords(a, direct)
-		if p := intSlice(a["ports"]); len(p) > 0 && !anyTCP(words) {
+		if p := portsOf(a["ports"]); len(p) > 0 && !anyTCP(words) {
 			for _, port := range p {
 				words = append([]string{fmt.Sprintf("tcp:%d", port)}, words...)
 			}
@@ -365,12 +365,26 @@ func envPairs(a, direct map[string]any) map[string]string {
 	return nil
 }
 
+// checksOf reads the checks list from either shape: []map[string]any
+// from the fresh fanout's clamped plans, []any from JSON artifacts.
+func checksOf(raw any) []any {
+	switch l := raw.(type) {
+	case []any:
+		return l
+	case []map[string]any:
+		var out []any
+		for _, m := range l {
+			out = append(out, m)
+		}
+		return out
+	}
+	return nil
+}
+
 func checkWords(a, direct map[string]any) []string {
-	var raw []any
-	if l, ok := a["checks"].([]any); ok {
-		raw = l
-	} else if l, ok := direct["checks"].([]any); ok {
-		raw = l
+	raw := checksOf(a["checks"])
+	if raw == nil {
+		raw = checksOf(direct["checks"])
 	}
 	var words []string
 	for _, c := range raw {
@@ -395,8 +409,8 @@ func checkWord(c any) string {
 			path = "/"
 		}
 		st := "2xx"
-		if s, ok := p["expect_status"].(float64); ok {
-			st = fmt.Sprintf("%d", int(s))
+		if s := intOf(p["expect_status"]); s > 0 {
+			st = fmt.Sprintf("%d", s)
 		}
 		return fmt.Sprintf("probe:%s → %s", path, st)
 	}
@@ -442,18 +456,24 @@ func sortedNonTCP(words []string) []string {
 	return out
 }
 
-func intSlice(raw any) []int {
-	l, ok := raw.([]any)
-	if !ok {
-		return nil
-	}
-	var out []int
-	for _, x := range l {
-		if n := intOf(x); n > 0 {
-			out = append(out, n)
+// portsOf reads the ports list from either shape: []int from the
+// fresh fanout's typed plans, []any/float64 from JSON artifacts. The
+// fresh path's typed shapes failed the []any cast silently and the
+// board dropped every port and check word (the CyberChef runs).
+func portsOf(raw any) []int {
+	switch l := raw.(type) {
+	case []int:
+		return l
+	case []any:
+		var out []int
+		for _, x := range l {
+			if n := intOf(x); n > 0 {
+				out = append(out, n)
+			}
 		}
+		return out
 	}
-	return out
+	return nil
 }
 
 func stringSlice(raw any) []string {

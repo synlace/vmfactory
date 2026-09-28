@@ -147,6 +147,36 @@ func TestIsTTYUnderTest(t *testing.T) {
 	}
 }
 
+// The fresh fanout's typed shapes must render exactly like the cached
+// JSON shapes: ports []int and checks []map[string]any failed the old
+// []any casts silently and the board dropped every word (the
+// CyberChef pair of runs).
+func TestRenderFreshShapes(t *testing.T) {
+	o := testOutcome(t)
+	o.Approaches[0]["ports"] = []int{8080}
+	o.Approaches[0]["checks"] = []map[string]any{
+		{"probe": map[string]any{"port": 8080, "path": "/",
+			"expect_status": 399}},
+	}
+	p := plan.RenderPlain(o)
+	if !strings.Contains(p, "checks    tcp:8080 · probe:/ → 399 · hold 25s") {
+		t.Errorf("fresh []int/[]map shapes dropped: %q", p)
+	}
+	if !strings.Contains(p, "winner needs 2/2 checks") {
+		t.Errorf("fresh word count dropped: %q", p)
+	}
+	// The json round-trip shape renders identically.
+	o2 := testOutcome(t)
+	o2.Approaches[0]["ports"] = []any{8080.0}
+	o2.Approaches[0]["checks"] = []any{map[string]any{
+		"probe": map[string]any{"port": 8080.0, "path": "/",
+			"expect_status": 399.0}}}
+	if plan.RenderPlain(o2) != p {
+		t.Errorf("fresh and cached shapes render differently:\n%s\nvs\n%s",
+			p, plan.RenderPlain(o2))
+	}
+}
+
 // The reference's join fallbacks: a check-less plan reads
 // "(none declared)" and an empty model-adds reads "—" (the CyberChef
 // run's two parity bugs).
