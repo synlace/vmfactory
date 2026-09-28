@@ -92,6 +92,11 @@ boot lab=lab:
 @grade *args:
     exec {{ uvrun }} --with pyyaml python scripts/grade_reference.py "$@"
 
+# Grade the same rows with the Go port. Skeleton stage: rows report
+# pending honestly; they flip to PASS/FAIL as the planner slices land.
+@grade-go *args:
+    exec go run ./cmd/vmf grade "$@"
+
 # SSH into a running box (qemu) or microVM (dropbear); pass a command to
 # run it remotely instead. Docker-style leading flags are accepted/ignored.
 ssh *args:
